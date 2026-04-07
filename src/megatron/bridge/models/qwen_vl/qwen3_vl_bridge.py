@@ -375,6 +375,7 @@ class Qwen3VLMoEBridge(MegatronModelBridge):
                 FusedExpertMapping(
                     megatron_param="language_model.decoder.layers.*.mlp.experts.linear_fc2.weight*",
                     hf_param="model.language_model.layers.*.mlp.experts.down_proj",
+                    permute_dims=(1, 0),
                     transpose_on_export=True,
                 ),
                 # QKV mapping for vision model
