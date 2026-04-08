@@ -125,8 +125,13 @@ class KimiK25VLBridge(MegatronModelBridge):
         provider.hf_model_path = hf_pretrained._model_name_or_path
         provider.generation_config = hf_pretrained.generation_config
 
-        # media_placeholder_token_id is on the top-level KimiK25Config, not on text_config
+        # media_placeholder_token_id is on the top-level KimiK25Config, not on text_config.
+        # The config value (163605) is wrong for some checkpoints — resolve from
+        # the tokenizer's <|media_pad|> special token when available.
         media_placeholder_token_id = getattr(hf_config, "media_placeholder_token_id", 163605)
+        media_placeholder_token_id = self._resolve_media_token_id(
+            hf_pretrained._model_name_or_path, media_placeholder_token_id
+        )
         provider.bos_token_id = getattr(text_config, "bos_token_id", 163584)
         provider.eos_token_id = getattr(text_config, "eos_token_id", 163585)
         provider.image_token_id = media_placeholder_token_id
@@ -135,6 +140,21 @@ class KimiK25VLBridge(MegatronModelBridge):
         provider.ignore_index = getattr(hf_config, "ignore_index", -100)
 
         return provider
+
+    @staticmethod
+    def _resolve_media_token_id(model_name_or_path: str, fallback: int) -> int:
+        """Resolve the correct media placeholder token ID from the tokenizer.
+
+        KimiK25Config.media_placeholder_token_id is wrong in some checkpoints
+        (163605 maps to [UNK]; the actual <|media_pad|> token is 163602).
+        """
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+        resolved = tokenizer.convert_tokens_to_ids("<|media_pad|>")
+        if isinstance(resolved, int) and resolved != tokenizer.unk_token_id:
+            return resolved
+        return fallback
 
     def _load_and_dequantize(self, key: str, hf_state_dict: Mapping[str, torch.Tensor]) -> torch.Tensor:
         """Load a weight, dequantizing INT4 packed tensors when present."""
