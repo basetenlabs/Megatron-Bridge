@@ -310,19 +310,8 @@ class MegatronPeftBridge:
             model = model.module
         config = model.language_model.config if hasattr(model, "language_model") else model.config
 
-        # split_qkv_weights has a scale-domain heuristic that misinterprets
-        # LoRA tensors (last dim = rank, not hidden_size). Split directly.
-        head_num = config.num_attention_heads
-        num_query_groups = config.num_query_groups
-        head_size = config.kv_channels or (config.hidden_size // head_num)
-        heads_per_group = head_num // num_query_groups
-
-        q_size = head_num * head_size
-        kv_size = num_query_groups * head_size
-        chunks = linear_out_weight.reshape(num_query_groups, (heads_per_group + 2) * head_size, -1)
-        q_out = chunks[:, :heads_per_group * head_size, :].reshape(q_size, -1)
-        k_out = chunks[:, heads_per_group * head_size:(heads_per_group + 1) * head_size, :].reshape(kv_size, -1)
-        v_out = chunks[:, (heads_per_group + 1) * head_size:, :].reshape(kv_size, -1)
+        feature_dim = linear_out_weight.shape[-1] if linear_out_weight.ndim == 2 else None
+        q_out, k_out, v_out = split_qkv_weights(config, linear_out_weight, feature_dim=feature_dim)
         return {"q_proj": q_out, "k_proj": k_out, "v_proj": v_out}
 
     def _split_gdn_in_proj_linear_out_weight(
