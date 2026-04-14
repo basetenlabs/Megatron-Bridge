@@ -223,26 +223,38 @@ def _ddp_wrap(
     else:
         DP = DistributedDataParallel
 
-    # DDP initialization is required to be on a side-stream for the full-iteration CUDA graph.
-    #  this side-stream may be nested if being called from within the get_model function, but it
-    #  is here in case someone wants to use this directly outside of get_model.
-    ddp_stream = torch.cuda.Stream()
-    ddp_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(ddp_stream):
+    if get_model_config(model[0]).cuda_graph_impl == "local":
+        # DDP initialization is required to be on a side-stream for the full-iteration CUDA graph.
+        #  this side-stream may be nested if being called from within the get_model function, but it
+        #  is here in case someone wants to use this directly outside of get_model.
+        ddp_stream = torch.cuda.Stream()
+        ddp_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(ddp_stream):
+            model = [
+                DP(
+                    config=get_model_config(model_chunk),
+                    ddp_config=ddp_config,
+                    module=model_chunk,
+                    # Turn off bucketing for model_chunk 2 onwards, since communication for these
+                    # model chunks is overlapped with compute anyway.
+                    disable_bucketing=(model_chunk_idx > 0) or overlap_param_gather_with_optimizer_step,
+                    pg_collection=pg_collection,
+                )
+                for (model_chunk_idx, model_chunk) in enumerate(model)
+            ]
+        # Critical: ensure side-stream work completes before touching params on default stream
+        torch.cuda.current_stream().wait_stream(ddp_stream)
+    else:
         model = [
             DP(
                 config=get_model_config(model_chunk),
                 ddp_config=ddp_config,
                 module=model_chunk,
-                # Turn off bucketing for model_chunk 2 onwards, since communication for these
-                # model chunks is overlapped with compute anyway.
                 disable_bucketing=(model_chunk_idx > 0) or overlap_param_gather_with_optimizer_step,
                 pg_collection=pg_collection,
             )
             for (model_chunk_idx, model_chunk) in enumerate(model)
         ]
-    # Critical: ensure side-stream work completes before touching params on default stream
-    torch.cuda.current_stream().wait_stream(ddp_stream)
 
     # Broadcast params from data parallel src rank to other data parallel ranks.
     if data_parallel_random_init:
