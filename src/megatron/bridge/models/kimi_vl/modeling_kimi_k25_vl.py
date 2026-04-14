@@ -136,6 +136,9 @@ class KimiK25VLModel(MegatronModule):
             if not hasattr(MoonViT3dEncoder, "use_deterministic_attn"):
                 MoonViT3dEncoder.use_deterministic_attn = False
 
+            # MoonViT3d doesn't support FA2; force eager attention to avoid
+            # transformers' _flash_attn_can_dispatch check.
+            self.vision_tower_config._attn_implementation = "eager"
             self.vision_tower = MoonViT3dPretrainedModel(self.vision_tower_config)
             self.mm_projector = PatchMergerMLP(self.projector_config)  # TODO: support different types of mm projector
             # Ensure HF visual tower params are marked for TP grad sync and future assignments are hooked.
