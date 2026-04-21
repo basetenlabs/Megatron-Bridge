@@ -325,8 +325,21 @@ class Qwen35VLMoEBridge(MegatronModelBridge):
                     megatron_param="language_model.decoder.layers.*.mlp.experts.linear_fc1.weight*",
                     hf_param="model.language_model.layers.*.mlp.experts.gate_up_proj",
                 ),
+                # Some MCore/MBridge builds expose routed experts as
+                # mlp.experts.local_experts.<idx>.linear_fc{1,2}.weight.
+                # Add explicit aliases so HF->Megatron task construction does
+                # not drop these parameters on those layouts.
+                FusedGatedExpertMapping(
+                    megatron_param="language_model.decoder.layers.*.mlp.experts.local_experts.*.linear_fc1.weight",
+                    hf_param="model.language_model.layers.*.mlp.experts.gate_up_proj",
+                ),
                 FusedExpertMapping(
                     megatron_param="language_model.decoder.layers.*.mlp.experts.linear_fc2.weight*",
+                    hf_param="model.language_model.layers.*.mlp.experts.down_proj",
+                    transpose_on_export=True,
+                ),
+                FusedExpertMapping(
+                    megatron_param="language_model.decoder.layers.*.mlp.experts.local_experts.*.linear_fc2.weight",
                     hf_param="model.language_model.layers.*.mlp.experts.down_proj",
                     transpose_on_export=True,
                 ),
@@ -408,8 +421,17 @@ class Qwen35VLMoEBridge(MegatronModelBridge):
                     gate="mtp.layers.*.mlp.experts.*.gate_proj.weight",
                     up="mtp.layers.*.mlp.experts.*.up_proj.weight",
                 ),
+                GatedMLPMapping(
+                    megatron_param="language_model.mtp.layers.*.mtp_model_layer.mlp.experts.local_experts.*.linear_fc1.weight",
+                    gate="mtp.layers.*.mlp.experts.*.gate_proj.weight",
+                    up="mtp.layers.*.mlp.experts.*.up_proj.weight",
+                ),
                 AutoMapping(
                     megatron_param="language_model.mtp.layers.*.mtp_model_layer.mlp.experts.linear_fc2.weight*",
+                    hf_param="mtp.layers.*.mlp.experts.*.down_proj.weight",
+                ),
+                AutoMapping(
+                    megatron_param="language_model.mtp.layers.*.mtp_model_layer.mlp.experts.local_experts.*.linear_fc2.weight",
                     hf_param="mtp.layers.*.mlp.experts.*.down_proj.weight",
                 ),
                 GatedMLPMapping(
