@@ -258,6 +258,12 @@ class TestSaveHfAdapter:
         assert set(cfg["target_modules"]) == {"q_proj", "v_proj"}
         assert cfg["base_model_name_or_path"] == "test/model"
 
+        from safetensors.torch import load_file
+
+        tensors = load_file(output_dir / "adapter_model.safetensors")
+        assert tensors
+        assert {tensor.dtype for tensor in tensors.values()} == {torch.bfloat16}
+
     def test_save_raises_on_empty_adapter(self, tmp_path):
         mock_bridge = MagicMock()
         mock_bridge.export_adapter_weights.return_value = iter([])

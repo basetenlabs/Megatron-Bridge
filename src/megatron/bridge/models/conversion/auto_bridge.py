@@ -522,6 +522,7 @@ class AutoBridge(Generic[MegatronModelT]):
         path: str | Path,
         peft_config: "PEFT",
         base_model_name_or_path: Optional[str] = None,
+        adapter_dtype: torch.dtype = torch.bfloat16,
         show_progress: bool = True,
     ) -> None:
         """Save LoRA adapter weights as a HuggingFace PEFT-compatible directory.
@@ -538,6 +539,7 @@ class AutoBridge(Generic[MegatronModelT]):
             base_model_name_or_path: HuggingFace model identifier or local path
                 of the base model this adapter was trained on.  If *None*, the
                 value is inferred from ``hf_pretrained.model_name_or_path``.
+            adapter_dtype: Dtype used when persisting adapter tensors.
             show_progress: Display progress bar during export.
 
         Example:
@@ -572,7 +574,7 @@ class AutoBridge(Generic[MegatronModelT]):
 
         adapter_state: dict[str, torch.Tensor] = {}
         for name, tensor in self.export_adapter_weights(model, cpu=True, show_progress=show_progress):
-            adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
+            adapter_state[f"base_model.model.{name}"] = tensor.clone().to(dtype=adapter_dtype)
 
         if not adapter_state:
             raise RuntimeError(
