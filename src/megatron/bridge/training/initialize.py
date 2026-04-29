@@ -596,6 +596,12 @@ def _initialize_distributed(
     """Initialize torch.distributed and core model parallel."""
 
     device_count = torch.cuda.device_count()
+    if device_count > 0:
+        if dist_config.external_gpu_device_mapping:
+            torch.cuda.set_device(0)
+        else:
+            torch.cuda.set_device(get_local_rank_preinit())
+
     if torch.distributed.is_initialized():
         if get_rank_safe() == 0:
             print(
@@ -606,13 +612,6 @@ def _initialize_distributed(
     else:
         if get_rank_safe() == 0:
             print("> initializing torch distributed ...", flush=True)
-
-        # Manually set the device ids.
-        if device_count > 0:
-            if dist_config.external_gpu_device_mapping:
-                torch.cuda.set_device(0)
-            else:
-                torch.cuda.set_device(get_local_rank_preinit())
 
         # Set to non-default stream for cudagraph capturing.
         if model_config.cuda_graph_impl == "transformer_engine":

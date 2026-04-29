@@ -180,8 +180,15 @@ class ModelProviderMixin(abc.ABC, Generic[ModelT]):
         # use it directly. Otherwise, initialize model parallel state and get pg_collection from MPU.
         if pg_collection is None:
             if not parallel_state.is_initialized():
-                print("Model parallel not initialized, initializing...")
-                self.initialize_model_parallel(seed=0)
+                import time as _pdm_time
+                skip_gloo = os.environ.get("MEGATRON_SKIP_GLOO_GROUPS", "0") == "1"
+                _r = int(os.environ.get("RANK", "0"))
+                if _r == 0:
+                    print(f"[BOOTSTRAP] Initializing NCCL parallel groups (skip_gloo={skip_gloo})...", flush=True)
+                _t = _pdm_time.monotonic()
+                self.initialize_model_parallel(seed=0, create_gloo_process_groups=not skip_gloo)
+                if _r == 0:
+                    print(f"[BOOTSTRAP] NCCL parallel groups initialized in {_pdm_time.monotonic() - _t:.1f}s", flush=True)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         # Providers (GPT, Mamba, Gemma, etc.) expect pg_collection on self for PP/TP role checks.
         setattr(self, "_pg_collection", pg_collection)
@@ -543,14 +550,26 @@ def get_model(
         model_provider.bf16 = bf16
 
     model_provider.use_cpu_initialization = use_cpu_initialization if use_cpu_initialization else False
+
+    import time as _time
+    _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    def _log(msg):
+        if _rank == 0:
+            print(f"[BOOTSTRAP] {msg}", flush=True)
+
+    _log("Creating model structure...")
+    _t0 = _time.monotonic()
     if init_model_with_meta_device:
         model_provider.init_model_with_meta_device = True
         with torch.device("meta"):
             model = _create_model(model_provider, model_type, pg_collection=pg_collection)
     else:
         model = _create_model(model_provider, model_type, pg_collection=pg_collection)
+    _log(f"Model structure created in {_time.monotonic() - _t0:.1f}s")
 
     if pre_wrap_hook:
+        _log("Loading HF weights into Megatron model...")
+        _t0 = _time.monotonic()
         if isinstance(pre_wrap_hook, list):
             # Execute hooks in order
             for hook in pre_wrap_hook:
@@ -565,6 +584,7 @@ def get_model(
             _model = pre_wrap_hook(model)
             if _model is not None:
                 model = _model
+        _log(f"HF weights loaded in {_time.monotonic() - _t0:.1f}s")
 
     # Set tensor model parallel attributes if not set
     # In case pre_wrap_hook augmented the model (e.g. adding PEFT adapters)
@@ -584,10 +604,15 @@ def get_model(
         and not model_config.use_cpu_initialization
         and not model_config.init_model_with_meta_device
     ):
+        _log("Moving model to GPU...")
+        _t0 = _time.monotonic()
         for model_module in model:
             model_module.cuda(torch.cuda.current_device())
+        _log(f"Model moved to GPU in {_time.monotonic() - _t0:.1f}s")
 
     if (model_config.fp16 or model_config.bf16) and mixed_precision_wrapper is not None:
+        _log("Applying mixed precision (BF16) wrapping...")
+        _t0 = _time.monotonic()
         # Save expert bias in float32 to avoid precision loss during conversion
         keep_in_fp32 = []
         for model_module in model:
@@ -602,6 +627,7 @@ def get_model(
         # Restore expert bias to float32
         for submodule, fp32_data in keep_in_fp32:
             submodule.expert_bias.data = fp32_data
+        _log(f"Mixed precision wrapping done in {_time.monotonic() - _t0:.1f}s")
 
     if correct_amax_history_if_needed is not None:
         correct_amax_history_if_needed(model)
