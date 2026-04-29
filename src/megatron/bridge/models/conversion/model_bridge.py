@@ -963,6 +963,12 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                 # Float8BlockwiseQTensor) that is a leaf with requires_grad=True.
                 # In-place updates under grad mode will raise:
                 # "a leaf Variable that requires grad is being used in an in-place operation."
+                #
+                # If the source weights are already in FP8 dtype (e.g. from a pre-quantized
+                # HF checkpoint), dequantize before copying so TE can re-quantize with its
+                # own scaling factors.
+                if converted_weights.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    converted_weights = converted_weights.to(torch.bfloat16)
                 with torch.no_grad():
                     task.param_weight.copy_(converted_weights)
         self._broadcast_shared_embeddings(megatron_model)
