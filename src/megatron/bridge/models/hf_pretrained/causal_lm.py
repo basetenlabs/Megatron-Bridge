@@ -23,7 +23,6 @@ from transformers import (
     AutoImageProcessor,
     AutoModelForCausalLM,
     AutoProcessor,
-    AutoTokenizer,
     GenerationConfig,
     PreTrainedTokenizer,
     ProcessorMixin,
@@ -33,6 +32,7 @@ from transformers.generation.utils import GenerateOutput
 
 from megatron.bridge.models.hf_pretrained.base import PreTrainedBase
 from megatron.bridge.models.hf_pretrained.safe_config_loader import safe_load_config_with_retry
+from megatron.bridge.models.hf_pretrained.tokenizer_utils import load_hf_tokenizer
 
 
 # Python 3.12+ supports PEP 692 (TypedDict Unpack)
@@ -210,7 +210,7 @@ class PreTrainedCausalLM(PreTrainedBase, Generic[CausalLMType]):
         """Load the tokenizer."""
         if self.model_name_or_path is None:
             raise ValueError("model_name_or_path must be provided to load tokenizer")
-        tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer = load_hf_tokenizer(
             self.model_name_or_path,
             trust_remote_code=self.trust_remote_code,
             **self.init_kwargs,

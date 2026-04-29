@@ -31,6 +31,7 @@ from transformers.generation.utils import GenerateOutput
 
 from megatron.bridge.models.hf_pretrained.base import PreTrainedBase
 from megatron.bridge.models.hf_pretrained.safe_config_loader import safe_load_config_with_retry
+from megatron.bridge.models.hf_pretrained.tokenizer_utils import load_hf_tokenizer
 
 
 # Type variable for generic model type
@@ -265,7 +266,7 @@ class PreTrainedVLM(PreTrainedBase, Generic[VLMType]):
         # Try to load tokenizer separately
         if self.model_name_or_path is not None:
             try:
-                tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer = load_hf_tokenizer(
                     self.model_name_or_path,
                     trust_remote_code=self.trust_remote_code,
                     **self.init_kwargs,

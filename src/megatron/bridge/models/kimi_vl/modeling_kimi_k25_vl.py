@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 from typing import List, Optional
 
 import torch
@@ -27,6 +28,42 @@ from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_gra
 
 
 logger = logging.getLogger(__name__)
+
+_VISION_ATTN_IMPL_ENV = "PRIME_KIMI_VISION_ATTN_IMPL"
+_SUPPORTED_VISION_ATTN_IMPLS = {"eager", "flash_attention_2"}
+_DEFAULT_VISION_ATTN_IMPL = "flash_attention_2"
+
+
+def _resolve_vision_attention_implementation(config: GPTModelProvider) -> str:
+    env_attn_impl = os.environ.get(_VISION_ATTN_IMPL_ENV)
+    if env_attn_impl is not None:
+        attn_impl = env_attn_impl
+    else:
+        attn_impl = getattr(config, "vision_attention_implementation", None)
+        if attn_impl in (None, "eager"):
+            attn_impl = _DEFAULT_VISION_ATTN_IMPL
+
+    if attn_impl not in _SUPPORTED_VISION_ATTN_IMPLS:
+        supported = ", ".join(sorted(_SUPPORTED_VISION_ATTN_IMPLS))
+        raise ValueError(
+            f"Unsupported Kimi vision attention implementation {attn_impl!r}. "
+            f"Expected one of: {supported}."
+        )
+    return attn_impl
+
+
+def _allow_flash_attention_2_on_vision_tower(model_cls: type) -> None:
+    if getattr(model_cls, "_bridge_flash_attn_patched", False):
+        return
+
+    model_cls._supports_flash_attn_2 = True
+
+    def _patched_flash_attn_can_dispatch(self, *args, **kwargs):  # noqa: ANN001
+        del args, kwargs
+        return None
+
+    model_cls._flash_attn_can_dispatch = _patched_flash_attn_can_dispatch
+    model_cls._bridge_flash_attn_patched = True
 
 
 class KimiK25VLModel(MegatronModule):
@@ -136,6 +173,13 @@ class KimiK25VLModel(MegatronModule):
             if not hasattr(MoonViT3dEncoder, "use_deterministic_attn"):
                 MoonViT3dEncoder.use_deterministic_attn = False
 
+            self.vision_tower_config._attn_implementation = _resolve_vision_attention_implementation(config)
+            if self.vision_tower_config._attn_implementation == "flash_attention_2":
+                _allow_flash_attention_2_on_vision_tower(MoonViT3dPretrainedModel)
+            logger.info(
+                "Using Kimi vision attention implementation %s",
+                self.vision_tower_config._attn_implementation,
+            )
             self.vision_tower = MoonViT3dPretrainedModel(self.vision_tower_config)
             self.mm_projector = PatchMergerMLP(self.projector_config)  # TODO: support different types of mm projector
             # Ensure HF visual tower params are marked for TP grad sync and future assignments are hooked.

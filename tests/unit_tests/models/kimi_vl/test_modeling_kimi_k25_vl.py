@@ -145,7 +145,7 @@ class TestMergePreExpanded:
 
         assert pos_ids[0].tolist() == [0, 1, 2, 3]
 
-    def test_batch_size_2(self, helper):
+def test_batch_size_2(self, helper):
         """Pre-expanded mode with batch_size=2."""
         # Each sample has 2 image placeholders
         input_ids = torch.tensor(
@@ -162,6 +162,40 @@ class TestMergePreExpanded:
 
         assert torch.allclose(embedding[0, 1:3], feat1)
         assert torch.allclose(embedding[1, 1:3], feat2)
+
+
+def test_resolve_vision_attention_implementation_defaults_to_eager(monkeypatch):
+    monkeypatch.delenv("PRIME_KIMI_VISION_ATTN_IMPL", raising=False)
+
+    from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import _resolve_vision_attention_implementation
+
+    config = Mock(spec=["vision_attention_implementation"])
+    config.vision_attention_implementation = None
+
+    assert _resolve_vision_attention_implementation(config) == "eager"
+
+
+def test_resolve_vision_attention_implementation_uses_env(monkeypatch):
+    monkeypatch.setenv("PRIME_KIMI_VISION_ATTN_IMPL", "flash_attention_2")
+
+    from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import _resolve_vision_attention_implementation
+
+    config = Mock(spec=["vision_attention_implementation"])
+    config.vision_attention_implementation = None
+
+    assert _resolve_vision_attention_implementation(config) == "flash_attention_2"
+
+
+def test_resolve_vision_attention_implementation_rejects_invalid(monkeypatch):
+    monkeypatch.setenv("PRIME_KIMI_VISION_ATTN_IMPL", "sdpa")
+
+    from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import _resolve_vision_attention_implementation
+
+    config = Mock(spec=["vision_attention_implementation"])
+    config.vision_attention_implementation = None
+
+    with pytest.raises(ValueError, match="Unsupported Kimi vision attention implementation"):
+        _resolve_vision_attention_implementation(config)
 
 
 # ===========================================================================
