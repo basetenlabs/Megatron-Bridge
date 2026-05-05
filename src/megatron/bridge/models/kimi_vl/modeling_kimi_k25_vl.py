@@ -136,11 +136,19 @@ class KimiK25VLModel(MegatronModule):
             if not hasattr(MoonViT3dEncoder, "use_deterministic_attn"):
                 MoonViT3dEncoder.use_deterministic_attn = False
 
-            # transformers >=5.5 strictly validates `attn_implementation` at
-            # __init__ and selects `flash_attention_2` by default when flash-attn
-            # is installed. MoonViT3dPretrainedModel doesn't declare flash-attn-2
-            # support, so force eager attention before construction.
-            self.vision_tower_config._attn_implementation = "eager"
+            # Long-context Kimi VLM SFT needs flash attention for image rows;
+            # eager vision attention materializes [heads, seq, seq] and can OOM.
+            # The remote class implements the flash path but does not declare
+            # support to Transformers' init-time validator, so opt it in here.
+            _vision_attn_impl = (
+                config.vision_attn_implementation
+                or getattr(self.vision_tower_config, "_attn_implementation", None)
+                or "eager"
+            )
+            self.vision_tower_config._attn_implementation = _vision_attn_impl
+            if _vision_attn_impl.startswith("flash_attention"):
+                MoonViT3dPretrainedModel._supports_flash_attn = True
+            logger.info("Using Kimi vision attention implementation %s", _vision_attn_impl)
             self.vision_tower = MoonViT3dPretrainedModel(self.vision_tower_config)
             self.mm_projector = PatchMergerMLP(self.projector_config)  # TODO: support different types of mm projector
             # Ensure HF visual tower params are marked for TP grad sync and future assignments are hooked.

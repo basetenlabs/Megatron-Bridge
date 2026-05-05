@@ -43,6 +43,7 @@ class KimiK25VLModelProvider(MLAModelProvider):
     # Vision configuration — raw HF KimiK25VisionConfig object, used to construct
     # VisionTowerConfig and ProjectorConfig for the vision tower and mm_projector.
     vision_config: Any = None
+    vision_attn_implementation: str | None = None
 
     # Path to HuggingFace model directory (required for dynamic module loading
     # of MoonViT3d, PatchMergerMLP, and other custom model classes).
