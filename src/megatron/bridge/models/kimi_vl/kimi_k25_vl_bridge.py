@@ -123,6 +123,7 @@ class KimiK25VLBridge(MegatronModelBridge):
 
         # VL-specific overrides
         provider.vision_config = vision_config
+        provider.vision_attn_implementation = getattr(vision_config, "_attn_implementation", None)
         provider.hf_model_path = hf_pretrained._model_name_or_path
         provider.generation_config = hf_pretrained.generation_config
 
