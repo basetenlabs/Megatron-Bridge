@@ -993,6 +993,8 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[tuple, BaseModelOutputWithPast]:
+        # TODO: Remove this local docstring workaround once this branch includes
+        # NVIDIA-NeMo/Megatron-Bridge@0a21da47 or a later upstream fix.
         r"""
         cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
             Indices depicting the position of the input sequence tokens in the sequence.
@@ -1175,6 +1177,8 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         cache_position=None,
         **kwargs,
     ) -> Union[tuple, Qwen3ASRThinkerCausalLMOutputWithPast]:
+        # TODO: Remove this local docstring workaround once this branch includes
+        # NVIDIA-NeMo/Megatron-Bridge@0a21da47 or a later upstream fix.
         r"""
         cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
             Indices depicting the position of the input sequence tokens in the sequence.
