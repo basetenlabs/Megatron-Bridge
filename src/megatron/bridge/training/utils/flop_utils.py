@@ -15,8 +15,6 @@
 import importlib
 from pathlib import Path
 
-import torch.nn.functional as F
-
 from megatron.bridge.data.datasets.packing_utils import calculate_avg_seqlen
 from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.training.config import ConfigContainer
@@ -26,8 +24,114 @@ from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 _lora_seq_stats_cache: dict = {}
 
 
-def num_floating_point_operations(cfg: ConfigContainer, batch_size: int = 1):
-    """Return the number of floating point operations"""
+def vit_flops(
+    cfg: ConfigContainer,
+    batch_size: int,
+    num_patches: int,
+):
+    """Calculate FLOPs for a Vision Transformer (ViT) encoder + patch merger.
+
+    Includes:
+    - ViT transformer layers (bidirectional full attention, not causal)
+    - Patch merger (spatial merge + MLP projection to LLM hidden size)
+
+    Args:
+        cfg: Configuration container. ViT hyper-parameters are read from
+            ``cfg.model.vision_config`` (``depth``, ``hidden_size``,
+            ``num_heads``, ``intermediate_size``, ``spatial_merge_size``,
+            ``out_hidden_size``). Passing the whole config keeps the public
+            signature stable as the list of required ViT attributes grows.
+        batch_size: Batch size.
+        num_patches: Per-image number of vision patches (before spatial
+            merge). Callers that track the total patch count across the
+            batch should divide by ``batch_size`` before invoking, because
+            ViT attention is per-image (not cross-image) and scales
+            quadratically with the per-image patch count.
+
+    Returns:
+        Total training FLOPs (forward * 3 for fwd+bwd). Returns 0 when
+        no ``vision_config`` is attached or ``num_patches`` is non-positive.
+    """
+    vision_config = getattr(cfg.model, "vision_config", None)
+    if vision_config is None or num_patches <= 0:
+        return 0
+
+    depth = getattr(vision_config, "depth", 0)
+    hidden_size = getattr(vision_config, "hidden_size", 0)
+    intermediate_size = getattr(vision_config, "intermediate_size", 0)
+    spatial_merge_size = getattr(vision_config, "spatial_merge_size", 2)
+    out_hidden_size = getattr(vision_config, "out_hidden_size", cfg.model.hidden_size)
+
+    # ViT Transformer layers (bidirectional attention)
+    per_token_per_layer = (
+        # QKV + O projections: 4 matmuls of h x h => 4 * 2 * h^2 FMA = 8h^2
+        # but standard counting: Q,K,V each h->h (3 * 2h^2) + O h->h (2h^2) = 8h^2
+        8 * hidden_size**2
+        # Attention core (full bidirectional, not causal): QK^T + attn*V
+        # = 2 * 2 * h * num_patches = 4 * h * num_patches
+        + 4 * hidden_size * num_patches
+        # MLP (GELU, 2 matmuls): fc1 h->intermediate + fc2 intermediate->h
+        # = 2 * 2 * h * intermediate = 4 * h * intermediate
+        + 4 * hidden_size * intermediate_size
+    )
+    transformer_flops_val = per_token_per_layer * num_patches * depth
+
+    # Patch Merger: spatial merge (2x2) + MLP projection
+    merge_unit = spatial_merge_size**2
+    merged_hidden = hidden_size * merge_unit  # concatenated hidden dim
+    num_merged_tokens = num_patches // merge_unit if merge_unit > 0 else num_patches
+    merger_flops_val = num_merged_tokens * (
+        2 * merged_hidden * merged_hidden  # fc1: merged_hidden -> merged_hidden
+        + 2 * merged_hidden * out_hidden_size  # fc2: merged_hidden -> out_hidden_size
+    )
+
+    return (transformer_flops_val + merger_flops_val) * batch_size * 3  # 3x for training (fwd + bwd)
+
+
+def num_floating_point_operations(
+    cfg: ConfigContainer,
+    batch_size: int = 1,
+    seqlen_sum: int | None = None,
+    seqlen_squared_sum: int | None = None,
+    num_vision_patches: int = 0,
+):
+    """Return the number of floating point operations.
+
+    Args:
+        cfg: Configuration container.
+        batch_size: Batch size.
+        seqlen_sum: Sum of actual sequence lengths across the batch
+            (batch_size * actual_seq_length). When provided, overrides
+            cfg.model.seq_length for more accurate FLOPS estimation with
+            dynamic-length sequences (e.g., VLM with dynamic padding).
+        seqlen_squared_sum: Sum of squared sequence lengths across the batch
+            (sum_i actual_seq_length_i^2). Used for attention core FLOPS
+            which scale quadratically with sequence length; when omitted,
+            falls back to ``batch_size * effective_seq_length^2`` so the
+            result matches the legacy constant-length estimate.
+        num_vision_patches: Total number of vision patches in the batch
+            (before spatial merge). Used to compute ViT encoder FLOPS.
+    """
+    # Compute effective sequence length from actual values or fall back to config.
+    if seqlen_sum is not None and batch_size > 0:
+        effective_seq_length = seqlen_sum / batch_size
+    else:
+        effective_seq_length = cfg.model.seq_length
+        seqlen_sum = batch_size * cfg.model.seq_length
+
+    # Per-layer attention core FLOPS scale as sum_i(s_i^2), while the outer
+    # formula multiplies every per-layer term by ``seqlen_sum``. To account
+    # for the quadratic scaling (and variance) of core attention we replace
+    # the linear ``effective_seq_length`` factor in core-attn expressions
+    # with ``core_attn_seq_factor``. With ``seqlen_sum * core_attn_seq_factor
+    # == sum_i(s_i^2)`` this reproduces the correct quadratic sum; when the
+    # squared sum is unavailable we fall back to ``effective_seq_length`` so
+    # the result matches the legacy constant-length estimate.
+    if seqlen_squared_sum is not None and seqlen_sum > 0:
+        core_attn_seq_factor = seqlen_squared_sum / seqlen_sum
+    else:
+        core_attn_seq_factor = effective_seq_length
+
     peft = getattr(cfg, "peft", None)
     is_lora = isinstance(peft, LoRA)
     # If the model provider has a custom TFLOPS calculation method, use it (non-LoRA only).
@@ -251,7 +355,7 @@ def num_floating_point_operations(cfg: ConfigContainer, batch_size: int = 1):
             cfg.model.num_attention_heads if cfg.model.num_query_groups is None else cfg.model.num_query_groups
         )
 
-        is_squad = getattr(getattr(cfg, "dataset", None), "dataset_name", None) == "squad"
+        is_squad = getattr(getattr(cfg, "dataset", None), "dataset_name", None) in ("squad", "rajpurkar/squad")
         hf_model_id = getattr(cfg.model, "hf_model_id", None)
         is_llama3_70b = hf_model_id is not None and "Meta-Llama-3-70B" in hf_model_id
         packed_specs = getattr(getattr(cfg, "dataset", None), "packed_sequence_specs", None)
@@ -335,10 +439,10 @@ def num_floating_point_operations(cfg: ConfigContainer, batch_size: int = 1):
             if cfg.model.moe_shared_expert_intermediate_size is None
             else cfg.model.moe_shared_expert_intermediate_size
         )
-        # SwiGLU: h->2*ffn_h and ffn_h->h = 3 projections; non-SwiGLU: h->ffn_h and ffn_h->h = 2 projections.
-        ffn_expansion_factor = (
-            3 if (cfg.model.gated_linear_unit is True and cfg.model.activation_func == F.silu) else 2
-        )
+        # GLU: h->2*ffn_h and ffn_h->h = 3 projections; non-GLU: h->ffn_h and ffn_h->h = 2 projections.
+        ffn_expansion_factor = 3 if cfg.model.gated_linear_unit is True else 2
+
+        experimental_attention_variant = getattr(cfg.model, "experimental_attention_variant", None)
 
         if cfg.model.multi_latent_attention:
             """
@@ -354,48 +458,144 @@ def num_floating_point_operations(cfg: ConfigContainer, batch_size: int = 1):
             https://arxiv.org/abs/2305.10403
             https://arxiv.org/abs/2205.05198
             """
-            ## MLA
-            if not hasattr(cfg.model, "q_lora_rank") or cfg.model.q_lora_rank is None:
-                q_term = (
+            if experimental_attention_variant == "dsv4_hybrid":
+                # DeepSeek-V4 hybrid MLA uses sparse attention instead of the full
+                # core-attention terms used by DeepSeek-V2/V3 MLA. Projection costs
+                # are accounted here; sparse attention, compressor, and indexer
+                # costs are added below.
+                q_lora_rank = getattr(cfg.model, "q_lora_rank", None)
+                if q_lora_rank is None:
+                    raise ValueError("q_lora_rank must be set for dsv4_hybrid FLOPs calculation")
+
+                qk_head_dim = getattr(cfg.model, "qk_head_dim", 64)
+                qk_pos_emb_head_dim = getattr(cfg.model, "qk_pos_emb_head_dim", 0)
+                v_head_dim = getattr(cfg.model, "v_head_dim", 64)
+                o_lora_rank = getattr(cfg.model, "o_lora_rank", 0)
+                o_groups = getattr(cfg.model, "o_groups", 1)
+
+                q_term = q_lora_rank * (
                     cfg.model.hidden_size
-                    * cfg.model.num_attention_heads
-                    * (getattr(cfg.model, "qk_head_dim", 64) + getattr(cfg.model, "qk_pos_emb_head_dim", 0))
+                    + cfg.model.num_attention_heads * (qk_head_dim + qk_pos_emb_head_dim)
+                    + 1  # q norm
                 )
-            else:
-                q_term = cfg.model.q_lora_rank * (
-                    cfg.model.hidden_size
-                    + cfg.model.num_attention_heads
-                    * (getattr(cfg.model, "qk_head_dim", 64) + getattr(cfg.model, "qk_pos_emb_head_dim", 0))
-                    + 1
+                kv_term = cfg.model.hidden_size * v_head_dim + v_head_dim  # kv projection + kv norm
+                o_term = (
+                    cfg.model.num_attention_heads * v_head_dim * o_lora_rank
+                    + o_groups * o_lora_rank * cfg.model.hidden_size
                 )
-            self_attn_term = (
-                3
-                * 2  # fwd(1) + bwd(2) *FMA
-                * num_layers
-                * (
-                    ## q lora + rope + q norm
-                    q_term
-                    ## kv lora + rope + kv norm
-                    + getattr(cfg.model, "kv_lora_rank", 0)
-                    * (
-                        cfg.model.hidden_size
-                        + cfg.model.num_attention_heads
-                        * (getattr(cfg.model, "qk_head_dim", 64) + getattr(cfg.model, "v_head_dim", 64))
-                        + 1
+                self_attn_term = 3 * 2 * num_layers * (q_term + kv_term + o_term)
+
+                compress_ratios = getattr(cfg.model, "csa_compress_ratios", None)
+                if compress_ratios is None:
+                    raise ValueError("csa_compress_ratios must be set for dsv4_hybrid FLOPs calculation")
+                if len(compress_ratios) != num_layers:
+                    raise ValueError(
+                        f"Invalid length of csa_compress_ratios: {len(compress_ratios)}, "
+                        f"expected {num_layers} "
+                        f"(num_layers={cfg.model.num_layers}, mtp_num_layers={mtp_num_layers})."
                     )
-                    + cfg.model.hidden_size * getattr(cfg.model, "qk_pos_emb_head_dim", 0)
-                    ## o proj
-                    + (cfg.model.num_attention_heads * getattr(cfg.model, "v_head_dim", 64)) * cfg.model.hidden_size
-                    ## core attn
-                    + cfg.model.seq_length
-                    * (
-                        cfg.model.num_attention_heads
+
+                supported_compress_ratios = {0, 4, 128}
+                unsupported_compress_ratios = [
+                    ratio for ratio in compress_ratios if ratio not in supported_compress_ratios
+                ]
+                if unsupported_compress_ratios:
+                    raise ValueError(
+                        "csa_compress_ratios contains unsupported values: "
+                        f"{unsupported_compress_ratios}. Only 0, 4, and 128 are supported."
+                    )
+
+                n_layers_r0 = sum(1 for ratio in compress_ratios if ratio == 0)
+                n_layers_r4 = sum(1 for ratio in compress_ratios if ratio == 4)
+                n_layers_r128 = sum(1 for ratio in compress_ratios if ratio == 128)
+                window = getattr(cfg.model, "csa_window_size", 128)
+
+                sparse_attn_r0 = n_layers_r0 * cfg.model.num_attention_heads * window * v_head_dim * 2
+                avg_comp_128 = (core_attn_seq_factor // 128) / 2
+                sparse_attn_r128 = (
+                    n_layers_r128 * cfg.model.num_attention_heads * (window + avg_comp_128) * v_head_dim * 2
+                )
+
+                main_compressor_term = (
+                    n_layers_r4 * cfg.model.hidden_size * (2 * v_head_dim) * 2
+                    + n_layers_r128 * cfg.model.hidden_size * v_head_dim * 2
+                )
+
+                if n_layers_r4 > 0:
+                    idx_n_heads = getattr(cfg.model, "dsa_indexer_n_heads", None)
+                    idx_head_dim = getattr(cfg.model, "dsa_indexer_head_dim", None)
+                    idx_topk = getattr(cfg.model, "dsa_indexer_topk", None)
+                    if idx_n_heads is None:
+                        raise ValueError("dsa_indexer_n_heads must be set for dsv4_hybrid ratio==4 layers")
+                    if idx_head_dim is None:
+                        raise ValueError("dsa_indexer_head_dim must be set for dsv4_hybrid ratio==4 layers")
+                    if idx_topk is None:
+                        raise ValueError("dsa_indexer_topk must be set for dsv4_hybrid ratio==4 layers")
+
+                    effective_topk_4 = min(idx_topk, core_attn_seq_factor // 4)
+                    avg_comp_4 = effective_topk_4 * (1 - effective_topk_4 * 4 / (2 * core_attn_seq_factor))
+                    sparse_attn_r4 = (
+                        n_layers_r4 * cfg.model.num_attention_heads * (window + avg_comp_4) * v_head_dim * 2
+                    )
+                    indexer_term = (
+                        n_layers_r4 * cfg.model.hidden_size * (2 * idx_head_dim) * 2
+                        + n_layers_r4 * q_lora_rank * idx_n_heads * idx_head_dim
+                        + n_layers_r4 * cfg.model.hidden_size * idx_n_heads
+                        + n_layers_r4 * idx_n_heads * idx_head_dim * (core_attn_seq_factor // 4)
+                    )
+                else:
+                    sparse_attn_r4 = 0
+                    indexer_term = 0
+
+                sparse_attn_term = sparse_attn_r0 + sparse_attn_r4 + sparse_attn_r128
+                self_attn_term += 3 * 2 * (sparse_attn_term + main_compressor_term + indexer_term)
+            else:
+                ## MLA
+                if not hasattr(cfg.model, "q_lora_rank") or cfg.model.q_lora_rank is None:
+                    q_term = (
+                        cfg.model.hidden_size
+                        * cfg.model.num_attention_heads
                         * (getattr(cfg.model, "qk_head_dim", 64) + getattr(cfg.model, "qk_pos_emb_head_dim", 0))
                     )
-                    / 2
-                    + cfg.model.seq_length * cfg.model.num_attention_heads * getattr(cfg.model, "v_head_dim", 64) / 2
+                else:
+                    q_term = cfg.model.q_lora_rank * (
+                        cfg.model.hidden_size
+                        + cfg.model.num_attention_heads
+                        * (getattr(cfg.model, "qk_head_dim", 64) + getattr(cfg.model, "qk_pos_emb_head_dim", 0))
+                        + 1
+                    )
+                self_attn_term = (
+                    3
+                    * 2  # fwd(1) + bwd(2) *FMA
+                    * num_layers
+                    * (
+                        ## q lora + rope + q norm
+                        q_term
+                        ## kv lora + rope + kv norm
+                        + getattr(cfg.model, "kv_lora_rank", 0)
+                        * (
+                            cfg.model.hidden_size
+                            + cfg.model.num_attention_heads
+                            * (getattr(cfg.model, "qk_head_dim", 64) + getattr(cfg.model, "v_head_dim", 64))
+                            + 1
+                        )
+                        + cfg.model.hidden_size * getattr(cfg.model, "qk_pos_emb_head_dim", 0)
+                        ## o proj
+                        + (cfg.model.num_attention_heads * getattr(cfg.model, "v_head_dim", 64))
+                        * cfg.model.hidden_size
+                        ## core attn
+                        + core_attn_seq_factor
+                        * (
+                            cfg.model.num_attention_heads
+                            * (getattr(cfg.model, "qk_head_dim", 64) + getattr(cfg.model, "qk_pos_emb_head_dim", 0))
+                        )
+                        / 2
+                        + core_attn_seq_factor
+                        * cfg.model.num_attention_heads
+                        * getattr(cfg.model, "v_head_dim", 64)
+                        / 2
+                    )
                 )
-            )
 
         else:
             ## MHA or GQA
@@ -416,7 +616,15 @@ def num_floating_point_operations(cfg: ConfigContainer, batch_size: int = 1):
                     effective_window = window_size[0] + window_size[1] + 1
                 else:
                     effective_window = window_size
-                swa_context = min(effective_window, cfg.model.seq_length)
+                # Exact average causal SWA context:
+                # W * (W + 1) / 2 + (T - W) * W if W < T, else T * (T + 1) / 2.
+                # Both expressions are divided by T because the multiplication with T happens later.
+                if effective_window < effective_seq_length:
+                    swa_context = effective_window - effective_window * (effective_window - 1) / (
+                        2 * effective_seq_length
+                    )
+                else:
+                    swa_context = core_attn_seq_factor / 2
 
                 if window_attn_skip_freq is None:
                     num_swa_layers = num_layers
@@ -433,8 +641,9 @@ def num_floating_point_operations(cfg: ConfigContainer, batch_size: int = 1):
                     num_swa_layers = 0
                     num_full_attn_layers = num_layers
 
-                full_core = query_projection_size * cfg.model.seq_length / 2 * 2
-                swa_core = query_projection_size * swa_context / 2 * 2
+                # Full attention is quadratic in seq_len -> use core_attn_seq_factor.
+                full_core = query_projection_size * core_attn_seq_factor / 2 * 2
+                swa_core = query_projection_size * swa_context * 2
 
                 self_attn_term = (
                     3
@@ -445,14 +654,13 @@ def num_floating_point_operations(cfg: ConfigContainer, batch_size: int = 1):
                     )
                 )
             else:
-                full_core = query_projection_size * cfg.model.seq_length / 2 * 2
+                full_core = query_projection_size * core_attn_seq_factor / 2 * 2
                 self_attn_term = 3 * 2 * num_layers * (proj_per_layer + full_core)
 
         # Handle GDN (Gated DeltaNet) hybrid attention variant.
         # When experimental_attention_variant is "gated_delta_net", a fraction of the
         # layers use GDN instead of standard attention. Override self_attn_term with a
         # weighted sum of GDN and standard-attention per-layer costs.
-        experimental_attention_variant = getattr(cfg.model, "experimental_attention_variant", None)
         if experimental_attention_variant == "gated_delta_net":
             linear_attention_freq = cfg.model.linear_attention_freq
             if linear_attention_freq is None:
@@ -524,39 +732,49 @@ def num_floating_point_operations(cfg: ConfigContainer, batch_size: int = 1):
                 / cfg.model.hidden_size
             ) + 2 * moe_latent_size
 
-        total_floating_point_operations = (
-            batch_size
-            * cfg.model.seq_length
+        total_floating_point_operations = seqlen_sum * (
+            # MLP
+            3
+            * 2
+            * cfg.model.hidden_size
             * (
-                # MLP
-                3
-                * 2
-                * cfg.model.hidden_size
-                * (
-                    # dense layers
-                    (cfg.model.ffn_hidden_size * ffn_expansion_factor) * num_dense_layers
-                    # routed experts
-                    + routed_expert_term * num_moe_layers
-                    # Shared Experts.
-                    + (shared_expert_ffn_hidden_size * ffn_expansion_factor) * num_moe_layers
-                )
-                # Self Attention
-                + self_attn_term
-                # MTP norms and proj
-                + 3
-                * 2
-                * mtp_num_layers
-                * (
-                    # MTP eh norm + final norm
-                    3 * cfg.model.hidden_size
-                    # MTP eh proj
-                    + 2 * cfg.model.hidden_size * cfg.model.hidden_size
-                )
-                # Logit.
-                + 3 * 2 * cfg.model.hidden_size * padded_vocab_size * (mtp_num_layers + 1)
+                # dense layers
+                (cfg.model.ffn_hidden_size * ffn_expansion_factor) * num_dense_layers
+                # routed experts
+                + routed_expert_term * num_moe_layers
+                # Shared Experts.
+                + (shared_expert_ffn_hidden_size * ffn_expansion_factor) * num_moe_layers
             )
+            # Self Attention
+            + self_attn_term
+            # MTP norms and proj
+            + 3
+            * 2
+            * mtp_num_layers
+            * (
+                # MTP eh norm + final norm
+                3 * cfg.model.hidden_size
+                # MTP eh proj
+                + 2 * cfg.model.hidden_size * cfg.model.hidden_size
+            )
+            # Logit.
+            + 3 * 2 * cfg.model.hidden_size * padded_vocab_size * (mtp_num_layers + 1)
         )
-        return total_floating_point_operations
+        return total_floating_point_operations + _compute_vit_flops()
+
+    def _compute_vit_flops():
+        """Compute ViT encoder FLOPs if vision config is available.
+
+        Note: num_vision_patches is the *total* patches across the batch.
+        ViT attention is per-image (not cross-image), so we convert to
+        per-image patch count before invoking ``vit_flops`` to get the
+        correct quadratic attention scaling. ``vit_flops`` itself returns
+        0 when ``cfg.model.vision_config`` is absent.
+        """
+        if num_vision_patches <= 0:
+            return 0
+        patches_per_image = num_vision_patches / batch_size if batch_size > 0 else num_vision_patches
+        return vit_flops(cfg, batch_size, patches_per_image)
 
     # Main entrypoint for FLOPs calculation.
     if getattr(cfg.model, "is_hybrid_model", False):
@@ -588,9 +806,9 @@ def num_floating_point_operations(cfg: ConfigContainer, batch_size: int = 1):
         )
 
         # Compute hybrid model FLOPs.
-        return hybrid_flops(
+        llm_flops = hybrid_flops(
             batch_size=batch_size,
-            seq_len=cfg.model.seq_length,
+            seq_len=effective_seq_length,
             hidden_size=cfg.model.hidden_size,
             num_attn_layers=num_attn_layers,
             num_mamba_layers=num_mamba_layers,
@@ -626,6 +844,7 @@ def num_floating_point_operations(cfg: ConfigContainer, batch_size: int = 1):
             vocab_size=padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
         )
+        return llm_flops + _compute_vit_flops()
     else:
         # Compute standard Transformer model FLOPs.
         return transformer_flops()

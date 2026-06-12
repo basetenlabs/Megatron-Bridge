@@ -45,6 +45,37 @@ def _fix_tied_weights_keys(model: nn.Module):
             module._tied_weights_keys = {k: k for k in tied}
 
 
+def _copy_custom_code_from_source(model_dir: Path, source_file: str | Path) -> None:
+    """Copy custom modeling/configuration modules needed for local trust_remote_code loading."""
+    copied_files: set[str] = set()
+
+    source_file = Path(source_file)
+    source_dir = source_file.parent
+    for py_file in source_dir.glob("*.py"):
+        target = model_dir / py_file.name
+        shutil.copy2(py_file, target)
+        copied_files.add(target.name)
+
+    from transformers.dynamic_module_utils import get_relative_import_files
+
+    for source in map(Path, get_relative_import_files(source_file)):
+        target = model_dir / source.name
+        if target.name not in copied_files:
+            shutil.copy2(source, target)
+            copied_files.add(target.name)
+
+
+def _set_temp_hf_modules_cache(monkeypatch: pytest.MonkeyPatch, temp_hf_modules_cache: Path) -> None:
+    """Point dynamic module loading at a per-test cache and clear stale local modules."""
+    monkeypatch.setattr(dynamic_module_utils, "HF_MODULES_CACHE", str(temp_hf_modules_cache))
+    monkeypatch.syspath_prepend(str(temp_hf_modules_cache))
+    (temp_hf_modules_cache / "__init__.py").touch()
+
+    for module_name in list(sys.modules):
+        if module_name == "transformers_modules" or module_name.startswith("transformers_modules."):
+            monkeypatch.delitem(sys.modules, module_name)
+
+
 # Overrides for 8B size
 HF_NEMOTRONH_TOY_MODEL_OVERRIDES = {
     "attention_head_dim": 48,
@@ -130,7 +161,7 @@ class TestNemotronHConversion:
         # directly from the HF Hub and are unaffected.
         model.save_pretrained(model_dir, safe_serialization=True, save_original_format=False)
         modeling_filepath = os.path.abspath(sys.modules[model_class.__module__].__file__)
-        shutil.copy(modeling_filepath, model_dir)
+        _copy_custom_code_from_source(model_dir, modeling_filepath)
 
         # Ensure config.json exists with expected keys
         config_path = model_dir / "config.json"
@@ -212,7 +243,7 @@ class TestNemotronHConversion:
         "tp,pp,test_name",
         [
             (2, 1, "TP"),
-            pytest.param(1, 2, "PP", marks=pytest.mark.pleasefixme),  # PP=2 broken by hybrid_layer_pattern (PR #2628)
+            (1, 2, "PP"),
         ],
     )
     def test_nemotronh_conversion_parallelism(self, nemotronh_toy_model_path, tmp_path, tp, pp, test_name):
@@ -231,20 +262,15 @@ class TestNemotronHConversion:
         test_output_dir = tmp_path / f"nemotronh_{test_name}"
         test_output_dir.mkdir(exist_ok=True)
 
-        # Modify config.json to add | separator for hybrid_override_pattern to be able to run PP > 1
+        # Keep the saved HF config valid. MCore handles PP partitioning from the
+        # Megatron parallelism settings, while HF custom configs reject pipeline
+        # delimiters in hybrid_override_pattern.
         config_file = Path(nemotronh_toy_model_path) / "config.json"
         assert config_file.exists(), f"config.json not found at {config_file}"
         with open(config_file) as f:
             config_data = json.load(f)
 
-        if pp > 1:
-            config_data["hybrid_override_pattern"] = (
-                HF_NEMOTRONH_TOY_MODEL_OVERRIDES["hybrid_override_pattern"][:2]
-                + "|"
-                + HF_NEMOTRONH_TOY_MODEL_OVERRIDES["hybrid_override_pattern"][2:]
-            )
-        else:
-            config_data["hybrid_override_pattern"] = HF_NEMOTRONH_TOY_MODEL_OVERRIDES["hybrid_override_pattern"]
+        config_data["hybrid_override_pattern"] = HF_NEMOTRONH_TOY_MODEL_OVERRIDES["hybrid_override_pattern"]
 
         original_hybrid_override_pattern = config_data.get("hybrid_override_pattern")
         with open(config_file, "w") as f:
@@ -334,8 +360,8 @@ class TestNemotronHConversion:
 
 # Overrides for Nemotron-3-Nano MoE model (30B total, 3B active)
 HF_NEMOTRON_3_NANO_TOY_MODEL_OVERRIDES = {
-    "num_hidden_layers": 3,
-    "hybrid_override_pattern": "M*E",
+    "num_hidden_layers": 4,
+    "hybrid_override_pattern": "M*E-",
     "hidden_size": 672,
     "n_routed_experts": 16,
 }
@@ -413,7 +439,7 @@ class TestNemotron3NanoConversion:
         # Check the notes above in TestNemotronHConversion.test_toy_model_creation for more details.
         model.save_pretrained(model_dir, safe_serialization=True, save_original_format=False)
         modeling_filepath = os.path.abspath(sys.modules[model_class.__module__].__file__)
-        shutil.copy(modeling_filepath, model_dir)
+        _copy_custom_code_from_source(model_dir, modeling_filepath)
 
         # Ensure config.json exists with expected keys
         config_path = model_dir / "config.json"
@@ -427,7 +453,7 @@ class TestNemotron3NanoConversion:
         """Change transformers.dynamic_module_utils.HF_MODULES_CACHE to a temp path"""
         temp_hf_modules_cache = tmp_path / "hf_modules_cache"
         temp_hf_modules_cache.mkdir(exist_ok=True)
-        monkeypatch.setattr(dynamic_module_utils, "HF_MODULES_CACHE", temp_hf_modules_cache)
+        _set_temp_hf_modules_cache(monkeypatch, temp_hf_modules_cache)
         yield temp_hf_modules_cache
 
     def test_toy_model_creation(self, nemotron_3_nano_toy_model_path, temp_hf_modules):
@@ -505,7 +531,7 @@ class TestNemotron3NanoConversion:
         "tp,pp,test_name",
         [
             (2, 1, "TP"),
-            pytest.param(1, 2, "PP", marks=pytest.mark.pleasefixme),  # PP=2 broken by hybrid_layer_pattern (PR #2628)
+            (1, 2, "PP"),
         ],
     )
     def test_nemotron_3_nano_conversion_parallelism(
@@ -603,7 +629,6 @@ class TestNemotron3NanoConversion:
             raise
 
     @pytest.mark.run_only_on("GPU")
-    @pytest.mark.pleasefixme
     def test_nemotron_3_nano_autoconfig_roundtrip(self, nemotron_3_nano_toy_model_path, tmp_path):
         from tests.functional_tests.utils import autoconfig_roundtrip
 
@@ -616,7 +641,7 @@ class TestNemotron3NanoConversion:
 
 # Overrides for Nemotron-3-Super MoE model (120B total, 12B active)
 HF_NEMOTRON_3_SUPER_TOY_MODEL_OVERRIDES = {
-    "layers_block_type": ["mamba", "attention", "moe"],
+    "layers_block_type": ["mamba", "attention", "moe", "mamba"],
     "hidden_size": 672,
     "n_routed_experts": 16,
     "num_nextn_predict_layers": 0,
@@ -709,7 +734,7 @@ class TestNemotron3SuperConversion:
             ]
         model.save_pretrained(model_dir, safe_serialization=True)
         modeling_filepath = os.path.abspath(sys.modules[model_class.__module__].__file__)
-        shutil.copy(modeling_filepath, model_dir)
+        _copy_custom_code_from_source(model_dir, modeling_filepath)
 
         # Ensure config.json exists with expected keys
         config_path = model_dir / "config.json"
@@ -723,7 +748,7 @@ class TestNemotron3SuperConversion:
         """Change transformers.dynamic_module_utils.HF_MODULES_CACHE to a temp path"""
         temp_hf_modules_cache = tmp_path / "hf_modules_cache"
         temp_hf_modules_cache.mkdir(exist_ok=True)
-        monkeypatch.setattr(dynamic_module_utils, "HF_MODULES_CACHE", temp_hf_modules_cache)
+        _set_temp_hf_modules_cache(monkeypatch, temp_hf_modules_cache)
         yield temp_hf_modules_cache
 
     def test_toy_model_creation(self, nemotron_3_super_toy_model_path, temp_hf_modules):
@@ -801,7 +826,7 @@ class TestNemotron3SuperConversion:
         "tp,pp,test_name",
         [
             (2, 1, "TP"),
-            pytest.param(1, 2, "PP", marks=pytest.mark.pleasefixme),  # PP=2 broken by hybrid_layer_pattern (PR #2628)
+            (1, 2, "PP"),
         ],
     )
     def test_nemotron_3_super_conversion_parallelism(

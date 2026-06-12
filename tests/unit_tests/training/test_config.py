@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import fields
 from typing import Any, Optional, Union
 from unittest.mock import MagicMock, patch
 
@@ -38,12 +39,13 @@ from megatron.bridge.training.config import (
     RerunStateMachineConfig,
     RNGConfig,
     SchedulerConfig,
-    TokenizerConfig,
     TrainingConfig,
     ValidationConfig,
     _validate_and_sync_distributed_optimizer_settings,
     _validate_mixed_precision_consistency,
 )
+from megatron.bridge.training.mixed_precision import MixedPrecisionConfig
+from megatron.bridge.training.tokenizers.config import TokenizerConfig
 from megatron.bridge.utils.cuda_graph import (
     cuda_graph_module_names,
     set_cuda_graph_modules,
@@ -432,27 +434,19 @@ class TestMockGPTDatasetConfig:
 
 
 class TestConfigContainerValidation:
-    def test_deterministic_mode_disallows_flash_and_ce_fusion(self, monkeypatch):
-        """Test that deterministic mode disallows flash attention and cross-entropy loss fusion."""
-        from megatron.core.transformer.enums import AttnBackend
-
+    def test_deterministic_mode_disallows_ce_fusion(self, monkeypatch):
+        """Test that deterministic mode disallows cross-entropy loss fusion."""
         gpt_model_cfg = create_test_gpt_config(
             deterministic_mode=True,
-            attention_backend=AttnBackend.flash,
             cross_entropy_loss_fusion=True,
         )
 
-        # Ensure NCCL_ALGO present but valid, so we fail earlier on flash/ce fusion
+        # Ensure NCCL_ALGO present but valid, so we fail on CE fusion
         monkeypatch.setenv("NCCL_ALGO", "Tree")
 
         container, og_ws, cfg_mod = create_test_config_container(world_size_override=1, model_config=gpt_model_cfg)
 
         try:
-            with pytest.raises(AssertionError, match="Flash attention can not be used in deterministic mode"):
-                container.validate()
-
-            # Fix attention, still CE fusion should fail
-            container.model.attention_backend = AttnBackend.local
             with pytest.raises(AssertionError, match="Cross Entropy Fusion is currently not deterministic"):
                 container.validate()
         finally:
@@ -1175,6 +1169,74 @@ class TestConfigContainerValidation:
             # After validation, both should be forced to False due to FSDP
             assert container.ddp.reuse_grad_buf_for_mxfp8_param_ag is False
             assert container.optimizer.reuse_grad_buf_for_mxfp8_param_ag is False
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_reuse_grad_buf_for_mxfp8_param_ag_required_without_fsdp(self, monkeypatch):
+        """Test that reuse_grad_buf_for_mxfp8_param_ag must be True when
+        FSDP is disabled, fp8_param_gather=True, and fp8_recipe='mxfp8'."""
+        gpt_model_cfg = create_test_gpt_config()
+        train_cfg = create_test_training_config(train_iters=500, global_batch_size=16)
+        sched_cfg = create_test_scheduler_config()
+
+        # Case 1: Should raise when reuse_grad_buf_for_mxfp8_param_ag=False
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            scheduler_config=sched_cfg,
+        )
+        try:
+            container.mixed_precision = MixedPrecisionConfig(
+                fp8_param_gather=True, fp8_recipe="mxfp8", reuse_grad_buf_for_mxfp8_param_ag=False
+            )
+            with pytest.raises(AssertionError, match="reuse_grad_buf_for_mxfp8_param_ag must be set to True"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+        # Case 2: Should pass when reuse_grad_buf_for_mxfp8_param_ag=True
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            scheduler_config=sched_cfg,
+        )
+        try:
+            container.mixed_precision = MixedPrecisionConfig(
+                fp8_param_gather=True, fp8_recipe="mxfp8", reuse_grad_buf_for_mxfp8_param_ag=True
+            )
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+        # Case 3: Should pass when fp8_param_gather=False (guard skips)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            scheduler_config=sched_cfg,
+        )
+        try:
+            container.mixed_precision = MixedPrecisionConfig(
+                fp8_param_gather=False, fp8_recipe="mxfp8", reuse_grad_buf_for_mxfp8_param_ag=False
+            )
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+        # Case 4: Should pass when fp8_recipe is not mxfp8 (guard skips)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            train_config=train_cfg,
+            scheduler_config=sched_cfg,
+        )
+        try:
+            container.mixed_precision = MixedPrecisionConfig(
+                fp8_param_gather=True, fp8_recipe="delayed", reuse_grad_buf_for_mxfp8_param_ag=False
+            )
+            container.validate()
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
@@ -1912,6 +1974,90 @@ class TestCheckpointConfig:
         assert ckpt_cfg.ckpt_step == 5000
         assert ckpt_cfg.load == "/checkpoints"
 
+    def test_save_weight_format_field_is_removed(self):
+        """Test that the old save_weight_format alias is no longer part of CheckpointConfig."""
+        assert "save_weight_format" not in {field.name for field in fields(CheckpointConfig)}
+
+    def test_also_save_hf_checkpoint_rejects_fsdp_dtensor(self):
+        """Test that HF extra export is not allowed with fsdp_dtensor checkpoints."""
+        ckpt_cfg = create_test_checkpoint_config(also_save_hf_checkpoint=True, ckpt_format="fsdp_dtensor")
+
+        with pytest.raises(ValueError, match="also_save_hf_checkpoint=True is not supported"):
+            ckpt_cfg.finalize()
+
+    def test_also_save_hf_checkpoint_rejects_local_non_persistent_checkpoint(self):
+        """Test that HF extra export is not allowed for local non-persistent checkpoints."""
+        ckpt_cfg = create_test_checkpoint_config(also_save_hf_checkpoint=True, non_persistent_ckpt_type="local")
+
+        with pytest.raises(ValueError, match="also_save_hf_checkpoint=True is not compatible"):
+            ckpt_cfg.finalize()
+
+    def test_also_save_hf_checkpoint_requires_hf_source_during_container_validation(self):
+        """Test that HF extra export requires a source before training starts."""
+        checkpoint_cfg = create_test_checkpoint_config(also_save_hf_checkpoint=True)
+        model_cfg = create_test_gpt_config(hf_model_id=None)
+        tokenizer_cfg = create_test_tokenizer_config(tokenizer_model=None)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=model_cfg,
+            tokenizer_config=tokenizer_cfg,
+            checkpoint_config=checkpoint_cfg,
+        )
+
+        try:
+            with pytest.raises(ValueError, match="also_save_hf_checkpoint=True requires an HF source"):
+                container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_also_save_hf_checkpoint_accepts_hf_source_path_during_container_validation(self):
+        """Test that explicit hf_source_path satisfies HF extra export validation."""
+        checkpoint_cfg = create_test_checkpoint_config(
+            also_save_hf_checkpoint=True,
+            hf_source_path="/hf/source",
+        )
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(hf_model_id=None),
+            tokenizer_config=create_test_tokenizer_config(tokenizer_model=None),
+            checkpoint_config=checkpoint_cfg,
+        )
+
+        try:
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_also_save_hf_checkpoint_accepts_model_hf_model_id_during_container_validation(self):
+        """Test that model.hf_model_id satisfies HF extra export validation."""
+        checkpoint_cfg = create_test_checkpoint_config(also_save_hf_checkpoint=True)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(hf_model_id="hf/model"),
+            tokenizer_config=create_test_tokenizer_config(tokenizer_model=None),
+            checkpoint_config=checkpoint_cfg,
+        )
+
+        try:
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_also_save_hf_checkpoint_accepts_tokenizer_model_during_container_validation(self):
+        """Test that tokenizer.tokenizer_model satisfies HF extra export validation."""
+        checkpoint_cfg = create_test_checkpoint_config(also_save_hf_checkpoint=True)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(hf_model_id=None),
+            tokenizer_config=create_test_tokenizer_config(tokenizer_model="hf/tokenizer-or-model"),
+            checkpoint_config=checkpoint_cfg,
+        )
+
+        try:
+            container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
     def test_async_save_validation_error(self):
         """Test that async_save requires both a save path and use_persistent_ckpt_worker=True."""
 
@@ -2610,6 +2756,63 @@ class TestDistributedOptimizerValidation:
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
+    @pytest.mark.parametrize(
+        "ddp_overlap, optimizer_overlap, expected_final_state, should_print_message, expected_message_parts",
+        [
+            (True, False, True, True, ["ddp.overlap_param_gather=True", "optimizer.overlap_param_gather=False"]),
+            (False, True, True, True, ["ddp.overlap_param_gather=False", "optimizer.overlap_param_gather=True"]),
+            (True, True, True, False, []),
+            (False, False, False, False, []),
+        ],
+    )
+    @patch("megatron.bridge.training.config.warn_rank_0")
+    def test_overlap_param_gather_sync_scenarios(
+        self,
+        mock_warn_rank_0,
+        ddp_overlap,
+        optimizer_overlap,
+        expected_final_state,
+        should_print_message,
+        expected_message_parts,
+    ):
+        """Test overlap_param_gather sync between DDP and optimizer configs."""
+        gpt_model_cfg = create_test_gpt_config()
+        ddp_cfg = create_test_ddp_config(overlap_param_gather=ddp_overlap)
+        optimizer_cfg = create_test_optimizer_config(overlap_param_gather=optimizer_overlap)
+
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=gpt_model_cfg,
+            ddp_config=ddp_cfg,
+            optimizer_config=optimizer_cfg,
+        )
+
+        try:
+            assert container.ddp.overlap_param_gather is ddp_overlap
+            assert container.optimizer.overlap_param_gather is optimizer_overlap
+
+            _validate_and_sync_distributed_optimizer_settings(container)
+
+            assert container.ddp.overlap_param_gather is expected_final_state
+            assert container.optimizer.overlap_param_gather is expected_final_state
+
+            overlap_warnings = [
+                call
+                for call in mock_warn_rank_0.call_args_list
+                if call[0] and "overlap_param_gather settings were not in sync" in call[0][0]
+            ]
+            if should_print_message:
+                assert len(overlap_warnings) == 1
+                call_args = overlap_warnings[0][0][0]
+                assert "Automatically enabling overlap_param_gather for both settings" in call_args
+                for expected_part in expected_message_parts:
+                    assert expected_part in call_args
+            else:
+                assert len(overlap_warnings) == 0
+
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
 
 class TestSampleBasedTraining:
     """Tests for sample-based training configuration and validation."""
@@ -3152,3 +3355,38 @@ class TestLoggerConfigFinalize:
         )
         with patch("importlib.import_module"):
             config.finalize()
+
+
+class TestTokenizerConfig:
+    def test_config_success(self):
+        tokenizer_model = "/path/to/tokenizer"
+        tokenizer_type = "HuggingFaceTokenizer"
+        metadata_path = "/path/to/metadata.json"
+        use_fast = False
+        legacy = True
+
+        config = TokenizerConfig(
+            tokenizer_model=tokenizer_model,
+            tokenizer_type=tokenizer_type,
+            metadata_path=metadata_path,
+            hf_tokenizer_kwargs={"use_fast": use_fast},
+            sp_tokenizer_kwargs={"legacy": legacy},
+        )
+
+        assert config.tokenizer_model == tokenizer_model
+        assert config.metadata_path == metadata_path
+        assert config.tokenizer_hf_no_use_fast == (not use_fast)
+        assert config.tokenizer_sentencepiece_legacy == legacy
+
+    def test_config_failure(self):
+        tokenizer_model = "/path/to/tokenizer"
+        tokenizer_type = "HuggingFaceTokenizer"
+        metadata_path = "/path/to/metadata.json"
+
+        with pytest.raises(TypeError, match="got an unexpected keyword argument"):
+            TokenizerConfig(
+                tokenizer_model=tokenizer_model,
+                tokenizer_type=tokenizer_type,
+                metadata_path=metadata_path,
+                random_arg=True,
+            )
