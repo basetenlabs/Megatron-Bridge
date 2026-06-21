@@ -280,3 +280,243 @@ class TestGLM5Conversion:
         from tests.functional_tests.utils import autoconfig_roundtrip
 
         autoconfig_roundtrip(glm5_toy_model_path, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# GLM-5.2 toy model — adds IndexShare (cross-layer top-k sharing) to the
+# GLM-5/5.1 architecture: ``index_topk_freq=4`` and ``index_skip_topk_offset=3``
+# plus a 1M context (``rope_theta=8_000_000``, vs 1M for GLM-5/5.1). The toy
+# carries only 2 hidden layers (both fall in the "full" prefix before the
+# ``skip_topk_offset`` cutoff), so the cross-pipeline IndexShare path is
+# exercised only by the mcore unit tests in
+# ``3rdparty/Megatron-LM/tests/unit_tests/transformer/experimental_attention_variant/test_dsa_index_share.py``.
+# This test verifies the bridge's ``_convert_config`` plumbs the new knobs
+# from HF to mcore.
+# ---------------------------------------------------------------------------
+
+# Build the GLM-5.2 toy config on top of the GLM-5 one. Two transformers-5.8
+# caveats require surgery:
+#   1. ``GlmMoeDsaConfig.attribute_map = {"head_dim": "qk_rope_head_dim"}``
+#      means ``AutoConfig.from_pretrained`` aliases ``head_dim`` onto
+#      ``qk_rope_head_dim`` when both appear in the saved ``config.json``,
+#      overriding our explicit ``qk_rope_head_dim = 32`` and producing a
+#      ``kv_a_proj_with_mqa`` shape mismatch on reload. Dropping ``head_dim``
+#      from the dict lets the explicit ``qk_rope_head_dim`` win.
+#   2. ``GlmMoeDsaConfig.__post_init__`` in transformers 5.8 pops
+#      ``index_topk_freq`` from the unused kwargs to (re)build
+#      ``indexer_types`` when that's unset, so any value set here is
+#      swallowed and ``getattr(hf_config, "index_topk_freq", 1)`` falls back
+#      to ``1``. Setting ``indexer_types`` explicitly (even a 2-element
+#      list) skips the pop branch and lets ``index_topk_freq`` stick as a
+#      preserved attribute — mirroring the real ``zai-org/GLM-5.2`` config,
+#      which already includes a 78-entry ``indexer_types``.
+HF_GLM52_TOY_MODEL_CONFIG = {k: v for k, v in HF_GLM5_TOY_MODEL_CONFIG.items() if k != "head_dim"}
+HF_GLM52_TOY_MODEL_CONFIG.update(
+    {
+        "rope_parameters": {"rope_theta": 8000000, "rope_type": "default"},
+        "index_topk_freq": 4,
+        "index_skip_topk_offset": 3,
+        "index_share_for_mtp_iteration": True,
+        "indexer_types": ["full", "full"],
+        "transformers_version": "5.12.0",
+    }
+)
+
+
+def _create_glm52_toy_model(model_dir: Path) -> None:
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    config = AutoConfig.from_pretrained("zai-org/GLM-5.2")
+
+    for key, value in HF_GLM52_TOY_MODEL_CONFIG.items():
+        setattr(config, key, value)
+
+    config.torch_dtype = torch.bfloat16
+
+    from transformers import GlmMoeDsaForCausalLM
+
+    model = GlmMoeDsaForCausalLM(config)
+
+    model = model.bfloat16()
+    for k, v in model.named_buffers():
+        if "e_score_correction_bias" in k:
+            v.data = v.data.to(torch.float32)
+
+    tokenizer = AutoTokenizer.from_pretrained("zai-org/GLM-5.2")
+    tokenizer.save_pretrained(model_dir)
+
+    model.save_pretrained(model_dir, safe_serialization=True)
+
+    config_to_save = HF_GLM52_TOY_MODEL_CONFIG.copy()
+    config_path = model_dir / "config.json"
+    with open(config_path, "w") as f:
+        json.dump(config_to_save, f, indent=2)
+
+
+class TestGLM52Conversion:
+    """
+    Test GLM-5.2 (MoE + MLA + DSA with IndexShare) model conversion with
+    different parallelism configurations. Uses a toy model with random
+    weights and the GLM-5.2 IndexShare knobs (``index_topk_freq=4``,
+    ``index_skip_topk_offset=3``).
+    """
+
+    @pytest.fixture(scope="class")
+    def glm52_toy_model_path(self, tmp_path_factory):
+        """Create and save a HuggingFace GLM-5.2 MoE toy model to a temporary directory."""
+        temp_dir = tmp_path_factory.mktemp("glm52_toy_model")
+        model_dir = temp_dir / "glm52_toy"
+
+        _create_glm52_toy_model(model_dir)
+
+        return str(model_dir)
+
+    def test_glm52_toy_model_creation(self, glm52_toy_model_path):
+        """Test that the GLM-5.2 toy MoE model is created correctly and can be loaded."""
+        model_path = Path(glm52_toy_model_path)
+        assert model_path.exists(), f"Model directory not found at {model_path}"
+
+        config_file = model_path / "config.json"
+        assert config_file.exists(), f"config.json not found at {config_file}"
+
+        weights_file = model_path / "model.safetensors"
+        if not weights_file.exists():
+            weights_file = model_path / "pytorch_model.bin"
+
+        if not weights_file.exists():
+            sharded_files = list(model_path.glob("model-*-of-*.safetensors"))
+            if sharded_files:
+                weights_file = sharded_files[0]
+            else:
+                sharded_files = list(model_path.glob("pytorch_model-*-of-*.bin"))
+                if sharded_files:
+                    weights_file = sharded_files[0]
+
+        assert weights_file.exists(), f"Model weights file not found in {model_path}"
+
+        tokenizer_config_file = model_path / "tokenizer_config.json"
+        assert tokenizer_config_file.exists(), f"tokenizer_config.json not found at {tokenizer_config_file}"
+
+        with open(config_file) as f:
+            config_data = json.load(f)
+
+        assert config_data["model_type"] == HF_GLM52_TOY_MODEL_CONFIG["model_type"]
+        assert config_data["index_topk_freq"] == HF_GLM52_TOY_MODEL_CONFIG["index_topk_freq"]
+        assert config_data["index_skip_topk_offset"] == HF_GLM52_TOY_MODEL_CONFIG["index_skip_topk_offset"]
+        assert (
+            config_data["index_share_for_mtp_iteration"] == HF_GLM52_TOY_MODEL_CONFIG["index_share_for_mtp_iteration"]
+        )
+
+        from transformers import GlmMoeDsaForCausalLM
+
+        model = GlmMoeDsaForCausalLM.from_pretrained(
+            glm52_toy_model_path,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=False,
+            trust_remote_code=True,
+        )
+
+        assert hasattr(model, "model")
+        assert hasattr(model.model, "layers")
+        assert len(model.model.layers) == 2
+
+        second_layer = model.model.layers[1]
+        assert hasattr(second_layer, "mlp")
+
+    def test_glm52_index_share_config_plumbing(self, glm52_toy_model_path):
+        """Bridge reads GLM-5.2 IndexShare knobs into the mcore provider."""
+        from megatron.bridge import AutoBridge
+
+        bridge = AutoBridge.from_hf_pretrained(glm52_toy_model_path, trust_remote_code=True)
+        provider = bridge.to_megatron_provider(load_weights=False)
+
+        assert provider.experimental_attention_variant == "dsa"
+        assert provider.dsa_indexer_topk_freq == HF_GLM52_TOY_MODEL_CONFIG["index_topk_freq"]
+        assert provider.dsa_indexer_skip_topk_offset == HF_GLM52_TOY_MODEL_CONFIG["index_skip_topk_offset"]
+
+    @pytest.mark.run_only_on("GPU")
+    @pytest.mark.parametrize(
+        "tp,pp,ep,test_name",
+        [
+            (2, 1, 1, "TP"),
+            (1, 2, 1, "PP"),
+            (1, 1, 2, "EP"),
+        ],
+    )
+    def test_glm52_conversion_parallelism(self, glm52_toy_model_path, tmp_path, tp, pp, ep, test_name):
+        """Test GLM-5.2 MoE model conversion with different parallelism configurations."""
+        test_output_dir = tmp_path / f"glm52_moe_{test_name}"
+        test_output_dir.mkdir(exist_ok=True)
+
+        repo_root = "/opt/Megatron-Bridge"
+        cmd = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--nproc_per_node=2",
+            "--nnodes=1",
+            "-m",
+            "coverage",
+            "run",
+            f"--data-file={repo_root}/.coverage",
+            f"--source={repo_root}/",
+            "--parallel-mode",
+            f"{repo_root}/examples/conversion/hf_megatron_roundtrip_multi_gpu.py",
+            "--hf-model-id",
+            glm52_toy_model_path,
+            "--output-dir",
+            str(test_output_dir),
+            "--tp",
+            str(tp),
+            "--pp",
+            str(pp),
+            "--ep",
+            str(ep),
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+        )
+
+        if result.returncode != 0:
+            print(f"STDOUT: {result.stdout}")
+            print(f"STDERR: {result.stderr}")
+            pytest.fail(f"GLM-5.2 MoE {test_name} conversion failed with return code {result.returncode}")
+
+        model_name = Path(glm52_toy_model_path).name
+        converted_model_dir = test_output_dir / model_name
+        assert converted_model_dir.exists(), f"Converted model directory not found at {converted_model_dir}"
+
+        config_file = converted_model_dir / "config.json"
+        assert config_file.exists(), f"config.json not found in converted model at {config_file}"
+
+        weights_file_safetensors = converted_model_dir / "model.safetensors"
+        weights_file_pytorch = converted_model_dir / "pytorch_model.bin"
+
+        weights_found = weights_file_safetensors.exists() or weights_file_pytorch.exists()
+
+        if not weights_found:
+            sharded_safetensors = list(converted_model_dir.glob("model-*-of-*.safetensors"))
+            sharded_pytorch = list(converted_model_dir.glob("pytorch_model-*-of-*.bin"))
+            weights_found = len(sharded_safetensors) > 0 or len(sharded_pytorch) > 0
+
+        assert weights_found, f"Model weights file not found in converted model at {converted_model_dir}"
+
+        with open(config_file) as f:
+            saved_config = json.load(f)
+
+        assert saved_config["model_type"] == "glm_moe_dsa"
+        assert saved_config["hidden_size"] == HF_GLM52_TOY_MODEL_CONFIG["hidden_size"]
+        assert saved_config["num_attention_heads"] == HF_GLM52_TOY_MODEL_CONFIG["num_attention_heads"]
+        assert saved_config["n_routed_experts"] == HF_GLM52_TOY_MODEL_CONFIG["n_routed_experts"]
+        assert saved_config["num_experts_per_tok"] == HF_GLM52_TOY_MODEL_CONFIG["num_experts_per_tok"]
+        assert saved_config["moe_intermediate_size"] == HF_GLM52_TOY_MODEL_CONFIG["moe_intermediate_size"]
+
+    @pytest.mark.run_only_on("GPU")
+    def test_glm52_autoconfig_roundtrip(self, glm52_toy_model_path, tmp_path):
+        from tests.functional_tests.utils import autoconfig_roundtrip
+
+        autoconfig_roundtrip(glm52_toy_model_path, tmp_path)
