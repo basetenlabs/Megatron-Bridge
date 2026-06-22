@@ -31,6 +31,20 @@ from megatron.bridge.models.mla_provider import MLAModelProvider
 logger = logging.getLogger(__name__)
 
 
+def _glm_qk_rope_head_dim(hf_config) -> int:
+    """Return GLM's RoPE head dim, avoiding transformers' head_dim alias."""
+    if not hasattr(hf_config, "qk_head_dim") or not hasattr(hf_config, "qk_nope_head_dim"):
+        raise ValueError("GlmMoeDsaConfig must define qk_head_dim and qk_nope_head_dim")
+
+    qk_rope_head_dim = int(hf_config.qk_head_dim) - int(hf_config.qk_nope_head_dim)
+    if qk_rope_head_dim <= 0:
+        raise ValueError(
+            f"Invalid GLM qk dimensions: qk_head_dim={hf_config.qk_head_dim}, "
+            f"qk_nope_head_dim={hf_config.qk_nope_head_dim}"
+        )
+    return qk_rope_head_dim
+
+
 @MegatronModelBridge.register_bridge(
     source=GlmMoeDsaForCausalLM, target=GPTModel, provider=MLAModelProvider, model_type="glm_moe_dsa"
 )
@@ -106,6 +120,11 @@ class GLM5Bridge(MegatronModelBridge):
             hf_config.num_hidden_layers - hf_config.first_k_dense_replace
         )
         provider.moe_shared_expert_intermediate_size = hf_config.moe_intermediate_size * hf_config.n_shared_experts
+
+        # Transformers aliases ``head_dim`` to ``qk_rope_head_dim`` for GlmMoeDsaConfig.
+        # GLM-5.2 publishes both fields with different values, so derive RoPE dim from
+        # qk_head_dim (= qk_nope + qk_rope) instead of trusting the aliased attr.
+        provider.qk_pos_emb_head_dim = _glm_qk_rope_head_dim(hf_config)
 
         # GLM5-specific: rotary_base is nested in rope_parameters
         provider.rotary_base = hf_config.rope_parameters["rope_theta"]

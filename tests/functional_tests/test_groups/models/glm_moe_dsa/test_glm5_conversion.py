@@ -194,6 +194,24 @@ class TestGLM5Conversion:
         second_layer = model.model.layers[1]
         assert hasattr(second_layer, "mlp")
 
+    def test_provider_uses_raw_qk_rope_head_dim(self, glm5_toy_model_path):
+        """GLM configs may publish head_dim and qk_rope_head_dim with different values."""
+        from megatron.bridge.models.glm_moe_dsa.glm5_bridge import GLM5Bridge
+
+        class HFPretrainedStub:
+            pass
+
+        hf_pretrained = HFPretrainedStub()
+        hf_pretrained.config = AutoConfig.from_pretrained(glm5_toy_model_path, trust_remote_code=True)
+        hf_pretrained.model_name_or_path = glm5_toy_model_path
+        hf_pretrained.trust_remote_code = True
+
+        provider = GLM5Bridge().provider_bridge(hf_pretrained)
+
+        assert hf_pretrained.config.qk_rope_head_dim == HF_GLM5_TOY_MODEL_CONFIG["head_dim"]
+        assert provider.qk_pos_emb_head_dim == HF_GLM5_TOY_MODEL_CONFIG["qk_rope_head_dim"]
+        assert provider.kv_lora_rank + provider.qk_pos_emb_head_dim == 160
+
     @pytest.mark.run_only_on("GPU")
     @pytest.mark.parametrize(
         "tp,pp,ep,test_name",
