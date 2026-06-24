@@ -109,6 +109,10 @@ class GLM5Bridge(MegatronModelBridge):
         provider.moe_router_enable_expert_bias = True
         provider.moe_router_dtype = "fp32"
         provider.moe_permute_fusion = True
+        provider.moe_n_hash_layers = 0
+        provider.log_moe_overload_factor = False
+        provider.delay_offload_until_cuda_graph = False
+        provider.moe_hybridep_pad_variable_tokens = False
 
         provider.hidden_dropout = 0.0
         provider.attention_softmax_in_fp32 = False
@@ -135,10 +139,13 @@ class GLM5Bridge(MegatronModelBridge):
 
         # DSA indexer params
         provider.experimental_attention_variant = "dsa"
+        provider.apply_dsa_kernel_fusion = True
         provider.dsa_indexer_head_dim = hf_config.index_head_dim
         provider.dsa_indexer_n_heads = hf_config.index_n_heads
         provider.dsa_indexer_topk = hf_config.index_topk
-        provider.dsa_indexer_loss_coeff = 0.001
+        # GLM post-training freezes the DSA indexer and uses deterministic top-k for
+        # train/infer consistency. LoRA targets intentionally exclude indexer weights.
+        provider.dsa_indexer_loss_coeff = 0.0
         provider.dsa_indexer_use_sparse_loss = True
 
         # DSA IndexShare (GLM-5.2): cross-layer top-k sharing. When the HF
