@@ -572,9 +572,19 @@ class Qwen3VLTransformerBlock(TransformerBlock):
                     *deepstack_visual_embeds_tuple,
                 )
             else:
-                return tensor_parallel.checkpoint(
+                # DEBUG: route non-fp8 recompute through TE's checkpoint with
+                # use_reentrant=False instead of megatron's reentrant
+                # CheckpointFunction. Non-reentrant frees each layer's saved input
+                # incrementally as the backward unwinds (vs the reentrant path
+                # pinning all ~N layer boundaries + dgrads for the whole backward).
+                # te_checkpoint preserves the model-parallel CUDA RNG tracker, so
+                # dropout recompute stays correct. Testing whether this drains the
+                # ~40 GiB residual-stream accumulation and clears the H200 OOM.
+                return te_checkpoint(
                     forward_func,
                     self.config.distribute_saved_activations,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    self.tp_group,
                     hidden_states,
                     attention_mask,
                     context,
@@ -582,6 +592,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
                     rotary_pos_emb,
                     visual_pos_masks,
                     *deepstack_visual_embeds_tuple,
+                    use_reentrant=False,
                 )
 
         if self.config.recompute_method == "uniform":
