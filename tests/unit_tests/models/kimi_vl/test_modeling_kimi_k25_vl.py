@@ -145,23 +145,24 @@ class TestMergePreExpanded:
 
         assert pos_ids[0].tolist() == [0, 1, 2, 3]
 
+
 def test_batch_size_2(self, helper):
-        """Pre-expanded mode with batch_size=2."""
-        # Each sample has 2 image placeholders
-        input_ids = torch.tensor(
-            [
-                [100, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 200],
-                [300, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 400],
-            ]
-        )
-        inputs_embeds = torch.zeros(2, 4, HIDDEN_DIM)
+    """Pre-expanded mode with batch_size=2."""
+    # Each sample has 2 image placeholders
+    input_ids = torch.tensor(
+        [
+            [100, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 200],
+            [300, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 400],
+        ]
+    )
+    inputs_embeds = torch.zeros(2, 4, HIDDEN_DIM)
 
-        feat1 = torch.ones(2, HIDDEN_DIM) * 1.0
-        feat2 = torch.ones(2, HIDDEN_DIM) * 2.0
-        embedding, _, _, _ = helper.merge([feat1, feat2], inputs_embeds, input_ids)
+    feat1 = torch.ones(2, HIDDEN_DIM) * 1.0
+    feat2 = torch.ones(2, HIDDEN_DIM) * 2.0
+    embedding, _, _, _ = helper.merge([feat1, feat2], inputs_embeds, input_ids)
 
-        assert torch.allclose(embedding[0, 1:3], feat1)
-        assert torch.allclose(embedding[1, 1:3], feat2)
+    assert torch.allclose(embedding[0, 1:3], feat1)
+    assert torch.allclose(embedding[1, 1:3], feat2)
 
 
 def test_resolve_vision_attention_implementation_defaults_to_eager(monkeypatch):
@@ -375,9 +376,9 @@ class TestKimiK25VLModelInit:
         config.provide_language_model = Mock(return_value=mock_lm)
         return config
 
-    @patch("megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl.get_class_from_dynamic_module")
+    @patch("megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl.safe_load_class_from_dynamic_module")
     @patch("megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl.hook_hf_module_setattr_for_tp_grad_sync")
-    @patch("megatron.bridge.models.hf_pretrained.safe_config_loader.safe_load_config_with_retry")
+    @patch("megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl.safe_load_config_with_retry")
     def test_init_with_pre_process(self, mock_safe_load, mock_hook, mock_get_class):
         """Test initialization with pre_process=True creates vision components."""
         config = self._make_mock_config()

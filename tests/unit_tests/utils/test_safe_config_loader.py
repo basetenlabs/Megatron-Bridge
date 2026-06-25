@@ -25,7 +25,10 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 from transformers.configuration_utils import PretrainedConfig
 
-from megatron.bridge.models.hf_pretrained.safe_config_loader import safe_load_config_with_retry
+from megatron.bridge.models.hf_pretrained.safe_config_loader import (
+    safe_load_class_from_dynamic_module,
+    safe_load_config_with_retry,
+)
 
 
 class TestSafeLoadConfigWithRetry:
@@ -469,3 +472,115 @@ class TestSafeLoadConfigWithRetry:
 
                     assert actual_lock_files == expected_lock_files
                     assert len(expected_lock_files) == len(test_paths)  # All should be unique
+
+
+class TestSafeLoadClassFromDynamicModule:
+    """Test suite for safe_load_class_from_dynamic_module function."""
+
+    def setup_method(self):
+        self.test_path = "loaded_weights"
+        self.class_reference = "modeling_kimi_k25.MoonViT3dPretrainedModel"
+        self.mock_class = MagicMock()
+
+    def test_basic_successful_load(self):
+        with patch(
+            "megatron.bridge.models.hf_pretrained.safe_config_loader.get_class_from_dynamic_module"
+        ) as mock_get_class:
+            mock_get_class.return_value = self.mock_class
+
+            result = safe_load_class_from_dynamic_module(self.class_reference, self.test_path)
+
+            assert result == self.mock_class
+            mock_get_class.assert_called_once_with(self.class_reference, self.test_path)
+
+    def test_with_file_locking(self):
+        mock_lock = MagicMock()
+
+        with patch("megatron.bridge.models.hf_pretrained.safe_config_loader.filelock.FileLock") as mock_filelock:
+            mock_filelock.return_value = mock_lock
+            mock_lock.__enter__ = Mock(return_value=mock_lock)
+            mock_lock.__exit__ = Mock(return_value=None)
+
+            with patch(
+                "megatron.bridge.models.hf_pretrained.safe_config_loader.get_class_from_dynamic_module"
+            ) as mock_get_class:
+                mock_get_class.return_value = self.mock_class
+
+                result = safe_load_class_from_dynamic_module(self.class_reference, self.test_path)
+
+                expected_hash = hashlib.md5(str(self.test_path).encode()).hexdigest()
+                expected_lock_file = (
+                    Path.home() / ".cache" / "huggingface" / f".megatron_config_lock_{expected_hash}.lock"
+                )
+                mock_filelock.assert_called_once_with(str(expected_lock_file), timeout=60)
+                mock_lock.__enter__.assert_called_once()
+                mock_lock.__exit__.assert_called_once()
+                assert result == self.mock_class
+
+    def test_shares_lock_with_config_loader(self):
+        mock_lock = MagicMock()
+
+        with patch("megatron.bridge.models.hf_pretrained.safe_config_loader.filelock.FileLock") as mock_filelock:
+            mock_filelock.return_value = mock_lock
+            mock_lock.__enter__ = Mock(return_value=mock_lock)
+            mock_lock.__exit__ = Mock(return_value=None)
+
+            with patch(
+                "megatron.bridge.models.hf_pretrained.safe_config_loader.get_class_from_dynamic_module"
+            ) as mock_get_class:
+                mock_get_class.return_value = self.mock_class
+
+                with patch("megatron.bridge.models.hf_pretrained.safe_config_loader.AutoConfig") as mock_auto_config:
+                    mock_auto_config.from_pretrained.return_value = MagicMock(spec=PretrainedConfig)
+
+                    safe_load_class_from_dynamic_module(self.class_reference, self.test_path)
+                    safe_load_config_with_retry(self.test_path)
+
+                    expected_hash = hashlib.md5(str(self.test_path).encode()).hexdigest()
+                    expected_lock_file = (
+                        Path.home() / ".cache" / "huggingface" / f".megatron_config_lock_{expected_hash}.lock"
+                    )
+                    assert mock_filelock.call_count == 2
+                    assert all(
+                        call_args[0][0] == str(expected_lock_file) for call_args in mock_filelock.call_args_list
+                    )
+
+    def test_retry_on_file_not_found(self):
+        with patch(
+            "megatron.bridge.models.hf_pretrained.safe_config_loader.get_class_from_dynamic_module"
+        ) as mock_get_class:
+            mock_get_class.side_effect = [
+                FileNotFoundError("configuration_deepseek.py"),
+                self.mock_class,
+            ]
+
+            with patch("megatron.bridge.models.hf_pretrained.safe_config_loader.time.sleep"):
+                result = safe_load_class_from_dynamic_module(
+                    self.class_reference, self.test_path, max_retries=3, base_delay=0.1
+                )
+
+                assert result == self.mock_class
+                assert mock_get_class.call_count == 2
+
+    def test_no_retry_on_permanent_failure(self):
+        with patch(
+            "megatron.bridge.models.hf_pretrained.safe_config_loader.get_class_from_dynamic_module"
+        ) as mock_get_class:
+            mock_get_class.side_effect = Exception("Repository not found")
+
+            with pytest.raises(ValueError, match="Failed to load class"):
+                safe_load_class_from_dynamic_module(self.class_reference, self.test_path, max_retries=3)
+
+            mock_get_class.assert_called_once()
+
+    def test_max_retries_exhausted(self):
+        with patch(
+            "megatron.bridge.models.hf_pretrained.safe_config_loader.get_class_from_dynamic_module"
+        ) as mock_get_class:
+            mock_get_class.side_effect = FileNotFoundError("configuration_deepseek.py")
+
+            with patch("megatron.bridge.models.hf_pretrained.safe_config_loader.time.sleep"):
+                with pytest.raises(ValueError, match="Failed to load class.*after 3 attempts"):
+                    safe_load_class_from_dynamic_module(self.class_reference, self.test_path, max_retries=2)
+
+                assert mock_get_class.call_count == 3

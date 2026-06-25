@@ -21,9 +21,12 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel import scatter_to_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from torch import Tensor
-from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
+from megatron.bridge.models.hf_pretrained.safe_config_loader import (
+    safe_load_class_from_dynamic_module,
+    safe_load_config_with_retry,
+)
 from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
 
 
@@ -46,8 +49,7 @@ def _resolve_vision_attention_implementation(config: GPTModelProvider) -> str:
     if attn_impl not in _SUPPORTED_VISION_ATTN_IMPLS:
         supported = ", ".join(sorted(_SUPPORTED_VISION_ATTN_IMPLS))
         raise ValueError(
-            f"Unsupported Kimi vision attention implementation {attn_impl!r}. "
-            f"Expected one of: {supported}."
+            f"Unsupported Kimi vision attention implementation {attn_impl!r}. Expected one of: {supported}."
         )
     return attn_impl
 
@@ -121,7 +123,7 @@ class KimiK25VLModel(MegatronModule):
 
         if pre_process:
             # Load vision tower and projector classes from the custom HuggingFace model code
-            MoonViT3dPretrainedModel = get_class_from_dynamic_module(
+            MoonViT3dPretrainedModel = safe_load_class_from_dynamic_module(
                 "modeling_kimi_k25.MoonViT3dPretrainedModel",
                 config.hf_model_path,
             )
@@ -140,22 +142,20 @@ class KimiK25VLModel(MegatronModule):
                 _vit_module.MoonViT3dEncoder.__init__ = _patched_encoder_init
                 _vit_module.MoonViT3dEncoder._bridge_init_patched = True
 
-            PatchMergerMLP = get_class_from_dynamic_module(
+            PatchMergerMLP = safe_load_class_from_dynamic_module(
                 "modeling_kimi_k25.PatchMergerMLP",
                 config.hf_model_path,
             )
-            ProjectorConfig = get_class_from_dynamic_module(
+            ProjectorConfig = safe_load_class_from_dynamic_module(
                 "modeling_kimi_k25.ProjectorConfig",
                 config.hf_model_path,
             )
-            VisionTowerConfig = get_class_from_dynamic_module(
+            VisionTowerConfig = safe_load_class_from_dynamic_module(
                 "modeling_kimi_k25.VisionTowerConfig",
                 config.hf_model_path,
             )
 
             # load vision config from hf model path
-            from megatron.bridge.models.hf_pretrained.safe_config_loader import safe_load_config_with_retry
-
             config.vision_config = safe_load_config_with_retry(
                 config.hf_model_path, trust_remote_code=True
             ).vision_config
@@ -166,7 +166,7 @@ class KimiK25VLModel(MegatronModule):
             # Patch: some versions of MoonViT3dEncoder.__init__ reference
             # self.use_deterministic_attn before setting it.  Inject a default
             # via the class so the attribute lookup succeeds.
-            MoonViT3dEncoder = get_class_from_dynamic_module(
+            MoonViT3dEncoder = safe_load_class_from_dynamic_module(
                 "modeling_kimi_k25.MoonViT3dEncoder",
                 config.hf_model_path,
             )
