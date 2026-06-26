@@ -114,6 +114,14 @@ class GLM5Bridge(MegatronModelBridge):
         provider.dsa_indexer_loss_coeff = 0.001
         provider.dsa_indexer_use_sparse_loss = True
 
+        # GLM-5.2 cross-layer top-k sharing (IndexShare). Architecture-level: read from
+        # the HF config. Defaults (freq=1, offset=first_k_dense_replace) reduce to the
+        # GLM-5 per-layer-indexer behaviour, so this is backward compatible.
+        provider.dsa_indexer_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+        provider.dsa_indexer_skip_topk_offset = getattr(
+            hf_config, "index_skip_topk_offset", hf_config.first_k_dense_replace
+        )
+
         return provider
 
     def mapping_registry(self) -> MegatronMappingRegistry:
