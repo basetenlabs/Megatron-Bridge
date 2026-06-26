@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
+import os
 
 from megatron.core.models.gpt.gpt_model import GPTModel
 from transformers import GlmMoeDsaForCausalLM
@@ -73,6 +75,18 @@ class GLM5Bridge(MegatronModelBridge):
         provider.share_embeddings_and_output_weights = False
         provider.qk_layernorm = True
         provider.multi_latent_attention = True
+
+        # Work around a transformers GlmMoeDsaConfig bug that collapses qk_rope_head_dim onto
+        # head_dim (e.g. it reports 192 instead of 64 for GLM-5.2), which corrupts every MLA
+        # shape derived from qk_pos_emb_head_dim (kv_a_proj, RoPE, etc.). The on-disk
+        # config.json carries the correct split dims, so read them directly. (When qk_nope ==
+        # qk_rope, as in the tiny debug model, this is a no-op.)
+        raw_config_path = os.path.join(getattr(hf_config, "_name_or_path", ""), "config.json")
+        if os.path.isfile(raw_config_path):
+            with open(raw_config_path) as raw_config_file:
+                raw_config = json.load(raw_config_file)
+            provider.qk_head_dim = raw_config["qk_nope_head_dim"]
+            provider.qk_pos_emb_head_dim = raw_config["qk_rope_head_dim"]
 
         # Disable MTP (Multi-Token Prediction) — HF config has num_nextn_predict_layers=1
         # but Bridge does not yet have MTP weight mappings for GLM-5.
