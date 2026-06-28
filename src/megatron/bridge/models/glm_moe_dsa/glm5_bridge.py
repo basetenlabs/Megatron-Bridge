@@ -26,6 +26,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     GatedMLPMapping,
     QKVMapping,
 )
+from megatron.bridge.models.conversion.quantization_utils import maybe_dequantize_fp8_blockwise
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.mla_provider import MLAModelProvider
 
@@ -228,3 +229,28 @@ class GLM5Bridge(MegatronModelBridge):
         )
 
         return MegatronMappingRegistry(*mapping_list)
+
+    def maybe_modify_loaded_hf_weight(self, hf_param, hf_state_dict):
+        """Dequantize block-wise FP8 (GLM-5.2-FP8) HF weights on load.
+
+        GLM-5.2-FP8 stores linear weights as float8_e4m3fn with a companion
+        ``<param>_scale_inv`` tensor per 128x128 block (DeepSeek-style; the HF
+        config carries ``weight_block_size=[128, 128]``). Layers listed in the
+        checkpoint's ``modules_to_not_convert`` have no scale and pass through
+        unchanged. This lets the bf16 (``zai-org/GLM-5.2``) and FP8
+        (``zai-org/GLM-5.2-FP8``) checkpoints both convert through this bridge,
+        so a single Loops config can train + sample on the FP8 id.
+        """
+        hf_weights = super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
+        if isinstance(hf_weights, dict):
+            return {
+                key: self._maybe_dequant_fp8(tensor, hf_param[key], hf_state_dict)
+                for key, tensor in hf_weights.items()
+            }
+        return self._maybe_dequant_fp8(hf_weights, hf_param, hf_state_dict)
+
+    @staticmethod
+    def _maybe_dequant_fp8(weight, param_name, hf_state_dict):
+        """Block-wise dequant ``weight`` if FP8, using ``<param_name>_scale_inv``."""
+        scale_inv = hf_state_dict.get(param_name + "_scale_inv")
+        return maybe_dequantize_fp8_blockwise(weight, scale_inv)
