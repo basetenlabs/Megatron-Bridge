@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import os
 from collections.abc import Callable, Mapping
 
 import torch
@@ -326,6 +327,14 @@ def dequantize_mxfp4_e2m1_packed(
     tensors can be passed directly; ``.to(torch.float32)`` materializes their
     power-of-two values.
     """
+    # DSV4_GPU_DEQUANT: run the unpack/dequant on GPU rather than the (much slower)
+    # CPU int64 path. Move the packed weight + scale to CUDA first; the dequantized
+    # result is copied to GPU right after load anyway, and processing one parameter
+    # at a time keeps the extra GPU memory bounded. Unset -> unchanged CPU path.
+    if os.environ.get("DSV4_GPU_DEQUANT") == "1" and torch.cuda.is_available() \
+            and weight_packed.device.type == "cpu":
+        weight_packed = weight_packed.cuda(non_blocking=True)
+        scale = scale.cuda(non_blocking=True)
     w_u8 = weight_packed.view(torch.uint8)
     lo = (w_u8 & 0xF).to(torch.int64)
     hi = (w_u8 >> 4).to(torch.int64)
