@@ -349,6 +349,25 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
         if self.pp_size == 1:
             return tensor
 
+        # BT_PROBE (debug branch): env-gated JSONL forensics, no-op when unset.
+        from megatron.bridge.models.conversion._bt_probe import probe_enabled, probe_log, tensor_spec as _bt_tspec
+
+        _probe = probe_enabled()
+        _cache_hit = cache_key is not None and cache_key in self._tensor_spec_output_cache
+        if _probe:
+            probe_log(
+                "bcast_from_pp_rank.enter",
+                mapping_cls=type(self).__name__,
+                mapping_id=id(self),
+                megatron_param=str(self.megatron_param),
+                hf_param=str(self.hf_param),
+                cache_key=cache_key,
+                cache_hit=_cache_hit,
+                cache_len=len(self._tensor_spec_output_cache),
+                local_tensor=_bt_tspec(tensor),
+                pp_size=self.pp_size,
+            )
+
         # ------------------------------------------------------------------
         # 1.  Gather (shape, dtype, tensor_parallel flag, partition_dim) from
         #     every PP rank so that we can find the source rank.
@@ -365,8 +384,16 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
             else:
                 tensor_spec = None
 
+            if _probe:
+                probe_log("bcast_from_pp_rank.all_gather_object.enter", cache_key=cache_key, my_spec=str(tensor_spec))
             tensor_spec_output: list[Optional[tuple]] = [None] * self.pp_size
             torch.distributed.all_gather_object(tensor_spec_output, tensor_spec, group=self.pp_group)
+            if _probe:
+                probe_log(
+                    "bcast_from_pp_rank.all_gather_object.exit",
+                    cache_key=cache_key,
+                    gathered_specs=[str(s) for s in tensor_spec_output],
+                )
             self._tensor_spec_output_cache[cache_key] = tensor_spec_output
 
         # ------------------------------------------------------------------
@@ -392,6 +419,7 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
         # 3.  Ensure every rank has an allocated tensor with the right shape
         #     and dtype before the broadcast.
         # ------------------------------------------------------------------
+        _alloc_from_spec = tensor is None
         if tensor is None:
             shape, dtype, tensor_parallel, partition_dim = target_tensor_spec
             # Use CPU by default, unless CUDA is available
@@ -406,7 +434,19 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
         # 4.  Broadcast from the source PP rank to all other PP ranks.
         # ------------------------------------------------------------------
         global_src = torch.distributed.get_global_rank(group=self.pp_group, group_rank=src_rank)
+        if _probe:
+            probe_log(
+                "bcast_from_pp_rank.broadcast.enter",
+                cache_key=cache_key,
+                src_rank_in_pp=src_rank,
+                global_src=global_src,
+                alloc_from_spec=_alloc_from_spec,
+                target_spec=str(target_tensor_spec),
+                bcast_tensor=_bt_tspec(tensor),
+            )
         torch.distributed.broadcast(tensor, src=global_src, group=self.pp_group)
+        if _probe:
+            probe_log("bcast_from_pp_rank.broadcast.exit", cache_key=cache_key)
 
         return tensor
 

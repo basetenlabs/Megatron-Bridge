@@ -757,8 +757,31 @@ class MegatronPeftBridge:
 
         from megatron.bridge.models.conversion.model_bridge import MegatronWeightTuple
 
+        # BT_PROBE (debug branch): env-gated JSONL forensics, no-op when unset.
+        from megatron.bridge.models.conversion._bt_probe import probe_enabled, probe_log, tensor_spec as _bt_tspec
+
+        _probe = probe_enabled()
+
         materialized: List[AdapterWeight] = []
-        for adapter_task in adapter_tasks:
+        for _task_idx, adapter_task in enumerate(adapter_tasks):
+            if _probe:
+                probe_log(
+                    "materialize_adapter.task.enter",
+                    task_idx=_task_idx,
+                    global_base_prefix=adapter_task.global_base_prefix,
+                    adapter_key=adapter_task.adapter_key,
+                    requires_expert_splits=adapter_task.requires_expert_splits,
+                    linear_in_mapping_cls=type(adapter_task.linear_in_task.mapping).__name__,
+                    linear_in_mapping_id=id(adapter_task.linear_in_task.mapping),
+                    linear_out_mapping_cls=type(adapter_task.linear_out_task.mapping).__name__,
+                    linear_out_mapping_id=id(adapter_task.linear_out_task.mapping),
+                    linear_in_hf=str(adapter_task.linear_in_task.mapping.hf_param),
+                    linear_out_hf=str(adapter_task.linear_out_task.mapping.hf_param),
+                    linear_in_global=adapter_task.linear_in_task.global_param_name,
+                    linear_out_global=adapter_task.linear_out_task.global_param_name,
+                    linear_in_weight=_bt_tspec(adapter_task.linear_in_task.param_weight),
+                    linear_out_weight=_bt_tspec(adapter_task.linear_out_task.param_weight),
+                )
             if adapter_task.requires_expert_splits:
                 linear_in_tp_axis = 2 if isinstance(adapter_task.linear_in_task.mapping, RowParallelMapping) else 1
                 linear_in_tensor = self._materialize_grouped_expert_adapter_tensor(
@@ -798,6 +821,14 @@ class MegatronPeftBridge:
                     ),
                 )
             )
+            if _probe:
+                probe_log(
+                    "materialize_adapter.task.exit",
+                    task_idx=_task_idx,
+                    global_base_prefix=adapter_task.global_base_prefix,
+                    linear_in_out=_bt_tspec(linear_in_tensor),
+                    linear_out_out=_bt_tspec(linear_out_tensor),
+                )
 
         return materialized
 
