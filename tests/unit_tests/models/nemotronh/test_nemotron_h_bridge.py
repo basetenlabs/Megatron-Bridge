@@ -958,3 +958,72 @@ class TestNemotronHBridgeMTPIntegration:
         assert len(mtp_mappings) == 0
         qkv_mappings = [m for m in registry.mappings if isinstance(m, _MTPFlatteningQKVMapping)]
         assert len(qkv_mappings) == 0
+
+
+class TestNemotronHDequantOnLoad:
+    """Tests for maybe_modify_loaded_hf_weight ModelOpt NVFP4/FP8 dequantization."""
+
+    def test_str_param_nvfp4_dequantized(self):
+        """A packed NVFP4 routed-expert weight is dequantized to dense bf16."""
+        bridge = NemotronHBridge()
+        name = "backbone.layers.7.mixer.experts.3.up_proj.weight"
+        # 0x21: low nibble = code 1 (+0.5), high nibble = code 2 (+1.0).
+        state = {
+            name: torch.tensor([[0x21]], dtype=torch.uint8),
+            f"{name}_scale": torch.ones(1, 1, dtype=torch.float8_e4m3fn),
+            f"{name}_scale_2": torch.tensor(2.0),
+        }
+
+        result = bridge.maybe_modify_loaded_hf_weight(name, state)
+
+        assert result.dtype == torch.bfloat16
+        torch.testing.assert_close(
+            result, torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16), rtol=0, atol=0
+        )
+
+    def test_str_param_fp8_dequantized(self):
+        """An FP8 Mamba in_proj weight is dequantized with its per-tensor scale."""
+        bridge = NemotronHBridge()
+        name = "backbone.layers.2.mixer.in_proj.weight"
+        state = {
+            name: torch.tensor([[1.0, -2.0]]).to(torch.float8_e4m3fn),
+            f"{name}_scale": torch.tensor(0.5),
+        }
+
+        result = bridge.maybe_modify_loaded_hf_weight(name, state)
+
+        torch.testing.assert_close(
+            result, torch.tensor([[0.5, -1.0]], dtype=torch.bfloat16), rtol=0, atol=0
+        )
+
+    def test_str_param_bf16_passthrough(self):
+        """BF16 tensors (and BF16 checkpoints generally) load unchanged."""
+        bridge = NemotronHBridge()
+        weight = torch.randn(4, 4, dtype=torch.bfloat16)
+        state = {"backbone.embeddings.weight": weight}
+        result = bridge.maybe_modify_loaded_hf_weight("backbone.embeddings.weight", state)
+        assert result is weight
+
+    def test_dict_param_dequantizes_each_component(self):
+        """Compound (QKV-style) params dequantize each component independently."""
+        bridge = NemotronHBridge()
+        q_name = "backbone.layers.9.mixer.q_proj.weight"
+        k_name = "backbone.layers.9.mixer.k_proj.weight"
+        v_name = "backbone.layers.9.mixer.v_proj.weight"
+        q = torch.randn(4, 4, dtype=torch.bfloat16)
+        k = torch.randn(2, 4, dtype=torch.bfloat16)
+        state = {
+            q_name: q,
+            k_name: k,
+            v_name: torch.tensor([[1.0, 2.0]]).to(torch.float8_e4m3fn),
+            f"{v_name}_scale": torch.tensor(2.0),
+        }
+
+        result = bridge.maybe_modify_loaded_hf_weight({"q": q_name, "k": k_name, "v": v_name}, state)
+
+        assert set(result.keys()) == {"q", "k", "v"}
+        assert result["q"] is q
+        assert result["k"] is k
+        torch.testing.assert_close(
+            result["v"], torch.tensor([[2.0, 4.0]], dtype=torch.bfloat16), rtol=0, atol=0
+        )

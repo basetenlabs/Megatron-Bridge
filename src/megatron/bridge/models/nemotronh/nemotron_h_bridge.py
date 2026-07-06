@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Dict, Mapping, Optional, Tuple, Union
 
 import torch
 from megatron.core.activations import squared_relu
@@ -30,6 +30,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     QKVMapping,
     RowParallelMapping,
 )
+from megatron.bridge.models.conversion.quantization_utils import maybe_dequantize_modelopt_weight
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.mamba.mamba_provider import MambaModelProvider
 
@@ -311,6 +312,26 @@ class NemotronHBridge(MegatronModelBridge):
             provider.keep_mtp_spec_in_bf16 = hf_config.keep_mtp_spec_in_bf16
 
         return provider
+
+    def maybe_modify_loaded_hf_weight(
+        self,
+        hf_param: Union[str, dict[str, str]],
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> Union[torch.Tensor, dict[str, torch.Tensor]]:
+        """Load HF weights, dequantizing ModelOpt NVFP4/FP8 tensors on the fly.
+
+        The ModelOpt MIXED_PRECISION export of Nemotron-3 (e.g.
+        ``nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4``) stores routed
+        experts as packed NVFP4 (uint8 ``weight`` + ``weight_scale`` +
+        ``weight_scale_2``), Mamba in/out projections and shared experts as
+        FP8 (``weight`` + ``weight_scale``), and everything else as BF16.
+        Dequantization happens here, before the parameter mappings run, so the
+        Mamba/QKV/expert mappings see ordinary dense bf16 tensors. BF16
+        checkpoints pass through untouched.
+        """
+        if isinstance(hf_param, str):
+            return maybe_dequantize_modelopt_weight(hf_param, hf_state_dict)
+        return {k: maybe_dequantize_modelopt_weight(v, hf_state_dict) for k, v in hf_param.items()}
 
     @classmethod
     def get_hf_tokenizer_kwargs(cls) -> dict:
