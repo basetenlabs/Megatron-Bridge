@@ -14,6 +14,9 @@
 
 """Compatibility utilities for HuggingFace transformers 5.0+ configs."""
 
+from pathlib import Path
+
+import transformers.dynamic_module_utils as _hf_dyn
 import transformers.utils.import_utils as _hf_import_utils
 
 
@@ -22,6 +25,27 @@ import transformers.utils.import_utils as _hf_import_utils
 # torch.fx has been stable since PyTorch 1.10, so always return True.
 if not hasattr(_hf_import_utils, "is_torch_fx_available"):
     _hf_import_utils.is_torch_fx_available = lambda: True
+
+
+# transformers' get_cached_module_file() copies a remote-code module plus only
+# its *direct* (1-level) relative imports into the transformers_modules cache,
+# while get_class_in_module() resolves relative imports *recursively*. Remote
+# code with a >1-level relative-import chain (e.g. Kimi-K2's
+# modeling_kimi_k25 -> modeling_deepseek -> configuration_deepseek) therefore
+# leaves the transitive files uncopied and loading fails with a FileNotFoundError
+# for the deepest dependency. Make check_imports() return the full transitive set
+# so every relatively-imported sibling module is materialized into the cache.
+if not getattr(_hf_dyn, "_bridge_recursive_check_imports", False):
+    _orig_check_imports = _hf_dyn.check_imports
+
+    def _recursive_check_imports(filename):
+        # Preserve the original missing-third-party-package validation, then
+        # widen the copy set from direct to transitive relative imports.
+        _orig_check_imports(filename)
+        return [Path(f).stem for f in _hf_dyn.get_relative_import_files(filename)]
+
+    _hf_dyn.check_imports = _recursive_check_imports
+    _hf_dyn._bridge_recursive_check_imports = True
 
 
 def rope_theta_from_hf(config) -> float:
