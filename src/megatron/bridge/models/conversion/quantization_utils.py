@@ -90,14 +90,10 @@ def dequantize_nvfp4(
     out_features, packed_in = weight_packed.shape
     in_features = packed_in * 2
     if weight_scale.shape[0] != out_features:
-        raise ValueError(
-            f"weight_scale rows ({weight_scale.shape[0]}) do not match out_features ({out_features})"
-        )
+        raise ValueError(f"weight_scale rows ({weight_scale.shape[0]}) do not match out_features ({out_features})")
     num_blocks = weight_scale.shape[1]
     if num_blocks == 0 or in_features % num_blocks != 0:
-        raise ValueError(
-            f"in_features ({in_features}) is not divisible by the number of scale blocks ({num_blocks})"
-        )
+        raise ValueError(f"in_features ({in_features}) is not divisible by the number of scale blocks ({num_blocks})")
     block_size = in_features // num_blocks
 
     lut = torch.tensor(_FP4_E2M1_VALUES, dtype=torch.float32, device=weight_packed.device)

@@ -22,9 +22,7 @@ def _pack_nvfp4(codes: torch.Tensor) -> torch.Tensor:
     return (lo | (hi << 4)).to(torch.uint8)
 
 
-def _reference_dequant(
-    codes: torch.Tensor, block_scale: torch.Tensor, global_scale: float
-) -> torch.Tensor:
+def _reference_dequant(codes: torch.Tensor, block_scale: torch.Tensor, global_scale: float) -> torch.Tensor:
     """Straightforward per-element reference implementation."""
     out_features, in_features = codes.shape
     block_size = in_features // block_scale.shape[1]
@@ -43,9 +41,11 @@ class TestDequantizeNvfp4:
         out_features, in_features = 4, 64
         codes = torch.randint(0, 16, (out_features, in_features), dtype=torch.uint8)
         # Powers of two are exactly representable in float8_e4m3fn.
-        block_scale = torch.tensor(
-            [[0.5, 1.0, 2.0, 4.0]] * out_features, dtype=torch.float32
-        ).repeat_interleave(in_features // 16 // 4, dim=1).to(torch.float8_e4m3fn)
+        block_scale = (
+            torch.tensor([[0.5, 1.0, 2.0, 4.0]] * out_features, dtype=torch.float32)
+            .repeat_interleave(in_features // 16 // 4, dim=1)
+            .to(torch.float8_e4m3fn)
+        )
         global_scale = torch.tensor(2.0, dtype=torch.float32)
 
         result = dequantize_nvfp4(_pack_nvfp4(codes), block_scale, global_scale)
@@ -67,9 +67,7 @@ class TestDequantizeNvfp4:
     def test_block_size_derived_from_scale_shape(self):
         # 16 elements with 2 scale blocks -> block size 8, not the NVFP4 default 16.
         codes = torch.full((2, 16), 2, dtype=torch.uint8)  # every element +1.0
-        block_scale = torch.tensor(
-            [[1.0, 2.0], [4.0, 0.5]], dtype=torch.float32
-        ).to(torch.float8_e4m3fn)
+        block_scale = torch.tensor([[1.0, 2.0], [4.0, 0.5]], dtype=torch.float32).to(torch.float8_e4m3fn)
         result = dequantize_nvfp4(_pack_nvfp4(codes), block_scale, torch.tensor(1.0))
         expected = torch.cat(
             [
@@ -84,9 +82,7 @@ class TestDequantizeNvfp4:
         packed = torch.tensor([[0x22]], dtype=torch.uint8)  # both elements +1.0
         scale = torch.full((1, 1), 2.0).to(torch.float8_e4m3fn)
         result = dequantize_nvfp4(packed, scale, torch.tensor(0.25))
-        torch.testing.assert_close(
-            result, torch.full((1, 2), 0.5, dtype=torch.bfloat16), rtol=0, atol=0
-        )
+        torch.testing.assert_close(result, torch.full((1, 2), 0.5, dtype=torch.bfloat16), rtol=0, atol=0)
 
     def test_rejects_indivisible_scale_blocks(self):
         packed = torch.zeros(2, 8, dtype=torch.uint8)  # in_features = 16
@@ -121,35 +117,25 @@ class TestMaybeDequantizeModeloptWeight:
         packed = torch.tensor([[0x21, 0xA3]], dtype=torch.uint8)
         state = {
             "backbone.layers.5.mixer.experts.0.up_proj.weight": packed,
-            "backbone.layers.5.mixer.experts.0.up_proj.weight_scale": torch.ones(
-                1, 1, dtype=torch.float8_e4m3fn
-            ),
+            "backbone.layers.5.mixer.experts.0.up_proj.weight_scale": torch.ones(1, 1, dtype=torch.float8_e4m3fn),
             "backbone.layers.5.mixer.experts.0.up_proj.weight_scale_2": torch.tensor(1.0),
         }
-        result = maybe_dequantize_modelopt_weight(
-            "backbone.layers.5.mixer.experts.0.up_proj.weight", state
-        )
+        result = maybe_dequantize_modelopt_weight("backbone.layers.5.mixer.experts.0.up_proj.weight", state)
         expected = torch.tensor([[0.5, 1.0, 1.5, -1.0]], dtype=torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
     def test_fp8_dispatch_with_scale(self):
         state = {
-            "backbone.layers.3.mixer.in_proj.weight": torch.tensor([[1.0, 2.0]]).to(
-                torch.float8_e4m3fn
-            ),
+            "backbone.layers.3.mixer.in_proj.weight": torch.tensor([[1.0, 2.0]]).to(torch.float8_e4m3fn),
             "backbone.layers.3.mixer.in_proj.weight_scale": torch.tensor(4.0),
         }
         result = maybe_dequantize_modelopt_weight("backbone.layers.3.mixer.in_proj.weight", state)
-        torch.testing.assert_close(
-            result, torch.tensor([[4.0, 8.0]], dtype=torch.bfloat16), rtol=0, atol=0
-        )
+        torch.testing.assert_close(result, torch.tensor([[4.0, 8.0]], dtype=torch.bfloat16), rtol=0, atol=0)
 
     def test_fp8_without_scale_is_plain_cast(self):
         state = {"w": torch.tensor([[1.0, -2.0]]).to(torch.float8_e4m3fn)}
         result = maybe_dequantize_modelopt_weight("w", state)
-        torch.testing.assert_close(
-            result, torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16), rtol=0, atol=0
-        )
+        torch.testing.assert_close(result, torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16), rtol=0, atol=0)
 
     def test_bf16_passthrough_is_identity(self):
         weight = torch.randn(4, 4, dtype=torch.bfloat16)

@@ -977,9 +977,7 @@ class TestNemotronHDequantOnLoad:
         result = bridge.maybe_modify_loaded_hf_weight(name, state)
 
         assert result.dtype == torch.bfloat16
-        torch.testing.assert_close(
-            result, torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16), rtol=0, atol=0
-        )
+        torch.testing.assert_close(result, torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16), rtol=0, atol=0)
 
     def test_str_param_fp8_dequantized(self):
         """An FP8 Mamba in_proj weight is dequantized with its per-tensor scale."""
@@ -992,9 +990,7 @@ class TestNemotronHDequantOnLoad:
 
         result = bridge.maybe_modify_loaded_hf_weight(name, state)
 
-        torch.testing.assert_close(
-            result, torch.tensor([[0.5, -1.0]], dtype=torch.bfloat16), rtol=0, atol=0
-        )
+        torch.testing.assert_close(result, torch.tensor([[0.5, -1.0]], dtype=torch.bfloat16), rtol=0, atol=0)
 
     def test_str_param_bf16_passthrough(self):
         """BF16 tensors (and BF16 checkpoints generally) load unchanged."""
@@ -1024,6 +1020,4 @@ class TestNemotronHDequantOnLoad:
         assert set(result.keys()) == {"q", "k", "v"}
         assert result["q"] is q
         assert result["k"] is k
-        torch.testing.assert_close(
-            result["v"], torch.tensor([[2.0, 4.0]], dtype=torch.bfloat16), rtol=0, atol=0
-        )
+        torch.testing.assert_close(result["v"], torch.tensor([[2.0, 4.0]], dtype=torch.bfloat16), rtol=0, atol=0)
