@@ -126,6 +126,12 @@ class GLM5Bridge(MegatronModelBridge):
         provider.dsa_indexer_head_dim = hf_config.index_head_dim
         provider.dsa_indexer_n_heads = hf_config.index_n_heads
         provider.dsa_indexer_topk = hf_config.index_topk
+        # GLM-5.2's indexer applies interleaved (GPT-J) RoPE; the trainer must
+        # match serving. Default-False-when-absent mirrors vLLM's read exactly
+        # (``is_neox_style = not getattr(config, "indexer_rope_interleave", False)``).
+        provider.dsa_indexer_rope_interleave = getattr(
+            hf_config, "indexer_rope_interleave", False
+        )
         provider.dsa_indexer_loss_coeff = 0.001
         provider.dsa_indexer_use_sparse_loss = True
 
