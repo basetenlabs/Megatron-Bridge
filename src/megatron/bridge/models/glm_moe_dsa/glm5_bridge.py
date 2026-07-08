@@ -137,6 +137,14 @@ class GLM5Bridge(MegatronModelBridge):
             hf_config, "index_skip_topk_offset", hf_config.first_k_dense_replace
         )
 
+        # GLM-5.2's indexer applies interleaved (GPT-J) RoPE; the trainer must match the
+        # serving engine or top-k selection drifts with sequence length. Mirrors vLLM's read
+        # (``is_neox_style = not getattr(config, "indexer_rope_interleave", False)``). Upstream
+        # Megatron-LM's config field is ``dsa_indexer_rope_interleaved`` (past-tense).
+        provider.dsa_indexer_rope_interleaved = getattr(
+            hf_config, "indexer_rope_interleave", False
+        )
+
         return provider
 
     def mapping_registry(self) -> MegatronMappingRegistry:
