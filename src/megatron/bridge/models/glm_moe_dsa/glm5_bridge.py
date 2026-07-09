@@ -141,7 +141,9 @@ class GLM5Bridge(MegatronModelBridge):
         provider.dsa_indexer_topk = hf_config.index_topk
         provider.dsa_indexer_rope_interleaved = hf_config.indexer_rope_interleave
         provider.dsa_indexer_topk_freq = getattr(hf_config, "index_topk_freq", 1)
-        provider.dsa_indexer_skip_topk_offset = getattr(hf_config, "index_skip_topk_offset", 0)
+        provider.dsa_indexer_skip_topk_offset = getattr(
+            hf_config, "index_skip_topk_offset", hf_config.first_k_dense_replace
+        )
         provider.dsa_indexer_rotate_activation = False
         provider.dsa_indexer_k_norm_epsilon = 1e-6
         provider.dsa_indexer_loss_coeff = 0.001
