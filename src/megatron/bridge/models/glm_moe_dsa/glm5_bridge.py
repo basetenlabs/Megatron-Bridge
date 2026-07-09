@@ -151,6 +151,7 @@ class GLM5Bridge(MegatronModelBridge):
         )
         provider.dsa_indexer_rotate_activation = False
         provider.dsa_indexer_k_norm_epsilon = 1e-6
+        provider.dsa_kernel_backend = "cudnn"
         provider.dsa_indexer_loss_coeff = 0.001
         provider.dsa_indexer_use_sparse_loss = True
 
