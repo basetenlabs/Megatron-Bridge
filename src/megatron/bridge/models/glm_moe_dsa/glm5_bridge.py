@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -93,6 +95,15 @@ class GLM5Bridge(MegatronModelBridge):
         provider.qk_layernorm = True
         provider.multi_latent_attention = True
 
+        # Work around transformers configs that collapse qk_rope_head_dim onto
+        # head_dim for GLM-5.2. The on-disk config carries the real MLA split.
+        raw_config_path = os.path.join(getattr(hf_config, "_name_or_path", ""), "config.json")
+        if os.path.isfile(raw_config_path):
+            with open(raw_config_path) as raw_config_file:
+                raw_config = json.load(raw_config_file)
+            provider.qk_head_dim = raw_config["qk_nope_head_dim"]
+            provider.qk_pos_emb_head_dim = raw_config["qk_rope_head_dim"]
+
         # Disable MTP (Multi-Token Prediction) by default
         # HF config has num_nextn_predict_layers=1
         provider.mtp_num_layers = None
@@ -141,7 +152,9 @@ class GLM5Bridge(MegatronModelBridge):
         provider.dsa_indexer_topk = hf_config.index_topk
         provider.dsa_indexer_rope_interleaved = hf_config.indexer_rope_interleave
         provider.dsa_indexer_topk_freq = getattr(hf_config, "index_topk_freq", 1)
-        provider.dsa_indexer_skip_topk_offset = getattr(hf_config, "index_skip_topk_offset", 0)
+        provider.dsa_indexer_skip_topk_offset = getattr(
+            hf_config, "index_skip_topk_offset", hf_config.first_k_dense_replace
+        )
         provider.dsa_indexer_rotate_activation = False
         provider.dsa_indexer_k_norm_epsilon = 1e-6
         provider.dsa_indexer_loss_coeff = 0.001
