@@ -37,7 +37,6 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedState
 from megatron.core.dist_checkpointing.serialization import (
     StateDict,
     get_default_load_sharded_strategy,
-    get_default_save_sharded_strategy,
 )
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
@@ -91,6 +90,17 @@ from megatron.bridge.utils.common_utils import (
 )
 from megatron.bridge.utils.import_utils import safe_import
 from megatron.bridge.utils.instantiate_utils import _validate_target_prefix
+
+
+try:
+    from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
+except ImportError:
+
+    def get_default_save_sharded_strategy(ckpt_format: str):
+        """Compatibility for Megatron-Core versions without this helper."""
+        if ckpt_format == "torch_dist":
+            return TorchDistSaveShardedStrategy("torch_dist", 1)
+        raise ValueError(f"Unsupported checkpoint format: {ckpt_format}")
 
 
 _, HAVE_RESIL = safe_import("nvidia_resiliency_ext.checkpointing")
