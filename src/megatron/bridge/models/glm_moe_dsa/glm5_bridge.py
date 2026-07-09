@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
+import os
 
 from megatron.core.models.gpt.gpt_model import GPTModel
 from transformers import GlmMoeDsaForCausalLM
@@ -24,6 +26,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     GatedMLPMapping,
     QKVMapping,
 )
+from megatron.bridge.models.conversion.quantization_utils import maybe_dequantize_fp8_blockwise
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.mla_provider import MLAModelProvider
 
@@ -74,6 +77,15 @@ class GLM5Bridge(MegatronModelBridge):
         provider.qk_layernorm = True
         provider.multi_latent_attention = True
 
+        # Work around transformers configs that collapse qk_rope_head_dim onto
+        # head_dim for GLM-5.2. The on-disk config carries the real MLA split.
+        raw_config_path = os.path.join(getattr(hf_config, "_name_or_path", ""), "config.json")
+        if os.path.isfile(raw_config_path):
+            with open(raw_config_path) as raw_config_file:
+                raw_config = json.load(raw_config_file)
+            provider.qk_head_dim = raw_config["qk_nope_head_dim"]
+            provider.qk_pos_emb_head_dim = raw_config["qk_rope_head_dim"]
+
         # Disable MTP (Multi-Token Prediction) by default
         # HF config has num_nextn_predict_layers=1
         provider.mtp_num_layers = None
@@ -114,7 +126,9 @@ class GLM5Bridge(MegatronModelBridge):
         provider.dsa_indexer_topk = hf_config.index_topk
         provider.dsa_indexer_rope_interleaved = hf_config.indexer_rope_interleave
         provider.dsa_indexer_topk_freq = getattr(hf_config, "index_topk_freq", 1)
-        provider.dsa_indexer_skip_topk_offset = getattr(hf_config, "index_skip_topk_offset", 0)
+        provider.dsa_indexer_skip_topk_offset = getattr(
+            hf_config, "index_skip_topk_offset", hf_config.first_k_dense_replace
+        )
         provider.dsa_indexer_rotate_activation = False
         provider.dsa_indexer_k_norm_epsilon = 1e-6
         provider.dsa_indexer_loss_coeff = 0.001
@@ -289,3 +303,18 @@ class GLM5Bridge(MegatronModelBridge):
                 )
 
         return MegatronMappingRegistry(*mapping_list)
+
+    def maybe_modify_loaded_hf_weight(self, hf_param, hf_state_dict):
+        """Dequantize block-wise FP8 GLM-5.2 HF weights on load."""
+        hf_weights = super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
+        if isinstance(hf_weights, dict):
+            return {
+                key: self._maybe_dequant_fp8(tensor, hf_param[key], hf_state_dict)
+                for key, tensor in hf_weights.items()
+            }
+        return self._maybe_dequant_fp8(hf_weights, hf_param, hf_state_dict)
+
+    @staticmethod
+    def _maybe_dequant_fp8(weight, param_name, hf_state_dict):
+        scale_inv = hf_state_dict.get(param_name + "_scale_inv")
+        return maybe_dequantize_fp8_blockwise(weight, scale_inv)
