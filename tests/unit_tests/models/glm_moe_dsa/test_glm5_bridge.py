@@ -137,6 +137,7 @@ def test_provider_bridge_maps_dsa_architecture_from_hf_config(
     assert provider.dsa_indexer_skip_topk_offset == expected_skip_topk_offset
     assert provider.dsa_indexer_rotate_activation is False
     assert provider.dsa_indexer_k_norm_epsilon == 1e-6
+    assert provider.dsa_kernel_backend == "cudnn"
     assert provider.dsa_indexer_loss_coeff == 0.001
     assert provider.dsa_indexer_use_sparse_loss is True
 
