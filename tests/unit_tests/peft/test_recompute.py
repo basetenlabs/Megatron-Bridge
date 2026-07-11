@@ -39,10 +39,10 @@ class DummyTransformerBlock(torch.nn.Module):
 
 
 class DummyModel(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, block_cls=None) -> None:
         super().__init__()
         self.config = SimpleNamespace(recompute_method="uniform")
-        self.block = DummyTransformerBlock()
+        self.block = (block_cls or DummyTransformerBlock)()
 
         # Frozen base parameter (not trainable)
         self.base = torch.nn.Linear(1, 1, bias=False)
@@ -59,6 +59,10 @@ class DummyModel(torch.nn.Module):
             yield module
 
 
+class DummyHybridStack(DummyTransformerBlock):
+    """Distinct dummy type standing in for megatron's HybridStack."""
+
+
 def _patch_transformer_block(monkeypatch):
     import megatron.core.transformer.transformer_block as transformer_block
 
@@ -66,6 +70,17 @@ def _patch_transformer_block(monkeypatch):
         transformer_block,
         "TransformerBlock",
         DummyTransformerBlock,
+        raising=False,
+    )
+
+
+def _patch_hybrid_stack(monkeypatch):
+    import megatron.core.models.hybrid.hybrid_block as hybrid_block
+
+    monkeypatch.setattr(
+        hybrid_block,
+        "HybridStack",
+        DummyHybridStack,
         raising=False,
     )
 
@@ -90,3 +105,22 @@ def test_maybe_enable_recompute_inputs_grad_patches_block(monkeypatch):
     # Second invocation should be a no-op (no duplicate patch)
     maybe_enable_recompute_inputs_grad(model, patched_registry)
     assert model.block.forward is patched_forward
+
+
+def test_maybe_enable_recompute_inputs_grad_patches_hybrid_stack(monkeypatch):
+    # HybridStack honours recompute_granularity='full' via the same reentrant
+    # checkpoint as TransformerBlock, so adapter-only training needs the same
+    # input-grad fix — without it LoRA gradients are silently zero at PP=1.
+    _patch_hybrid_stack(monkeypatch)
+    recompute_mod.PEFT_RECOMPUTE_PATCHED.clear()
+
+    model = DummyModel(block_cls=DummyHybridStack)
+    patched_registry = maybe_enable_recompute_inputs_grad(model, set())
+
+    assert id(model) in patched_registry
+
+    input_tensor = torch.zeros(2, 2)
+    assert input_tensor.requires_grad is False
+
+    model.block(input_tensor)
+    assert model.block.last_input_requires_grad is True
