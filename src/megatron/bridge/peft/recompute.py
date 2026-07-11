@@ -53,14 +53,20 @@ def maybe_enable_recompute_inputs_grad(model, peft_recompute_patched: Set[int] |
       This means CheckpointFunction.backward() is never called, and LoRA gradients
       inside the checkpoint are never computed.
 
-    Solution: Hook TransformerBlock.forward to ensure hidden_states.requires_grad=True
+    Solution: Hook the decoder block's forward to ensure hidden_states.requires_grad=True
     before it enters checkpointed computation. This doesn't unfreeze any parameters;
     it just ensures the autograd machinery calls checkpoint's backward.
+
+    ``HybridStack`` (Mamba hybrids such as NemotronH / Nemotron 3) honours
+    ``recompute_granularity='full'`` via the same reentrant checkpoint since
+    megatron-core 0.19 and needs the same fix — without it, adapter-only hybrid
+    training at PP=1 silently produces zero gradients.
 
     Borrowed (with modifications) from
     https://github.com/HollowMan6/verl/blob/4285f0601028aee7ddcb9ec5a15198ebfc69bba3/verl/utils/megatron_peft_utils.py
     """
 
+    from megatron.core.models.hybrid.hybrid_block import HybridStack
     from megatron.core.transformer.transformer_block import TransformerBlock
 
     patched_registry = peft_recompute_patched or PEFT_RECOMPUTE_PATCHED
@@ -83,8 +89,8 @@ def maybe_enable_recompute_inputs_grad(model, peft_recompute_patched: Set[int] |
             if not (trainable_adapter and not trainable_base):
                 continue  # Not adapter-only training, no fix needed
 
-            def _patch_transformer_block(module: torch.nn.Module) -> bool:
-                if isinstance(module, TransformerBlock):
+            def _patch_block(module: torch.nn.Module) -> bool:
+                if isinstance(module, (TransformerBlock, HybridStack)):
                     original_forward = module.forward
 
                     @wraps(original_forward)
@@ -104,18 +110,18 @@ def maybe_enable_recompute_inputs_grad(model, peft_recompute_patched: Set[int] |
 
             patched = False
             for module in unwrapped_model.modules():
-                if _patch_transformer_block(module):
+                if _patch_block(module):
                     patched = True
             if patched:
                 patched_registry.add(id(unwrapped_model))
                 print_rank_0(
-                    "[PEFT+Recompute] Patched TransformerBlock.forward to enable grad on "
+                    "[PEFT+Recompute] Patched decoder block forward to enable grad on "
                     "hidden_states input. This ensures checkpoint backward is called when "
                     "only adapters are trainable (PP=1 with frozen base model).",
                 )
     except Exception as exc:  # pragma: no cover - best effort logging
         # Log but don't fail - user will see grad_norm=0 and can debug
-        print_rank_0(f"[PEFT+Recompute] Warning: Failed to patch TransformerBlock: {exc}")
+        print_rank_0(f"[PEFT+Recompute] Warning: Failed to patch decoder block: {exc}")
 
     return patched_registry
 
