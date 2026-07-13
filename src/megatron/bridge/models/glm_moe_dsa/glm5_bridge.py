@@ -94,7 +94,8 @@ class GLM5Bridge(MegatronModelBridge):
         provider.qk_layernorm = True
         provider.multi_latent_attention = True
 
-        # transformers loses the GLM qk head-dimension split.
+        # Work around transformers configs that collapse qk_rope_head_dim onto
+        # head_dim for GLM-5.2. The on-disk config carries the real MLA split.
         raw_config = _load_raw_hf_config(getattr(hf_config, "_name_or_path", ""))
         provider.qk_head_dim = raw_config["qk_nope_head_dim"]
         provider.qk_pos_emb_head_dim = raw_config["qk_rope_head_dim"]
