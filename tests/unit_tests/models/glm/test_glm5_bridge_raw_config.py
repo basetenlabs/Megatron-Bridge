@@ -12,13 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Unit tests for the GLM-5 raw-config resolution used by the qk head-dim
-workaround (transformers GlmMoeDsaConfig collapses qk_rope_head_dim, so
-GLM5Bridge re-reads the on-disk config.json).
-"""
-
 import json
+
+import pytest
 
 from megatron.bridge.models.glm_moe_dsa.glm5_bridge import _load_raw_hf_config
 
@@ -47,7 +43,7 @@ def test_hub_id_resolves_through_hub_cache(tmp_path, monkeypatch):
     assert calls == {"repo_id": "zai-org/GLM-5.2-FP8", "filename": "config.json"}
 
 
-def test_unresolvable_name_returns_none(monkeypatch):
+def test_unresolvable_name_raises(monkeypatch):
     def fake_download(repo_id, filename):
         raise OSError("offline and not in the hub cache")
 
@@ -55,4 +51,5 @@ def test_unresolvable_name_returns_none(monkeypatch):
         "megatron.bridge.models.glm_moe_dsa.glm5_bridge.hf_hub_download",
         fake_download,
     )
-    assert _load_raw_hf_config("zai-org/GLM-5.2-FP8") is None
+    with pytest.raises(RuntimeError, match="GLM-5 requires raw config"):
+        _load_raw_hf_config("zai-org/GLM-5.2-FP8")

@@ -80,11 +80,6 @@ def dequantize_fp8_blockwise(
     """
     M, N = weight.shape
     w = weight.float()
-    # Vectorized block expansion: the per-(bi, bj) Python loop costs ~1k
-    # iterations per tensor (~45M across an 800B checkpoint) and made the
-    # FP8 load CPU-bound for tens of minutes. Expanding scale_inv with two
-    # repeat_interleaves and multiplying once is numerically identical
-    # (same float32 elementwise product, same scales).
     scales = scale_inv.to(device=w.device, dtype=torch.float32)
     scales = scales.repeat_interleave(block_size, dim=0)[:M]
     scales = scales.repeat_interleave(block_size, dim=1)[:, :N]

@@ -35,15 +35,8 @@ from megatron.bridge.models.mla_provider import MLAModelProvider
 logger = logging.getLogger(__name__)
 
 
-def _load_raw_hf_config(name_or_path: str) -> dict | None:
-    """Return the raw config.json for a local snapshot dir or a hub repo id.
-
-    Bypasses transformers config parsing on purpose: GlmMoeDsaConfig mangles
-    the qk head-dim split (see provider_bridge), so callers need the on-disk
-    values. For a repo id the file resolves through the hub cache —
-    transformers already fetched config.json to build the parsed config, so
-    this works offline (HF_HUB_OFFLINE) too.
-    """
+def _load_raw_hf_config(name_or_path: str) -> dict:
+    """Load raw config.json for a local snapshot or hub repo."""
     local_path = os.path.join(name_or_path, "config.json")
     if os.path.isfile(local_path):
         with open(local_path) as f:
@@ -51,13 +44,9 @@ def _load_raw_hf_config(name_or_path: str) -> dict | None:
     try:
         resolved = hf_hub_download(repo_id=name_or_path, filename="config.json")
     except Exception as exc:
-        logger.warning(
-            "Could not resolve raw config.json for %r locally or from the hub "
-            "cache: %s",
-            name_or_path,
-            exc,
-        )
-        return None
+        raise RuntimeError(
+            f"GLM-5 requires raw config.json for {name_or_path!r} to preserve qk head dimensions."
+        ) from exc
     with open(resolved) as f:
         return json.load(f)
 
@@ -105,23 +94,10 @@ class GLM5Bridge(MegatronModelBridge):
         provider.qk_layernorm = True
         provider.multi_latent_attention = True
 
-        # Work around a transformers GlmMoeDsaConfig bug that collapses qk_rope_head_dim onto
-        # head_dim (e.g. it reports 192 instead of 64 for GLM-5.2), which corrupts every MLA
-        # shape derived from qk_pos_emb_head_dim (kv_a_proj, RoPE, etc.). The on-disk
-        # config.json carries the correct split dims, so read them directly — from the local
-        # directory when base_model is a snapshot path, otherwise via the hub cache, so
-        # hub-id launches (prod) get the fix too. (When qk_nope == qk_rope, as in the tiny
-        # debug model, this is a no-op.)
+        # transformers loses the GLM qk head-dimension split.
         raw_config = _load_raw_hf_config(getattr(hf_config, "_name_or_path", ""))
-        if raw_config is not None:
-            provider.qk_head_dim = raw_config["qk_nope_head_dim"]
-            provider.qk_pos_emb_head_dim = raw_config["qk_rope_head_dim"]
-        else:
-            logger.warning(
-                "Skipping the GLM-5 qk head-dim workaround (raw config.json "
-                "unavailable). If qk_nope_head_dim != qk_rope_head_dim (as in "
-                "GLM-5.2), weight load will fail with a kv_a_proj shape mismatch."
-            )
+        provider.qk_head_dim = raw_config["qk_nope_head_dim"]
+        provider.qk_pos_emb_head_dim = raw_config["qk_rope_head_dim"]
 
         # Disable MTP (Multi-Token Prediction) by default
         # HF config has num_nextn_predict_layers=1
