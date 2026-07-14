@@ -17,6 +17,7 @@ import logging
 import os
 from typing import Any
 
+from huggingface_hub import hf_hub_download
 from megatron.core.models.gpt.gpt_model import GPTModel
 from transformers import GlmMoeDsaForCausalLM
 
@@ -33,6 +34,22 @@ from megatron.bridge.models.mla_provider import MLAModelProvider
 
 
 logger = logging.getLogger(__name__)
+
+
+def _load_raw_hf_config(name_or_path: str) -> dict:
+    """Load raw config.json for a local snapshot or hub repo."""
+    local_path = os.path.join(name_or_path, "config.json")
+    if os.path.isfile(local_path):
+        with open(local_path) as f:
+            return json.load(f)
+    try:
+        resolved = hf_hub_download(repo_id=name_or_path, filename="config.json")
+    except Exception as exc:
+        raise RuntimeError(
+            f"GLM-5 requires raw config.json for {name_or_path!r} to preserve qk head dimensions."
+        ) from exc
+    with open(resolved) as f:
+        return json.load(f)
 
 
 @MegatronModelBridge.register_bridge(
@@ -92,12 +109,9 @@ class GLM5Bridge(MegatronModelBridge):
 
         # Work around transformers configs that collapse qk_rope_head_dim onto
         # head_dim for GLM-5.2. The on-disk config carries the real MLA split.
-        raw_config_path = os.path.join(getattr(hf_config, "_name_or_path", ""), "config.json")
-        if os.path.isfile(raw_config_path):
-            with open(raw_config_path) as raw_config_file:
-                raw_config = json.load(raw_config_file)
-            provider.qk_head_dim = raw_config["qk_nope_head_dim"]
-            provider.qk_pos_emb_head_dim = raw_config["qk_rope_head_dim"]
+        raw_config = _load_raw_hf_config(getattr(hf_config, "_name_or_path", ""))
+        provider.qk_head_dim = raw_config["qk_nope_head_dim"]
+        provider.qk_pos_emb_head_dim = raw_config["qk_rope_head_dim"]
 
         # Disable MTP (Multi-Token Prediction) by default
         # HF config has num_nextn_predict_layers=1
