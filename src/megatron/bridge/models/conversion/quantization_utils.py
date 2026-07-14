@@ -80,14 +80,10 @@ def dequantize_fp8_blockwise(
     """
     M, N = weight.shape
     w = weight.float()
-    out = torch.empty_like(w)
-    sM, sN = scale_inv.shape
-    for bi in range(sM):
-        for bj in range(sN):
-            r0, r1 = bi * block_size, min((bi + 1) * block_size, M)
-            c0, c1 = bj * block_size, min((bj + 1) * block_size, N)
-            out[r0:r1, c0:c1] = w[r0:r1, c0:c1] * scale_inv[bi, bj]
-    return out.to(dtype)
+    scales = scale_inv.to(device=w.device, dtype=torch.float32)
+    scales = scales.repeat_interleave(block_size, dim=0)[:M]
+    scales = scales.repeat_interleave(block_size, dim=1)[:, :N]
+    return (w * scales).to(dtype)
 
 
 def maybe_dequantize_fp8_blockwise(
