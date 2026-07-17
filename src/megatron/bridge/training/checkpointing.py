@@ -381,28 +381,15 @@ def schedule_async_save(global_state: GlobalState, async_request: AsyncRequest) 
         async_queue.schedule_async_request(async_request)
 
 
-# Exit code the forked-finalize child uses to signal a failed write to the
-# parent (distinct from 0=success; the real traceback is printed to the
-# child's stderr before exit).
 _FORKED_FINALIZE_CHILD_ERROR_EXIT = 17
-# Ceiling on how long the parent will wait for the forked write. Two hours
-# mirrors ``baseten_weight_sync.writer._FORK_WRITE_TIMEOUT_SEC`` — enough for a
-# large per-expert MoE checkpoint on slow storage; short enough that a wedged
-# child never masquerades as a permanent stall.
 _FORKED_FINALIZE_TIMEOUT_SEC = 2 * 60 * 60
 _FORKED_FINALIZE_POLL_INTERVAL_SEC = 0.1
 
 
 def _reset_logging_locks_in_child() -> None:
-    """Reset locks the ``logging`` module's threads may have held at ``fork``.
+    """Reset ``logging`` locks a peer thread may have held at ``fork`` time.
 
-    Only the forking thread survives in the child; any lock another thread
-    held when we forked is now frozen-locked forever, so the child would
-    deadlock the first time it logs. Re-create them — the classic
-    fork-in-a-threaded-process hazard (the parent here is a Megatron trainer
-    with async-save queue workers, pytest runners, etc., so it is real).
-
-    Mirrors ``baseten_weight_sync.writer._reset_logging_locks_in_child``.
+    Without this the child deadlocks on its first log call.
     """
     import logging as _logging
 
@@ -419,46 +406,19 @@ def _reset_logging_locks_in_child() -> None:
 def schedule_forked_save(global_state: GlobalState, async_request: AsyncRequest) -> None:
     """Finalize an ``async_sharded_save=True`` request in a forked child.
 
-    ``dist_checkpointing.save(async_sharded_save=True)`` returns after the
-    collective plan phase and CPU tensor gather; only the per-rank bytes-to-
-    disk write remains inside ``async_request.async_fn``. That write is pure
-    CPU + local I/O and holds the GIL for its duration (multi-second for a
-    large state dict) — enough to starve a co-resident FastAPI event loop's
-    ``/health`` route and trip the kubelet liveness probe.
-
-    ``schedule_async_save``'s background-thread executor does not help
-    because the GIL is held on the writer thread. This function forks
-    instead: the parent blocks in ``os.waitpid`` (a GIL-releasing syscall)
-    so the event loop keeps running; the child inherits the CPU-resident
-    state via COW and never touches CUDA or NCCL.
-
-    After the child exits, the parent runs the trailing ``dist.barrier``
-    (all-ranks synchronization point) and any ``finalize_fns`` (version
-    pointer bumps, cleanup, etc.) — those require the parent's NCCL state
-    and cannot happen in the child.
-
-    Falls back to ``execute_sync`` when ``os.fork`` is unavailable (Windows
-    or restricted sandboxes) so the caller sees identical semantics.
-
-    Args:
-        global_state: The global training state (currently unused; taken to
-            match ``schedule_async_save``'s signature so the call site can
-            dispatch between the two).
-        async_request: The async save request returned by
-            ``dist_checkpointing.save(async_sharded_save=True)``.
+    Parent blocks in ``waitpid`` (GIL-releasing) so a co-resident event loop
+    keeps running; child inherits CPU state via COW and must not touch
+    CUDA/NCCL. Parent runs ``dist.barrier`` + ``finalize_fns`` after the
+    child exits — those need the parent's NCCL state.
     """
-    del global_state  # kept for signature parity with schedule_async_save
-    # Preload GPU→CPU tensors *before* the fork: this touches CUDA and must
-    # stay in the parent. Mirrors ``AsyncRequest.execute_sync``'s prelude.
+    del global_state
+    # Preload touches CUDA — must be parent-side.
     async_fn_args = list(async_request.async_fn_args)
     if async_request.preload_fn is not None:
         assert len(async_fn_args) == 3, "Expected 3 args to be passed to async function"
         async_fn_args[1] = async_request.preload_fn()
 
     if not hasattr(os, "fork"):
-        # No fork available — degrade to execute_sync semantics. Same
-        # blocking behavior as if async_save were disabled; the event loop
-        # is not preserved but nothing else breaks.
         if async_request.async_fn is not None:
             async_request.async_fn(*async_fn_args, **async_request.async_fn_kwargs)
         torch.distributed.barrier()
@@ -467,13 +427,8 @@ def schedule_forked_save(global_state: GlobalState, async_request: AsyncRequest)
         return
 
     pid = os.fork()
-    if pid == 0:  # ---- child: CPU + local I/O only, never CUDA/NCCL ----
+    if pid == 0:
         try:
-            # Re-create the ``logging`` module's locks — the parent is a
-            # threaded process (async-save queue workers, at minimum) so any
-            # lock a peer thread held at fork time is now frozen-locked in
-            # the child. Do this before anything that might log, including
-            # ``async_fn`` (mcore's writer logs during shard write).
             _reset_logging_locks_in_child()
             if async_request.async_fn is not None:
                 async_request.async_fn(
@@ -485,7 +440,6 @@ def schedule_forked_save(global_state: GlobalState, async_request: AsyncRequest)
             sys.stderr.flush()
             os._exit(_FORKED_FINALIZE_CHILD_ERROR_EXIT)
 
-    # ---- parent: polling wait keeps the GIL free and enforces the timeout ----
     deadline_monotonic = _time.monotonic() + _FORKED_FINALIZE_TIMEOUT_SEC
     while True:
         waited_pid, status = os.waitpid(pid, os.WNOHANG)
@@ -515,8 +469,6 @@ def schedule_forked_save(global_state: GlobalState, async_request: AsyncRequest)
             "see the child traceback logged above"
         )
 
-    # Parent-side: barrier + finalize on all ranks. These need NCCL and
-    # cannot happen in the forked child. Matches ``execute_sync``'s trailer.
     torch.distributed.barrier()
     for finalize_fn in async_request.finalize_fns:
         finalize_fn()
@@ -1704,6 +1656,7 @@ def save_checkpoint(
             print_rank_0(f"  scheduled an async checkpoint save at iteration {train_state.step:7d} to {save_dir}")
         if pending_hf_save_dir is not None:
             _save_hf_weights(state, model, pending_hf_save_dir)
+
 
     end_misc = time()
     logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")

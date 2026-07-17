@@ -613,19 +613,8 @@ class CheckpointConfig(MTrainCheckpointConfig):
 
     use_forked_finalize: bool = False
     """When ``async_save=True``, finalize each save's per-rank write in a forked
-    child process (parent blocks in ``os.waitpid``) instead of scheduling it on
-    the async_calls_queue background thread.
-
-    ``os.waitpid`` releases the GIL while waiting, so a co-resident FastAPI /
-    Knative event loop that shares the trainer process (e.g. Baseten Loops)
-    keeps serving ``/health`` throughout the write. A background thread does
-    not help: the write's Python/C serialization holds the GIL, starves the
-    event loop, and trips the kubelet liveness probe mid-checkpoint.
-
-    Requires ``async_save=True`` and ``os.fork`` (POSIX). The child inherits
-    the CPU-resident state via COW and must never touch CUDA or NCCL; the
-    parent runs the trailing ``dist.barrier`` and ``finalize_fns`` after
-    ``waitpid`` returns. Ignored when ``async_save=False``."""
+    child so a co-resident event loop's ``/health`` stays responsive.
+    Requires POSIX ``os.fork``. Ignored when ``async_save=False``."""
 
     strict_fsdp_dtensor_load: bool = False
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
