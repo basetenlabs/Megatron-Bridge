@@ -32,11 +32,10 @@ if not hasattr(_hf_import_utils, "is_torch_fx_available"):
 # resolve relative imports recursively. Widen the copy set so transitive sibling
 # modules are materialized too.
 #
-# The walk must not open() files that are not on disk yet: on the hub path,
-# get_cached_module_file() calls check_imports() BEFORE downloading the
-# module's relative imports, so on a cold HF cache the siblings do not exist
-# yet. Naming a missing sibling is enough — the caller downloads it and
-# re-enters this hook on the downloaded file, covering its imports in turn.
+# Remote code is materialized lazily: check_imports() runs on each module as
+# it is downloaded, before its relative imports are fetched, so missing
+# siblings are expected here. Return them by name — the caller downloads each
+# and re-enters this hook — rather than reading them from disk.
 if not getattr(_hf_dyn, "_bridge_recursive_check_imports", False):
     _orig_check_imports = _hf_dyn.check_imports
 
