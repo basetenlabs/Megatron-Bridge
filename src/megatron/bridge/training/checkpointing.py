@@ -393,6 +393,29 @@ _FORKED_FINALIZE_TIMEOUT_SEC = 2 * 60 * 60
 _FORKED_FINALIZE_POLL_INTERVAL_SEC = 0.1
 
 
+def _reset_logging_locks_in_child() -> None:
+    """Reset locks the ``logging`` module's threads may have held at ``fork``.
+
+    Only the forking thread survives in the child; any lock another thread
+    held when we forked is now frozen-locked forever, so the child would
+    deadlock the first time it logs. Re-create them — the classic
+    fork-in-a-threaded-process hazard (the parent here is a Megatron trainer
+    with async-save queue workers, pytest runners, etc., so it is real).
+
+    Mirrors ``baseten_weight_sync.writer._reset_logging_locks_in_child``.
+    """
+    import logging as _logging
+
+    setattr(_logging, "_lock", threading.RLock())
+    for ref in list(getattr(_logging, "_handlerList", [])):
+        try:
+            handler = ref()
+            if handler is not None:
+                handler.createLock()
+        except Exception:
+            pass
+
+
 def schedule_forked_save(global_state: GlobalState, async_request: AsyncRequest) -> None:
     """Finalize an ``async_sharded_save=True`` request in a forked child.
 
@@ -446,6 +469,12 @@ def schedule_forked_save(global_state: GlobalState, async_request: AsyncRequest)
     pid = os.fork()
     if pid == 0:  # ---- child: CPU + local I/O only, never CUDA/NCCL ----
         try:
+            # Re-create the ``logging`` module's locks — the parent is a
+            # threaded process (async-save queue workers, at minimum) so any
+            # lock a peer thread held at fork time is now frozen-locked in
+            # the child. Do this before anything that might log, including
+            # ``async_fn`` (mcore's writer logs during shard write).
+            _reset_logging_locks_in_child()
             if async_request.async_fn is not None:
                 async_request.async_fn(
                     *async_fn_args, **async_request.async_fn_kwargs

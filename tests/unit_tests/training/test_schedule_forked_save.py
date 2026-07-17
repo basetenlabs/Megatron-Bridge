@@ -185,6 +185,46 @@ def test_forked_finalize_raises_when_child_write_fails():
     assert finalize_pids == []
 
 
+@requires_fork
+def test_forked_finalize_child_can_log(tmp_path):
+    """The child can invoke Python ``logging`` without deadlocking.
+
+    Regression guard for the fork-in-a-threaded-process hazard: if any peer
+    thread held ``logging._lock`` at fork time, the child would deadlock on
+    the first ``logging.getLogger(...).info(...)`` call (the lock is frozen
+    in its acquired state in the child address space). ``schedule_forked_save``
+    resets these locks before invoking ``async_fn``.
+
+    We can't reliably arrange for another thread to be holding the lock at
+    the exact fork instant, so this test exercises the happy path: the
+    child logs and finishes. It'll hang (and pytest will kill it via the
+    2h timeout, i.e. fail hard) if the reset ever regresses under a scheduler
+    that happens to schedule a peer thread into the lock at fork time.
+    """
+    import logging as _logging
+
+    marker = tmp_path / "logged.pid"
+
+    def _child_logs(path: str) -> None:
+        _logging.getLogger("schedule_forked_save.test").info(
+            "child pid=%d writing marker", os.getpid()
+        )
+        with open(path, "w") as fh:
+            fh.write(str(os.getpid()))
+
+    request = AsyncRequest(
+        async_fn=_child_logs,
+        async_fn_args=(str(marker),),
+        finalize_fns=[],
+    )
+
+    with patch("megatron.bridge.training.checkpointing.torch.distributed.barrier"):
+        schedule_forked_save(global_state=None, async_request=request)
+
+    assert marker.is_file()
+    assert int(marker.read_text()) != os.getpid()
+
+
 def test_forked_finalize_falls_back_when_fork_unavailable(tmp_path, monkeypatch):
     """When ``os.fork`` is missing (Windows / restricted sandboxes) the
     function degrades to ``execute_sync``-style inline semantics: async_fn +
