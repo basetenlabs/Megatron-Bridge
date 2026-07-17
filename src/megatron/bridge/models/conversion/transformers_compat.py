@@ -31,12 +31,28 @@ if not hasattr(_hf_import_utils, "is_torch_fx_available"):
 # its direct relative imports into the cache, while get_class_in_module() can
 # resolve relative imports recursively. Widen the copy set so transitive sibling
 # modules are materialized too.
+#
+# Remote code is materialized lazily: check_imports() runs on each module as
+# it is downloaded, before its relative imports are fetched, so missing
+# siblings are expected here. Return them by name — the caller downloads each
+# and re-enters this hook — rather than reading them from disk.
 if not getattr(_hf_dyn, "_bridge_recursive_check_imports", False):
     _orig_check_imports = _hf_dyn.check_imports
 
     def _recursive_check_imports(filename):
         _orig_check_imports(filename)
-        return [Path(f).stem for f in _hf_dyn.get_relative_import_files(filename)]
+        root = Path(filename).parent
+        seen: set[str] = set()
+        queue = [Path(filename)]
+        while queue:
+            f = queue.pop()
+            if not f.exists():
+                continue
+            for stem in _hf_dyn.get_relative_imports(f):
+                if stem not in seen:
+                    seen.add(stem)
+                    queue.append(root / f"{stem}.py")
+        return sorted(seen)
 
     _hf_dyn.check_imports = _recursive_check_imports
     _hf_dyn._bridge_recursive_check_imports = True
