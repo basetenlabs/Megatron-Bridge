@@ -1294,10 +1294,22 @@ def save_checkpoint(
             else:
                 validate_sharding_integrity = True
                 if ckpt_cfg.ckpt_format == "torch_dist":
+                    strategy_kwargs: dict[str, Any] = {
+                        "thread_count": ckpt_cfg.storage_writers_per_rank,
+                    }
+                    if getattr(ckpt_cfg, "async_ckpt_use_cpu_shm", False):
+                        if "cpu_shm_mode" in inspect.signature(TorchDistSaveShardedStrategy.__init__).parameters:
+                            strategy_kwargs["cpu_shm_mode"] = True
+                        else:
+                            logger.warning(
+                                "async_ckpt_use_cpu_shm=True requested but installed "
+                                "megatron-core TorchDistSaveShardedStrategy does not accept "
+                                "cpu_shm_mode; ignoring."
+                            )
                     save_strategy = TorchDistSaveShardedStrategy(
                         "torch_dist",
                         1,
-                        thread_count=ckpt_cfg.storage_writers_per_rank,
+                        **strategy_kwargs,
                     )
                 else:
                     save_strategy = get_default_save_sharded_strategy(ckpt_cfg.ckpt_format)
