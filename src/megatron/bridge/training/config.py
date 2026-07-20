@@ -537,6 +537,10 @@ class CheckpointConfig(MTrainCheckpointConfig):
     """Multiprocessing start method for the async write results queue.
     Options: ``"fork"`` (default), ``"spawn"``, ``"forkserver"``."""
 
+    async_ckpt_use_cpu_shm: bool = False
+    """Copy GPU tensors to CPU shared-memory in the training process before handing off to the async
+    checkpoint worker. Avoids CUDA IPC / NVLink fabric handles in the worker subprocess."""
+
     strict_fsdp_dtensor_load: bool = False
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
 
