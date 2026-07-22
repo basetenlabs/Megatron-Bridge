@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import os
 from collections.abc import Callable, Mapping
 
 import torch
@@ -321,6 +322,10 @@ def dequantize_mxfp4_e2m1_packed(
     ``scale`` is expected to be one scale per row and per K tile. ``uint8``
     E8M0 tensors use exponent bias 127 and are decoded to powers of two.
     """
+    # Dequantize one parameter at a time on GPU to avoid the slow CPU int64 path.
+    if os.environ.get("DSV4_GPU_DEQUANT") == "1" and torch.cuda.is_available() and weight_packed.device.type == "cpu":
+        weight_packed = weight_packed.cuda(non_blocking=True)
+        scale = scale.cuda(non_blocking=True)
     w_u8 = weight_packed.view(torch.uint8)
     lo = (w_u8 & 0xF).to(torch.int64)
     hi = (w_u8 >> 4).to(torch.int64)

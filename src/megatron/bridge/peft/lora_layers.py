@@ -82,7 +82,7 @@ class LoRALinear(AdapterWrapper):
             return linear_output if not self._base_returns_tuple else (linear_output, bias)
         adapter_output = self.adapter_forward(self.adapter, layernorm_output.contiguous(), *args, **kwargs)
         adapter_output = adapter_output.reshape(linear_output.shape)
-        combined = linear_output + adapter_output
+        combined = adapter_output.add_(linear_output)
         if not self._base_returns_tuple:
             return combined
         return combined, bias

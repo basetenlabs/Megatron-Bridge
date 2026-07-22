@@ -1309,7 +1309,12 @@ class ParallelLinearAdapter(nn.Module):
         if self.dropout_position == "post":
             x = self.dropout(x)
 
-        x = x * (self.alpha / self.dim)
+        if torch.is_grad_enabled():
+            # The gather-region output is a view, so autograd forbids mul_.
+            x = x * (self.alpha / self.dim)
+        else:
+            # Checkpointed forward can avoid a delta-sized allocation.
+            x = x.mul_(self.alpha / self.dim)
 
         if pad_len > 0:
             # Remove MoE padding.
