@@ -1218,7 +1218,15 @@ class ParallelLinearAdapter(nn.Module):
         if self.dropout_position == "post":
             x = self.dropout(x)
 
-        x = x * (self.alpha / self.dim)
+        if torch.is_grad_enabled():
+            # Recompute/backward (or no-recompute forward): the linear_out
+            # gather-region output is a view; in-place mul_ is forbidden by
+            # autograd. Go out-of-place (costs a delta-sized alloc).
+            x = x * (self.alpha / self.dim)
+        else:
+            # no_grad checkpointed forward: in-place is safe and avoids a
+            # delta-sized (6-8 GiB) alloc at 131k.
+            x = x.mul_(self.alpha / self.dim)
 
         if pad_len > 0:
             # Remove MoE padding.
