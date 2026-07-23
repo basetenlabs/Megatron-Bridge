@@ -45,8 +45,11 @@ def apply_flex_dispatcher_backend(
 
     device_properties = torch.cuda.get_device_properties(0)
     if moe_flex_dispatcher_backend == "deepep":
+        # major 10 == Blackwell (B200 sm_100, B300 sm_103): gate on capability
+        # like the hybridep branch below, since some B300 nodes report a masked
+        # product name (e.g. "NVIDIA L20D") that the name check would miss.
         if not (
-            device_properties.major in [8, 9] or device_properties.name.startswith(("NVIDIA B200", "NVIDIA B300"))
+            device_properties.major in [8, 9, 10] or device_properties.name.startswith(("NVIDIA B200", "NVIDIA B300"))
         ):
             if get_rank_safe() == 0:
                 logger.warning(
@@ -77,8 +80,10 @@ def validate_flex_dispatcher_backend(model_config: TransformerConfig) -> None:
     if model_config.moe_token_dispatcher_type == "flex":
         device_properties = torch.cuda.get_device_properties(0)
         if model_config.moe_flex_dispatcher_backend == "deepep":
+            # major 10 == Blackwell (B200 sm_100, B300 sm_103): capability gate
+            # (some B300 nodes report a masked name like "NVIDIA L20D").
             if not (
-                device_properties.major in (8, 9) or device_properties.name.startswith(("NVIDIA B200", "NVIDIA B300"))
+                device_properties.major in (8, 9, 10) or device_properties.name.startswith(("NVIDIA B200", "NVIDIA B300"))
             ):
                 raise ValueError(
                     f"DeepEP is supported for Ampere, Hopper, and Blackwell (B200/B300) GPUs. "
