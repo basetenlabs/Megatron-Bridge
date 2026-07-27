@@ -82,6 +82,8 @@ from megatron.bridge.models.hybrid import (
 )
 from megatron.bridge.models.kimi import (
     KimiK2Bridge,
+    KimiK3Bridge,
+    KimiK3ModelProvider,
 )
 from megatron.bridge.models.kimi_vl import (
     KimiK25VLBridge,
@@ -217,6 +219,8 @@ __all__ = [
     "HybridModelConfig",
     "HybridModelProvider",
     "KimiK2Bridge",
+    "KimiK3Bridge",
+    "KimiK3ModelProvider",
     "KimiK25VLModel",
     "KimiK25VLBridge",
     "KimiK25VLModelProvider",
