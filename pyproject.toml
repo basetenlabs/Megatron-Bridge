@@ -92,7 +92,8 @@ dependencies = [
     "megatron-core[dev,mlm]",
     "qwen-vl-utils",
     "nvidia-resiliency-ext",
-    "flash-linear-attention",
+    # Kimi-K3 needs >= 0.5.2: older chunk_kda silently discards A_log / dt_bias.
+    "flash-linear-attention>=0.5.2",
     "timm",
     "open-clip-torch>=3.2.0",
     "mlflow>=3.9.0",    # To address CVE-2025-15031
