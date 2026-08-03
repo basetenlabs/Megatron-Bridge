@@ -483,7 +483,12 @@ class DeepSeekV4Bridge(MegatronModelBridge):
         provider.moe_router_pre_softmax = False  # V4 uses post-topk normalisation
         provider.moe_token_dispatcher_type = "alltoall"
         provider.moe_router_load_balancing_type = "noaux_tc"
-        provider.moe_shared_expert_overlap = True
+        # STOPGAP (DSv4-Flash accumulation-poison): shared-expert overlap runs the
+        # shared-expert MLP on a side stream whose cross-stream sync is unsafe under
+        # >1 forward_backward per optim_step (grad accumulation) -> non-finite combine
+        # (async race, root-caused 2026-08-03). Disable until the overlap-preserving
+        # stream fix lands. Correct behavior; shared experts run inline after routed.
+        provider.moe_shared_expert_overlap = False
         provider.moe_router_score_function = hf_config.scoring_func  # "sqrtsoftplus"
         provider.moe_router_enable_expert_bias = True
         provider.moe_router_dtype = "fp32"
