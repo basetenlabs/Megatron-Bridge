@@ -224,6 +224,24 @@ def _dsv4_compress_ratios(hf_config) -> list[int]:
     return ratios[:expected_len]
 
 
+def _dsv4_is_dspark_checkpoint(hf_config) -> bool:
+    """Whether the checkpoint's ``mtp.*`` stack is a DSpark speculative decoder.
+
+    DSpark checkpoints (DeepSeek-V4-Flash-0731 and later) repurpose the MTP
+    stack as a block-speculative decoder: ``mtp.0`` consumes a concatenation of
+    trunk hidden states from ``dspark_target_layer_ids`` via
+    ``main_proj``/``main_norm`` (the classic ``enorm``/``hnorm``/``e_proj``/
+    ``h_proj`` tensors do not exist), and only the last MTP block carries the
+    output norm, HC head, markov head, and confidence head. Megatron's MTP-loss
+    module cannot represent that structure, so loading it would leave the MTP
+    input projections randomly initialized and silently poison training.
+    Callers must disable Megatron MTP for these checkpoints.
+    """
+    return bool(getattr(hf_config, "dspark_target_layer_ids", None)) or bool(
+        getattr(hf_config, "dspark_block_size", 0) or 0
+    )
+
+
 def _dsv4_use_mxfp4_export(hf_param: str, weight: torch.Tensor, source_scale: torch.Tensor) -> bool:
     """Routed DSv4 experts use packed MXFP4; all other scaled weights export as FP8."""
     if ".ffn.experts." not in hf_param or ".shared_experts." in hf_param:
@@ -461,6 +479,16 @@ class DeepSeekV4Bridge(MegatronModelBridge):
                 "DeepSeek-V4-Flash uses num_nextn_predict_layers=1."
             )
             _mtp = 0
+        if _dsv4_is_dspark_checkpoint(hf_config):
+            import logging
+
+            logging.warning(
+                "DSpark checkpoint detected (dspark_* config keys): the mtp.* stack "
+                "is a speculative decoder Megatron MTP cannot represent; disabling "
+                "Megatron MTP (mtp_num_layers=None) and truncating csa_compress_ratios "
+                "to the decoder layers."
+            )
+            _mtp = 0
         _expected = hf_config.num_hidden_layers + _mtp
         provider.csa_compress_ratios = _cr[:_expected]
         provider.csa_window_size = hf_config.sliding_window  # 128
@@ -505,7 +533,9 @@ class DeepSeekV4Bridge(MegatronModelBridge):
         provider.moe_shared_expert_intermediate_size = hf_config.moe_intermediate_size * hf_config.n_shared_experts
 
         # ---- MTP ----
-        provider.mtp_num_layers = getattr(hf_config, "num_nextn_predict_layers", 0) or None
+        # _mtp is the dspark-adjusted count: 0 when the checkpoint's mtp.* stack
+        # is a DSpark speculative decoder (see _dsv4_is_dspark_checkpoint).
+        provider.mtp_num_layers = _mtp or None
 
         # ---- Misc ----
         provider.share_embeddings_and_output_weights = bool(hf_config.tie_word_embeddings)

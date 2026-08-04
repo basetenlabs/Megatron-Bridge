@@ -30,6 +30,7 @@ from megatron.bridge.models.conversion.param_mapping import AutoMapping, Replica
 from megatron.bridge.models.deepseek.deepseek_v4_bridge import (
     DeepSeekV4Bridge,
     _dsv4_compress_ratios,
+    _dsv4_is_dspark_checkpoint,
     _dsv4_num_hash_layers,
 )
 
@@ -525,3 +526,51 @@ class TestDeepSeekV4ExportWeightDtype:
         out = bridge.maybe_modify_converted_hf_weight(task, {"a.weight": torch.ones(1)}, {})
 
         assert called.get("hit") and "quantized" in out
+
+
+class TestDeepSeekV4DSparkCheckpoint:
+    """DSpark checkpoints (DeepSeek-V4-Flash-0731+) repurpose the mtp.* stack as
+    a block-speculative decoder (main_proj/main_norm trunk tap, markov +
+    confidence heads) that Megatron's MTP-loss module cannot represent. The
+    provider must disable Megatron MTP and truncate csa_compress_ratios to the
+    decoder layers — loading the DSpark stack into a Megatron MTP layer would
+    leave its input projections randomly initialized and silently poison
+    training."""
+
+    def _provider_for(self, hf_config):
+        hf_pretrained = MagicMock()
+        hf_pretrained.config = hf_config
+        provider = MagicMock()
+        bridge = DeepSeekV4Bridge.__new__(DeepSeekV4Bridge)
+        with patch.object(MegatronModelBridge, "provider_bridge", return_value=provider):
+            return bridge.provider_bridge(hf_pretrained)
+
+    def test_dspark_detection_reads_dspark_config_keys(self):
+        assert _dsv4_is_dspark_checkpoint(_deepseek_v4_hf_config()) is False
+        with_ids = _deepseek_v4_hf_config()
+        with_ids.dspark_target_layer_ids = [1, 2, 3]
+        assert _dsv4_is_dspark_checkpoint(with_ids) is True
+        with_block = _deepseek_v4_hf_config()
+        with_block.dspark_block_size = 5
+        assert _dsv4_is_dspark_checkpoint(with_block) is True
+
+    def test_dspark_config_disables_megatron_mtp(self):
+        hf_config = _deepseek_v4_hf_config()
+        hf_config.dspark_block_size = 5
+        hf_config.dspark_markov_rank = 256
+        hf_config.dspark_noise_token_id = 128799
+        hf_config.dspark_target_layer_ids = [1, 2, 3]
+        # 0731 layout: num_nextn_predict_layers stays 1 while the checkpoint
+        # ships 3 mtp blocks; compress_ratios grows an all-zero dspark tail.
+        hf_config.compress_ratios = [0, 4, 128, 4, 0, 0, 0]
+
+        provider = self._provider_for(hf_config)
+
+        assert provider.mtp_num_layers is None
+        assert provider.csa_compress_ratios == [0, 4, 128, 4]
+
+    def test_non_dspark_config_keeps_megatron_mtp(self):
+        provider = self._provider_for(_deepseek_v4_hf_config())
+
+        assert provider.mtp_num_layers == 1
+        assert provider.csa_compress_ratios == [0, 4, 128, 4, 0]
