@@ -224,6 +224,13 @@ def _dsv4_compress_ratios(hf_config) -> list[int]:
     return ratios[:expected_len]
 
 
+def _dsv4_is_dspark_checkpoint(hf_config) -> bool:
+    """Return whether ``mtp.*`` is a DSpark decoder instead of Megatron MTP."""
+    return bool(getattr(hf_config, "dspark_target_layer_ids", None)) or bool(
+        getattr(hf_config, "dspark_block_size", 0) or 0
+    )
+
+
 def _dsv4_use_mxfp4_export(hf_param: str, weight: torch.Tensor, source_scale: torch.Tensor) -> bool:
     """Routed DSv4 experts use packed MXFP4; all other scaled weights export as FP8."""
     if ".ffn.experts." not in hf_param or ".shared_experts." in hf_param:
@@ -461,6 +468,16 @@ class DeepSeekV4Bridge(MegatronModelBridge):
                 "DeepSeek-V4-Flash uses num_nextn_predict_layers=1."
             )
             _mtp = 0
+        if _dsv4_is_dspark_checkpoint(hf_config):
+            import logging
+
+            logging.warning(
+                "DSpark checkpoint detected (dspark_* config keys): the mtp.* stack "
+                "is a speculative decoder Megatron MTP cannot represent; disabling "
+                "Megatron MTP (mtp_num_layers=None) and truncating csa_compress_ratios "
+                "to the decoder layers."
+            )
+            _mtp = 0
         _expected = hf_config.num_hidden_layers + _mtp
         provider.csa_compress_ratios = _cr[:_expected]
         provider.csa_window_size = hf_config.sliding_window  # 128
@@ -508,7 +525,7 @@ class DeepSeekV4Bridge(MegatronModelBridge):
         provider.moe_shared_expert_intermediate_size = hf_config.moe_intermediate_size * hf_config.n_shared_experts
 
         # ---- MTP ----
-        provider.mtp_num_layers = getattr(hf_config, "num_nextn_predict_layers", 0) or None
+        provider.mtp_num_layers = _mtp or None
 
         # ---- Misc ----
         provider.share_embeddings_and_output_weights = bool(hf_config.tie_word_embeddings)
