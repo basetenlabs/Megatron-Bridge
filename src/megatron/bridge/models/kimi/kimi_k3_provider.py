@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model provider for the Kimi K3 language backbone."""
+"""Model provider for the Kimi K3 language backbone.
+
+Vendored from NVIDIA-NeMo/Megatron-Bridge PR #5130 (``2f0f8c80``). The field
+defaults are Kimi-K3's published architecture, not tunables.
+"""
 
 from dataclasses import dataclass
 

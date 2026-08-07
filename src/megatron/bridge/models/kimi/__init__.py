@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Kimi model bridges.
+
+The ``kimi_k3_*`` modules are vendored from NVIDIA-NeMo/Megatron-Bridge PR #5130,
+squash-merged as ``2f0f8c80e832ad5b4acf9b2b16883aab55923ca9``. Diff against that
+commit when re-syncing, and land original K3 modelling work upstream first.
+"""
+
 from megatron.bridge.models.kimi.kimi_bridge import KimiK2Bridge  # noqa: F401
 from megatron.bridge.models.kimi.kimi_k3_bridge import KimiK3Bridge
 from megatron.bridge.models.kimi.kimi_k3_provider import KimiK3ModelProvider

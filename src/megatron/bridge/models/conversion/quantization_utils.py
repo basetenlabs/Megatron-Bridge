@@ -328,6 +328,8 @@ def dequantize_mxfp4_e2m1_packed(
     table = torch.tensor(_FP4_E2M1_TABLE_VALUES, dtype=torch.float32, device=weight_packed.device)
     logical = torch.stack([table[lo], table[hi]], dim=-1).reshape(weight_packed.shape[0], -1)
 
+    # A uint8 scale holds an E8M0 exponent, not a value: casting byte 130 to float
+    # would give 130.0 instead of 2**(130-127) = 8, scaling the block ~16x too high.
     if scale.dtype == torch.uint8:
         scale_f32 = torch.ldexp(
             torch.ones_like(scale, dtype=torch.float32),
@@ -392,6 +394,9 @@ def quantize_mxfp4_e2m1_like_scale(
         row_end = min(row_start + rows_per_chunk, rows)
         chunk = weight_f32[row_start:row_end].reshape(-1, scale_cols, block_size)
         chunk_amax = chunk.abs().amax(dim=-1)
+        # An E8M0 slot can only store a power of two, so round the divisor before
+        # normalizing; rounding it afterwards would leave the codes and the stored
+        # scale disagreeing.
         if source_scale.dtype == torch.uint8:
             unrounded_scale = torch.where(
                 chunk_amax > 0,
