@@ -23,6 +23,19 @@ from megatron.bridge.utils.common_utils import get_rank_safe
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+# CUDA compute-capability majors whose GPUs can run DeepEP / HybridEP:
+#   8  = Ampere   (A100, sm_80/86)
+#   9  = Hopper   (H100/H200, sm_90)
+#   10 = Blackwell (B200 sm_100, B300 sm_103)
+#
+# Keyed on compute capability rather than on ``device_properties.name``. The name
+# is a marketing string that does not reliably identify the SKU: our B300 hosts
+# enumerate as "NVIDIA L20D", so the previous
+# ``name.startswith(("NVIDIA B200", "NVIDIA B300"))`` test silently skipped DeepEP
+# on every one of them and fell back to the alltoall dispatcher. Compute
+# capability comes from the driver and cannot be relabelled.
+_FLEX_DISPATCHER_CC_MAJORS = (8, 9, 10)
+
 
 def apply_flex_dispatcher_backend(
     model_config: TransformerConfig,
@@ -45,9 +58,7 @@ def apply_flex_dispatcher_backend(
 
     device_properties = torch.cuda.get_device_properties(0)
     if moe_flex_dispatcher_backend == "deepep":
-        if not (
-            device_properties.major in [8, 9] or device_properties.name.startswith(("NVIDIA B200", "NVIDIA B300"))
-        ):
+        if device_properties.major not in _FLEX_DISPATCHER_CC_MAJORS:
             if get_rank_safe() == 0:
                 logger.warning(
                     f"DeepEP is only applicable to Ampere, Hopper, and Blackwell (B200/B300) GPUs. "
@@ -55,7 +66,7 @@ def apply_flex_dispatcher_backend(
                 )
             return
     elif moe_flex_dispatcher_backend == "hybridep":
-        if not device_properties.major in [8, 9, 10]:
+        if device_properties.major not in _FLEX_DISPATCHER_CC_MAJORS:
             if get_rank_safe() == 0:
                 logger.warning(
                     f"HybridEP is only applicable for GB200, GB300 with NVL72 and for Ampere, Hopper, B200 and B300 GPUs. "
@@ -77,16 +88,14 @@ def validate_flex_dispatcher_backend(model_config: TransformerConfig) -> None:
     if model_config.moe_token_dispatcher_type == "flex":
         device_properties = torch.cuda.get_device_properties(0)
         if model_config.moe_flex_dispatcher_backend == "deepep":
-            if not (
-                device_properties.major in (8, 9) or device_properties.name.startswith(("NVIDIA B200", "NVIDIA B300"))
-            ):
+            if device_properties.major not in _FLEX_DISPATCHER_CC_MAJORS:
                 raise ValueError(
                     f"DeepEP is supported for Ampere, Hopper, and Blackwell (B200/B300) GPUs. "
                     f"Current GPU: {device_properties.name}"
                 )
 
         if model_config.moe_flex_dispatcher_backend == "hybridep":
-            if not device_properties.major in [8, 9, 10]:
+            if device_properties.major not in _FLEX_DISPATCHER_CC_MAJORS:
                 raise ValueError(
                     "HybridEP is supported for GB200, GB300 with NVL72 and for Ampere, Hopper, B200 and B300 GPUs"
                 )
