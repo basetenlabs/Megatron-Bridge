@@ -407,16 +407,16 @@ class TestDeepSeekV4RotaryPercent:
 
 
 class TestDeepSeekV4HardwareDefaults:
-    """DSv4 Blackwell-only fused kernels must not default on for Hopper."""
+    """Fused DSA defaults on for SM90+; fused mHC stays Blackwell-only."""
 
     @pytest.mark.parametrize(
-        ("capability", "expected"),
+        ("capability", "expected_dsa", "expected_mhc"),
         [
-            ((9, 0), False),
-            ((10, 0), True),
+            ((9, 0), True, False),
+            ((10, 0), True, True),
         ],
     )
-    def test_provider_bridge_gates_blackwell_only_fusions(self, capability, expected):
+    def test_provider_bridge_gates_blackwell_only_fusions(self, capability, expected_dsa, expected_mhc):
         hf_pretrained = MagicMock()
         hf_pretrained.config = _deepseek_v4_hf_config()
         provider = MagicMock()
@@ -433,8 +433,8 @@ class TestDeepSeekV4HardwareDefaults:
         ):
             out = bridge.provider_bridge(hf_pretrained)
 
-        assert out.apply_dsa_kernel_fusion is expected
-        assert out.use_fused_mhc is expected
+        assert out.apply_dsa_kernel_fusion is expected_dsa
+        assert out.use_fused_mhc is expected_mhc
 
     def test_provider_bridge_disables_blackwell_only_fusions_without_cuda(self):
         hf_pretrained = MagicMock()
