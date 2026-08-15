@@ -103,7 +103,7 @@ _DSV4_COMPRESS_RATIO_TO_LAYER_TYPE = {
 
 
 def deepseek_v4_supports_blackwell_fused_kernels() -> bool:
-    """Return whether DSv4 Blackwell-only fused kernels should default on."""
+    """Return whether DSv4 Blackwell-only fused kernels (fused mHC) should default on."""
     if not torch.cuda.is_available():
         return False
 
@@ -112,7 +112,19 @@ def deepseek_v4_supports_blackwell_fused_kernels() -> bool:
 
 
 def deepseek_v4_supports_fused_dsa_kernels() -> bool:
-    """Return whether DSv4 fused DSA kernels can be enabled."""
+    """Return whether DSv4 fused DSA kernels can be enabled.
+
+    SM90+ device (flash_mla ships sm_90a + sm_100f cubins; matches the
+    megatron-core apply_dsa_kernel_fusion validation floor) with the fused
+    kernel packages importable.
+    """
+    if not torch.cuda.is_available():
+        return False
+
+    major, _minor = torch.cuda.get_device_capability()
+    if major < 9:
+        return False
+
     try:
         from cudnn import DSA  # noqa: F401
         from flash_mla import flash_mla_sparse_fwd  # noqa: F401
@@ -409,7 +421,7 @@ class DeepSeekV4Bridge(MegatronModelBridge):
         provider = super().provider_bridge(hf_pretrained)
         hf_config = hf_pretrained.config
         use_blackwell_fused_kernels = deepseek_v4_supports_blackwell_fused_kernels()
-        use_dsa_kernel_fusion = use_blackwell_fused_kernels and deepseek_v4_supports_fused_dsa_kernels()
+        use_dsa_kernel_fusion = deepseek_v4_supports_fused_dsa_kernels()
 
         # ---- Attention ----
         provider.experimental_attention_variant = "dsv4_hybrid"
