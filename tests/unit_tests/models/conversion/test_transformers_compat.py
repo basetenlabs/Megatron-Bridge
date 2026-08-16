@@ -88,8 +88,6 @@ def test_hub_cold_cache_materializes_full_chain(tmp_path, monkeypatch):
     copied = sorted(p.name for p in modcache.rglob("*.py") if p.name != "__init__.py")
     assert copied == ["configuration_leaf.py", "modeling_entry.py", "modeling_mid.py"]
     # get_class_in_module's pre-import closure walk must succeed on the result.
-    entry = (
-        modcache / _hf_dyn.TRANSFORMERS_DYNAMIC_MODULE_NAME / "fake" / "repo" / "deadbeef" / "modeling_entry.py"
-    )
+    entry = modcache / _hf_dyn.TRANSFORMERS_DYNAMIC_MODULE_NAME / "fake" / "repo" / "deadbeef" / "modeling_entry.py"
     walked = sorted(Path(f).name for f in _hf_dyn.get_relative_import_files(entry))
     assert walked == ["configuration_leaf.py", "modeling_mid.py"]
