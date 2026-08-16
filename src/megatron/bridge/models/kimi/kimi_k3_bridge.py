@@ -342,6 +342,23 @@ class KimiK3Bridge(MegatronModelBridge):
         weight_dtype=None,
     ) -> list[WeightConversionTask]:
         """Expose virtual BF16 expert weights for MXFP4 packed/scale pairs."""
+        # Kimi-K3 export is source-backed only: the virtual dense expert keys below
+        # are derived from the checkpoint's .weight_packed/.weight_scale pairs, and
+        # A_log padding and the multimodal passthrough both read real tensors.
+        # The repository's config-only path (examples/conversion/convert_checkpoints.py
+        # export) hands over a PretrainedConfig with no `.state`, which would fail
+        # here as an opaque AttributeError on `.state`. Reject it explicitly instead.
+        state = getattr(hf_pretrained, "state", None)
+        if state is None or getattr(state, "source", None) is None:
+            raise ValueError(
+                "Kimi-K3 export requires a state-backed HF checkpoint: "
+                f"{type(hf_pretrained).__name__} exposes no `.state.source`. "
+                "The routed experts ship as MXFP4 .weight_packed/.weight_scale pairs "
+                "that must be read from the source to synthesize dense expert keys, "
+                "so config-only export is not supported for this model. "
+                "Pass a checkpoint loaded with its state (e.g. via from_hf_pretrained) "
+                "rather than a config-only PretrainedConfig."
+            )
         original_get_all_keys = hf_pretrained.state.source.get_all_keys
 
         def _get_all_keys_with_virtual() -> list[str]:
