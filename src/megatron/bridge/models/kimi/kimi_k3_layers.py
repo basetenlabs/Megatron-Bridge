@@ -384,6 +384,20 @@ class KimiK3Attention(MegatronModule):
         **kwargs,
     ) -> tuple[torch.Tensor, None]:
         """Run the attention implementation selected for this layer."""
+        # Kimi-K3 has no cache implementation yet: MLA never writes the KV cache and
+        # KDA always restarts from zero recurrent/convolution state. Silently
+        # dropping the context makes MCore's static and dynamic cached-inference
+        # engines return wrong tokens after prefill with no error, so refuse it.
+        # Recompute-the-whole-prefix decoding (what the docs script does) passes
+        # no context and is unaffected.
+        if inference_context is not None:
+            raise NotImplementedError(
+                "Kimi-K3 does not support cached incremental inference: "
+                "MLA does not populate the KV cache and KDA does not carry recurrent "
+                "or convolution state across steps, so a cached decode would silently "
+                "forget the prefix. Run without an inference context (recomputing the "
+                "full prefix each step) until both caches are implemented."
+            )
         del (
             attention_mask,
             key_value_states,
