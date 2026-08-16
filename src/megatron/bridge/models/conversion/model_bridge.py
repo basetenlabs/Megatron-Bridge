@@ -97,6 +97,40 @@ class HFWeightTuple(NamedTuple):
     param_name: str
     weight: torch.Tensor
 
+    def iter_finalized(
+        self,
+        *,
+        cpu: bool,
+        export_hook: Callable[[str, torch.Tensor], Iterable["HFWeightTuple"]] | None = None,
+        clone_identity_output: bool = False,
+    ) -> Iterable["HFWeightTuple"]:
+        """Apply an optional export hook and yield finalized weights.
+
+        Export hooks run on a detached tensor before final device placement and may
+        emit zero, one, or multiple weights. Identity outputs can optionally be
+        cloned so independently named tied weights do not share storage.
+
+        Args:
+            cpu: Whether to move exported tensors to CPU.
+            export_hook: Optional transformation applied before device placement.
+            clone_identity_output: Clone an output when it is the detached input.
+
+        Yields:
+            Finalized HuggingFace weights in export-hook order.
+        """
+        source_tensor = self.weight.detach()
+        exported_weights = (
+            export_hook(self.param_name, source_tensor)
+            if export_hook is not None
+            else ((self.param_name, source_tensor),)
+        )
+        for exported_name, exported_tensor in exported_weights:
+            is_identity_output = exported_tensor is source_tensor
+            exported_tensor = exported_tensor.detach()
+            if clone_identity_output and is_identity_output:
+                exported_tensor = exported_tensor.clone().detach()
+            yield HFWeightTuple(exported_name, exported_tensor.cpu() if cpu else exported_tensor)
+
 
 @dataclass(frozen=True)
 class WeightConversionTask(Generic[MappingT]):
