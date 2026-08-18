@@ -3,7 +3,7 @@
 [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) is a large sparse MoE model from Moonshot AI. Megatron Bridge supports the **language backbone** of the published multimodal checkpoint through the `KimiK3Bridge`.
 
 ```{note}
-Support for this model is in progress. Conversion (HF → Megatron) and Megatron greedy inference are verified; strict full-checkpoint export, exact round-trip parity, and every training workflow are not. See [Known Limitations](#known-limitations) and the machine-readable [verification card](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/examples/model_verification_cards/kimi-k3/card.yaml) before relying on this path.
+Support for this model is in progress. Conversion (HF → Megatron) and Megatron greedy inference are verified; strict full-checkpoint export, exact round-trip parity, and every training workflow are not. See [Known Limitations](#known-limitations) and, for the numbers NVIDIA recorded, their machine-readable [verification card](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/examples/model_verification_cards/kimi-k3/card.yaml) — it lives upstream and is not vendored into this fork.
 ```
 
 ## Supported Variants
@@ -54,7 +54,7 @@ For a fast local iteration loop, build a truncated proxy checkpoint with
 
 ## Inference
 
-Megatron greedy generation was validated on 24 GB300 GPUs at TP1/PP3/EP8/ETP1. See the verification card for the exact command and the recorded deterministic completion.
+Megatron greedy generation was validated on 24 GB300 GPUs at TP1/PP3/EP8/ETP1. NVIDIA's [verification card](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/examples/model_verification_cards/kimi-k3/card.yaml) carries the exact command and the recorded deterministic completion; this fork does not vendor it.
 
 ## Training
 
@@ -78,4 +78,4 @@ No training recipe ships for K3 yet. Pretraining, SFT, and PEFT configs, checkpo
 - Bridge: [`src/megatron/bridge/models/kimi/kimi_k3_bridge.py`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/src/megatron/bridge/models/kimi/kimi_k3_bridge.py)
 - Provider: [`src/megatron/bridge/models/kimi/kimi_k3_provider.py`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/src/megatron/bridge/models/kimi/kimi_k3_provider.py)
 - Layer spec and KDA/MLA modules: [`src/megatron/bridge/models/kimi/kimi_k3_layers.py`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/src/megatron/bridge/models/kimi/kimi_k3_layers.py)
-- Verification card: [`examples/model_verification_cards/kimi-k3/card.yaml`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/examples/model_verification_cards/kimi-k3/card.yaml)
+- Verification card, upstream only: [`examples/model_verification_cards/kimi-k3/card.yaml` in NVIDIA-NeMo/Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/examples/model_verification_cards/kimi-k3/card.yaml)
