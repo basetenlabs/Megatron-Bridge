@@ -37,7 +37,8 @@ Other notable properties:
 
 ```bash
 # HF → Megatron
-./scripts/conversion/convert.sh import \
+srun --ntasks-per-node=8 python \
+    examples/conversion/convert_checkpoints_multi_gpu.py import \
     --hf-model moonshotai/Kimi-K3 \
     --megatron-path /workspace/kimi-k3 \
     --torch-dtype bfloat16 \
@@ -49,7 +50,7 @@ Other notable properties:
 The full checkpoint needs a multi-node allocation — import was validated on 48 GB200 GPUs at TP2/PP3/EP8/ETP2.
 
 For a fast local iteration loop, build a truncated proxy checkpoint with
-[`examples/conversion/create_hf_toy_model.py`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/examples/conversion/create_hf_toy_model.py), which truncates the heterogeneous layer schedule and downloads only the safetensor shards the selected layers need.
+[`examples/conversion/create_hf_toy_model.py`](../../../examples/conversion/create_hf_toy_model.py), which truncates the heterogeneous layer schedule and downloads only the safetensor shards the selected layers need.
 
 ## Inference
 
@@ -67,6 +68,10 @@ No training recipe ships for K3 yet. Pretraining, SFT, and PEFT configs, checkpo
 - KDA layers do not support context parallelism (`CP > 1`).
 - Only the language backbone is covered. Native K3 vision/video modeling and multimodal inference are not implemented; export only preserves the published vision and projector tensors unchanged.
 - The model has not been performance-tuned. Reported timings are sanity checks, not optimized throughput results.
+- Full-weight training with `TP > 1` is not supported. K3 marks its replicated norms and AttnRes projections with `sum_gradients_across_tp_domain`, and Megatron-LM's gradient finalization has no consumer for that marker, so those replicas would drift apart across tensor-parallel ranks. Only the frozen-base LoRA path, which does not train them, is supported today.
+- Export to a plain dtype (`--weight-dtype`) is unverified for the routed experts. The published experts are MXFP4, and the source shard map only carries `.weight_packed` / `.weight_scale` keys, so a dense `.weight` output key may have nowhere to go.
+- Config-only export is rejected with an explicit error. Restoring the MXFP4 expert layout and the `A_log` padding needs the source checkpoint, which the config-only path does not open.
+- Cached incremental inference is rejected with an explicit error. MLA never writes the KV cache and KDA never carries its recurrent state, so the engines would silently forget the prefix. Decoding that recomputes the full prefix each step still works.
 
 ## Related Implementation
 
