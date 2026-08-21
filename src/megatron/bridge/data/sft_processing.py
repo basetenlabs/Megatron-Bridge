@@ -149,6 +149,7 @@ _PLURAL_MEDIA_KEYS = (
     "video_paths",
     "audio_paths",
 )
+_B10_TP2_KEY = "tp2_media"
 _MEDIA_KEYS = (
     "image",
     "image_path",
