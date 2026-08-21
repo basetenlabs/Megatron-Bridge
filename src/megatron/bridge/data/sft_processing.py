@@ -142,6 +142,7 @@ class TokenizedPromptCompletion:
 _CONVERSATION_KEYS = ("messages", "conversation", "conversations")
 _CANONICAL_PROMPT_KEY = "prompt"
 _CANONICAL_COMPLETION_KEY = "completion"
+<<<<<<< HEAD
 _PLURAL_MEDIA_KEYS = (
     "images",
     "image_paths",
@@ -149,6 +150,9 @@ _PLURAL_MEDIA_KEYS = (
     "video_paths",
     "audio_paths",
 )
+=======
+_B10_TP_MEDIA_KEY = "tp_media"
+>>>>>>> a44123c90 ([baseten] data: tp-campaign media key (Bridge conflict 1))
 _MEDIA_KEYS = (
     "image",
     "image_path",
