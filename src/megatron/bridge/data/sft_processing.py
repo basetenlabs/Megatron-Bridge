@@ -142,6 +142,7 @@ class TokenizedPromptCompletion:
 _CONVERSATION_KEYS = ("messages", "conversation", "conversations")
 _CANONICAL_PROMPT_KEY = "prompt"
 _CANONICAL_COMPLETION_KEY = "completion"
+_B10_TP_MEDIA_KEY = "tp_media"
 _PLURAL_MEDIA_KEYS = (
     "images",
     "image_paths",
