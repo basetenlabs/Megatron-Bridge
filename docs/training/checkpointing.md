@@ -407,7 +407,11 @@ from megatron.bridge.training.checkpointing import (
     load_checkpoint,
     init_checkpointing_context,
 )
+<<<<<<< HEAD
 from megatron.bridge.training.callbacks import CallbackManager
+=======
+from megatron.bridge.training.determinism import apply_determinism  # rs3 rehearsal
+>>>>>>> 77b9e0b9c ([baseten] docs: determinism import example (rs3 rehearsal))
 from megatron.bridge.training.config import CheckpointConfig
 from megatron.bridge.training.state import GlobalState
 
