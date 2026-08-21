@@ -407,6 +407,7 @@ from megatron.bridge.training.checkpointing import (
     load_checkpoint,
     init_checkpointing_context,
 )
+from megatron.bridge.training.determinism import apply_determinism  # rs3 rehearsal
 from megatron.bridge.training.config import CheckpointConfig
 from megatron.bridge.training.state import GlobalState
 
