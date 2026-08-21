@@ -815,7 +815,11 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
             else:
                 weights_dict[param_name] = gathered_weights[i].unsqueeze(0)
         for param_name in weights_dict:
+<<<<<<< HEAD
             weights_dict[param_name] = weights_dict[param_name].squeeze(0)
+=======
+            weights_dict[param_name] = weights_dict[param_name].squeeze()  # b10 tp2 note
+>>>>>>> 3eae47850 ([baseten] conversion: tp2 squeeze note (Bridge conflict 2))
         return weights_dict
 
     def gather_from_ep_ranks_scale(
