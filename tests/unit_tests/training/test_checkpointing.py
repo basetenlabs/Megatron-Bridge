@@ -22,6 +22,7 @@ from unittest.mock import Mock, mock_open, patch
 import numpy as np
 import pytest
 import torch
+from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.msc_utils import MultiStorageClientFeature
 
 from megatron.bridge.training.checkpointing import (
@@ -63,6 +64,7 @@ from megatron.bridge.training.checkpointing import (
     maybe_save_dataloader_state,
     read_metadata,
     save_checkpoint,
+    sharded_objects_present_in_checkpoint,
 )
 from megatron.bridge.training.config import CheckpointConfig, ConfigContainer
 from megatron.bridge.training.state import GlobalState, TrainState
@@ -5485,3 +5487,65 @@ class TestMaybeSaveDataloaderState:
             {"dataloader_state_dict": {"dummy_energon_state": "xyz"}}, expected_path
         )
         mock_torch_save.assert_not_called()
+
+
+class TestShardedObjectsPresentInCheckpoint:
+    """Tests for sharded_objects_present_in_checkpoint.
+
+    Guards resuming a run at a different replica count. RNG state under expert
+    parallelism is sharded by (PP, TP, DP), so its storage key embeds the
+    data-parallel size; rerun state is sharded by world size. Neither can be
+    read back once that dimension changes.
+    """
+
+    @staticmethod
+    def _rng_state(pp_size: int, tp_size: int, dp_size: int, dp_rank: int = 0) -> ShardedObject:
+        """An RNG ShardedObject shaped the way get_rng_state builds it under EP > 1."""
+        return ShardedObject("rng_state", [None], (pp_size, tp_size, dp_size), (0, 0, dp_rank), replica_id=0)
+
+    def test_present_when_layout_matches(self):
+        rng_state = self._rng_state(pp_size=1, tp_size=8, dp_size=8)
+        metadata = {"rng_state/shard_0.0.0_1.8.8": object()}
+
+        assert sharded_objects_present_in_checkpoint(rng_state, metadata) is True
+
+    def test_absent_when_data_parallel_size_changed(self):
+        """DP 8 -> 12 with TP/PP unchanged: the exact production failure."""
+        # The run asks for DP=12 keys; the checkpoint only holds DP=8 keys.
+        rng_state = self._rng_state(pp_size=1, tp_size=8, dp_size=12)
+        metadata = {f"rng_state/shard_0.{tp}.{dp}_1.8.8": object() for tp in range(8) for dp in range(8)}
+
+        assert rng_state.unique_key == "rng_state/shard_0.0.0_1.8.12"
+        assert sharded_objects_present_in_checkpoint(rng_state, metadata) is False
+
+    def test_absent_for_every_rank_not_just_the_new_ones(self):
+        """The global shape lives in the key suffix, so even dp_rank 0 misses."""
+        metadata = {f"rng_state/shard_0.0.{dp}_1.8.8": object() for dp in range(8)}
+
+        for dp_rank in range(12):
+            rng_state = self._rng_state(pp_size=1, tp_size=8, dp_size=12, dp_rank=dp_rank)
+            assert sharded_objects_present_in_checkpoint(rng_state, metadata) is False
+
+    def test_nested_sharded_object_is_found(self):
+        """Rerun state nests its ShardedObject under a "sharded" key."""
+        rerun_state = {
+            "mode": "disabled",
+            "sharded": ShardedObject("rerun_state_machine_state", {}, (96,), (0,)),
+        }
+        matching = {"rerun_state_machine_state/shard_0_96": object()}
+        stale = {"rerun_state_machine_state/shard_0_64": object()}
+
+        assert sharded_objects_present_in_checkpoint(rerun_state, matching) is True
+        assert sharded_objects_present_in_checkpoint(rerun_state, stale) is False
+
+    def test_empty_metadata_preserves_existing_behavior(self):
+        """Unreadable or absent metadata must not silently disable loading."""
+        rng_state = self._rng_state(pp_size=1, tp_size=8, dp_size=12)
+
+        assert sharded_objects_present_in_checkpoint(rng_state, {}) is True
+
+    def test_state_without_sharded_objects_is_present(self):
+        metadata = {"rng_state/shard_0.0.0_1.8.8": object()}
+
+        assert sharded_objects_present_in_checkpoint({"mode": "disabled"}, metadata) is True
+        assert sharded_objects_present_in_checkpoint(None, metadata) is True
