@@ -28,7 +28,7 @@ from enum import Enum, auto
 from logging import getLogger
 from pathlib import Path
 from time import time
-from typing import Any, Callable, Literal, Optional, Protocol, Union, runtime_checkable
+from typing import Any, Callable, Iterator, Literal, Optional, Protocol, Union, runtime_checkable
 
 import numpy as np
 import torch
@@ -556,6 +556,55 @@ def get_rng_state(
         rng_state_list = {f"({pp_rank}, {tp_rank})": rng_state_list}
 
     return rng_state_list
+
+
+def sharded_objects_present_in_checkpoint(sharded_state: Any, state_dict_metadata: dict[str, Any]) -> bool:
+    """Check that every ShardedObject in ``sharded_state`` exists in the checkpoint.
+
+    A ``ShardedObject`` bakes its global shape into the storage key (see
+    ``ShardedObject.unique_key``), and megatron-core documents that, unlike
+    ShardedTensor, "it's impossible to change global object sharding". So any
+    object whose sharding depends on the parallel layout becomes unreadable once
+    that layout changes — every rank asks for a key the checkpoint does not
+    contain. Two objects are affected:
+
+    * RNG state under expert parallelism, sharded by ``(PP, TP, DP)``.
+    * Rerun state, sharded by world size.
+
+    Both are bookkeeping rather than trainable state, so skipping them is the
+    only sensible response: with N saved shards and M != N ranks there is no
+    correct mapping to reshard onto.
+
+    This asks the checkpoint what it actually holds instead of predicting the
+    layout from config, because ``run_config.yaml`` records neither the
+    data-parallel size nor the world size it was written with.
+
+    Args:
+        sharded_state: A ShardedObject, or a nested dict/list containing some.
+            Leaves that are not ShardedObjects are ignored.
+        state_dict_metadata: ``state_dict_metadata`` from the checkpoint's
+            metadata. Empty when the checkpoint has none or it is unreadable.
+
+    Returns:
+        True when every ShardedObject found is present in the checkpoint, or when
+        there is nothing to check — including when ``state_dict_metadata`` is
+        empty, so checkpoints without readable metadata keep their existing
+        behavior. False when any ShardedObject is absent.
+    """
+    if not state_dict_metadata:
+        return True
+
+    def _walk(node: Any) -> Iterator[ShardedObject]:
+        if isinstance(node, ShardedObject):
+            yield node
+        elif isinstance(node, dict):
+            for value in node.values():
+                yield from _walk(value)
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                yield from _walk(value)
+
+    return all(obj.unique_key in state_dict_metadata for obj in _walk(sharded_state))
 
 
 class CheckpointType(Enum):
@@ -2921,6 +2970,21 @@ def _load_checkpoint_from_path(
             tp_pp_match = ckpt_tp_pp == run_tp_pp
             mismatch_msg = "(TP, PP) mismatch after resume ({} vs {} from checkpoint)".format(run_tp_pp, ckpt_tp_pp)
 
+        # (TP, PP) is not the whole parallel layout. RNG state under expert
+        # parallelism is sharded by (PP, TP, DP) and rerun state by world size,
+        # so both can be unreadable even when TP and PP are unchanged — a
+        # replica-count change is enough. run_config.yaml records neither DP nor
+        # world size, so the checkpoint's own metadata is the only way to tell.
+        if ckpt_type == CheckpointType.LOCAL:
+            # Local checkpoints always resume with the same parallelism.
+            state_dict_metadata = {}
+        else:
+            reader = _get_filesystem_reader(checkpoint_name)
+            try:
+                state_dict_metadata = reader.read_metadata().state_dict_metadata
+            except FileNotFoundError:
+                state_dict_metadata = {}
+
         # Determine if RNG state will be loaded
         if (
             tp_pp_match
@@ -2935,6 +2999,13 @@ def _load_checkpoint_from_path(
                 pg_collection=pg_collection,
                 module_name=module_name,
             )
+            if not sharded_objects_present_in_checkpoint(gen_sd_rng_state, state_dict_metadata):
+                ignore_rng_state = True
+                gen_sd_rng_state = None
+                print_rank_0(
+                    "RNG state was saved under a different parallel layout than this run "
+                    "(most likely a different data-parallel size): RNG state will be ignored"
+                )
         else:
             ignore_rng_state = True
             gen_sd_rng_state = None
@@ -2993,6 +3064,12 @@ def _load_checkpoint_from_path(
                 data_iterator=None, ckpt_format=ckpt_format, force=True
             )
             ignore_rerun_state = False
+            if not sharded_objects_present_in_checkpoint(gen_sd_rerun_state, state_dict_metadata):
+                ignore_rerun_state = True
+                gen_sd_rerun_state = None
+                print_rank_0(
+                    "Rerun state was saved under a different world size than this run: rerun state will be ignored"
+                )
         else:
             gen_sd_rerun_state = None
             if not tp_pp_match:
