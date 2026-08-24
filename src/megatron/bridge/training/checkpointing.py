@@ -578,6 +578,14 @@ def sharded_objects_present_in_checkpoint(sharded_state: Any, state_dict_metadat
     layout from config, because ``run_config.yaml`` records neither the
     data-parallel size nor the world size it was written with.
 
+    The answer is reduced across ranks so every rank builds the same load state
+    dict. Each rank checks a different shard key (its own offsets), which agrees
+    everywhere in the cases that matter — a changed layout puts the wrong global
+    shape in every key. But a partially written checkpoint could otherwise make
+    ranks disagree and load mismatched state dicts, turning a clean "missing key"
+    error into a collective hang. Any rank finding an absent shard makes it
+    absent for all.
+
     Args:
         sharded_state: A ShardedObject, or a nested dict/list containing some.
             Leaves that are not ShardedObjects are ignored.
@@ -588,10 +596,8 @@ def sharded_objects_present_in_checkpoint(sharded_state: Any, state_dict_metadat
         True when every ShardedObject found is present in the checkpoint, or when
         there is nothing to check — including when ``state_dict_metadata`` is
         empty, so checkpoints without readable metadata keep their existing
-        behavior. False when any ShardedObject is absent.
+        behavior. False when any ShardedObject is absent on any rank.
     """
-    if not state_dict_metadata:
-        return True
 
     def _walk(node: Any) -> Iterator[ShardedObject]:
         if isinstance(node, ShardedObject):
@@ -603,7 +609,17 @@ def sharded_objects_present_in_checkpoint(sharded_state: Any, state_dict_metadat
             for value in node:
                 yield from _walk(value)
 
-    return all(obj.unique_key in state_dict_metadata for obj in _walk(sharded_state))
+    # Empty metadata means "cannot verify", which must not be mistaken for
+    # "absent" — checkpoints without readable metadata keep today's behavior.
+    present = not state_dict_metadata or all(obj.unique_key in state_dict_metadata for obj in _walk(sharded_state))
+
+    if torch.distributed.is_initialized():
+        device = "cuda" if torch.distributed.get_backend() == "nccl" else "cpu"
+        vote = torch.tensor([1 if present else 0], dtype=torch.int, device=device)
+        torch.distributed.all_reduce(vote, op=torch.distributed.ReduceOp.MIN)
+        present = bool(vote.item())
+
+    return present
 
 
 class CheckpointType(Enum):
