@@ -561,43 +561,18 @@ def get_rng_state(
 def sharded_objects_present_in_checkpoint(sharded_state: Any, state_dict_metadata: dict[str, Any]) -> bool:
     """Check that every ShardedObject in ``sharded_state`` exists in the checkpoint.
 
-    A ``ShardedObject`` bakes its global shape into the storage key (see
-    ``ShardedObject.unique_key``), and megatron-core documents that, unlike
-    ShardedTensor, "it's impossible to change global object sharding". So any
-    object whose sharding depends on the parallel layout becomes unreadable once
-    that layout changes — every rank asks for a key the checkpoint does not
-    contain. Two objects are affected:
-
-    * RNG state under expert parallelism, sharded by ``(PP, TP, DP)``.
-    * Rerun state, sharded by world size.
-
-    Both are bookkeeping rather than trainable state, so skipping them is the
-    only sensible response: with N saved shards and M != N ranks there is no
-    correct mapping to reshard onto.
-
-    This asks the checkpoint what it actually holds instead of predicting the
-    layout from config, because ``run_config.yaml`` records neither the
-    data-parallel size nor the world size it was written with.
-
-    The answer is reduced across ranks so every rank builds the same load state
-    dict. Each rank checks a different shard key (its own offsets), which agrees
-    everywhere in the cases that matter — a changed layout puts the wrong global
-    shape in every key. But a partially written checkpoint could otherwise make
-    ranks disagree and load mismatched state dicts, turning a clean "missing key"
-    error into a collective hang. Any rank finding an absent shard makes it
-    absent for all.
+    ``ShardedObject.unique_key`` embeds the global shape, so an object sharded
+    over a dimension that changed since the save is unreadable: every rank asks
+    for a key the checkpoint does not contain. Reduced with MIN so all ranks
+    build the same load state dict even if the checkpoint is partially written.
 
     Args:
         sharded_state: A ShardedObject, or a nested dict/list containing some.
-            Leaves that are not ShardedObjects are ignored.
-        state_dict_metadata: ``state_dict_metadata`` from the checkpoint's
-            metadata. Empty when the checkpoint has none or it is unreadable.
+        state_dict_metadata: ``state_dict_metadata`` from the checkpoint.
 
     Returns:
-        True when every ShardedObject found is present in the checkpoint, or when
-        there is nothing to check — including when ``state_dict_metadata`` is
-        empty, so checkpoints without readable metadata keep their existing
-        behavior. False when any ShardedObject is absent on any rank.
+        False if any ShardedObject is missing on any rank. Empty metadata means
+        "cannot verify" and returns True, preserving the previous behavior.
     """
 
     def _walk(node: Any) -> Iterator[ShardedObject]:
@@ -610,8 +585,6 @@ def sharded_objects_present_in_checkpoint(sharded_state: Any, state_dict_metadat
             for value in node:
                 yield from _walk(value)
 
-    # Empty metadata means "cannot verify", which must not be mistaken for
-    # "absent" — checkpoints without readable metadata keep today's behavior.
     present = not state_dict_metadata or all(obj.unique_key in state_dict_metadata for obj in _walk(sharded_state))
 
     if torch.distributed.is_initialized():
@@ -2986,14 +2959,11 @@ def _load_checkpoint_from_path(
             tp_pp_match = ckpt_tp_pp == run_tp_pp
             mismatch_msg = "(TP, PP) mismatch after resume ({} vs {} from checkpoint)".format(run_tp_pp, ckpt_tp_pp)
 
-        # (TP, PP) is not the whole parallel layout. RNG state under expert
-        # parallelism is sharded by (PP, TP, DP) and rerun state by world size,
-        # so both can be unreadable even when TP and PP are unchanged — a
-        # replica-count change is enough. run_config.yaml records neither DP nor
-        # world size, so the checkpoint's own metadata is the only way to tell.
+        # tp_pp_match is not the whole layout: RNG is sharded by (PP, TP, DP)
+        # under EP and rerun state by world size, and run_config.yaml records
+        # neither DP nor world size, so consult the checkpoint's own metadata.
         if ckpt_type == CheckpointType.LOCAL:
-            # Local checkpoints always resume with the same parallelism.
-            state_dict_metadata = {}
+            state_dict_metadata = {}  # local checkpoints always resume with the same parallelism
         else:
             reader = _get_filesystem_reader(checkpoint_name)
             try:
