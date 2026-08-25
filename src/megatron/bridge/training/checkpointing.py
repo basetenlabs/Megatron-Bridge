@@ -560,29 +560,36 @@ def get_rng_state(
     return rng_state_list
 
 
-def sharded_objects_present_in_checkpoint(
-    sharded_state: ShardedStateDict | ShardedObject,
+def resolve_state_to_load(
+    kind: str,
+    sharded_state: ShardedStateDict | ShardedObject | None,
     state_dict_metadata: Mapping[str, STORAGE_TYPES],
-) -> bool:
-    """Check that every ShardedObject in ``sharded_state`` exists in the checkpoint.
+) -> tuple[bool, ShardedStateDict | ShardedObject | None]:
+    """Decide whether ``kind`` state can be loaded from this checkpoint.
 
     Collective: every rank must call this, or the reduce below hangs.
 
     ``ShardedObject.unique_key`` embeds the global shape, so an object sharded
     over a dimension that changed since the save is unreadable: every rank asks
     for a key the checkpoint does not contain. Reduced with MIN so all ranks
-    build the same load state dict even if the checkpoint is partially written.
+    reach the same decision even if the checkpoint is partially written.
 
     Args:
-        sharded_state: A bare ShardedObject (what ``get_rng_state`` returns for
-            torch_dist) or a sharded state dict containing some.
+        kind: Name of the section, for the log line ("RNG", "Rerun").
+        sharded_state: The state this run would request -- a bare ShardedObject
+            (what ``get_rng_state`` returns for torch_dist) or a sharded state
+            dict containing some. ``None`` when the caller already decided not
+            to load, which passes straight through.
         state_dict_metadata: The checkpoint's ``state_dict_metadata``. Only its
-            keys are consulted.
+            keys are consulted; empty means "cannot verify", which loads.
 
     Returns:
-        False if any ShardedObject is missing on any rank. Empty metadata means
-        "cannot verify" and returns True, preserving the previous behavior.
+        ``(ignore_flag, state)`` for the caller to assign: the state itself when
+        every shard is present, otherwise ``(True, None)``.
     """
+    if sharded_state is None:
+        return True, None
+
     if isinstance(sharded_state, ShardedObject):
         objects = [sharded_state]
     else:
@@ -596,7 +603,11 @@ def sharded_objects_present_in_checkpoint(
         torch.distributed.all_reduce(vote, op=torch.distributed.ReduceOp.MIN)
         present = bool(vote.item())
 
-    return present
+    if present:
+        return False, sharded_state
+
+    print_rank_0(f"checkpoint {kind} shards do not match this parallel layout: {kind} state will be ignored")
+    return True, None
 
 
 def _select_dp_rng_state(
@@ -621,13 +632,6 @@ def _select_dp_rng_state(
         )
         return None
     return rng_state_list[pg_collection.dp.rank()]
-
-
-def _skip_loaded_state(message: str) -> tuple[bool, None]:
-    print_rank_0(message)
-    # (ignore_flag, generated_state): suppress the restore and leave the section
-    # out of the load state dict.
-    return True, None
 
 
 class CheckpointType(Enum):
@@ -3013,22 +3017,20 @@ def _load_checkpoint_from_path(
             and cfg.checkpoint.load_rng
             and run_config["checkpoint"]["save_rng"]
         ):
-            gen_sd_rng_state = get_rng_state(
+            candidate_rng_state = get_rng_state(
                 cfg.rng.data_parallel_random_init,
                 ckpt_format,
                 pg_collection=pg_collection,
                 module_name=module_name,
             )
-            if not sharded_objects_present_in_checkpoint(gen_sd_rng_state, state_dict_metadata):
-                ignore_rng_state, gen_sd_rng_state = _skip_loaded_state(
-                    "checkpoint RNG shards do not match this parallel layout: RNG state will be ignored"
-                )
         else:
-            ignore_rng_state, gen_sd_rng_state = _skip_loaded_state(
+            candidate_rng_state = None
+            print_rank_0(
                 "{}: RNG state will be ignored".format(mismatch_msg)
                 if not tp_pp_match
                 else "RNG state will not be loaded"
             )
+        ignore_rng_state, gen_sd_rng_state = resolve_state_to_load("RNG", candidate_rng_state, state_dict_metadata)
 
         if ckpt_type == CheckpointType.LOCAL:
             # Local checkpoints don't store content metadata in common.pt.
@@ -3078,20 +3080,19 @@ def _load_checkpoint_from_path(
         # Determine if rerun state will be loaded
         if tp_pp_match and not release and not cfg.checkpoint.finetune and "rerun_state_machine" in state_dict:
             rerun_state_machine = get_rerun_state_machine()
-            gen_sd_rerun_state = rerun_state_machine.state_dict(
+            candidate_rerun_state = rerun_state_machine.state_dict(
                 data_iterator=None, ckpt_format=ckpt_format, force=True
             )
-            ignore_rerun_state = False
-            if not sharded_objects_present_in_checkpoint(gen_sd_rerun_state, state_dict_metadata):
-                ignore_rerun_state, gen_sd_rerun_state = _skip_loaded_state(
-                    "checkpoint rerun shards do not match this world size: Rerun state will be ignored"
-                )
         else:
-            ignore_rerun_state, gen_sd_rerun_state = _skip_loaded_state(
+            candidate_rerun_state = None
+            print_rank_0(
                 "{}: Rerun state will be ignored".format(mismatch_msg)
                 if not tp_pp_match
                 else "Rerun state will not be loaded"
             )
+        ignore_rerun_state, gen_sd_rerun_state = resolve_state_to_load(
+            "Rerun", candidate_rerun_state, state_dict_metadata
+        )
 
         if sharded_sd_metadata is None:
             sharded_sd_metadata = {}
