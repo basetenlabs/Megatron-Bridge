@@ -61,6 +61,7 @@ from modelopt.torch.opt.plugins import (
     save_modelopt_state,
     save_sharded_modelopt_state,
 )
+from torch.distributed.checkpoint.metadata import STORAGE_TYPES
 from torch.distributed.tensor import DTensor
 
 from megatron.bridge.peft.base import PEFT
@@ -560,7 +561,7 @@ def get_rng_state(
 
 def sharded_objects_present_in_checkpoint(
     sharded_state: ShardedStateDict | ShardedObject,
-    state_dict_metadata: Mapping[str, object],
+    state_dict_metadata: Mapping[str, STORAGE_TYPES],
 ) -> bool:
     """Check that every ShardedObject in ``sharded_state`` exists in the checkpoint.
 
