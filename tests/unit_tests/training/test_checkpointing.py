@@ -47,6 +47,7 @@ from megatron.bridge.training.checkpointing import (
     _record_dataloader_state_dir,
     _save_hf_adapter_weights,
     _save_hf_weights,
+    _select_dp_rng_state,  # noqa: E402
     checkpoint_exists,
     cleanup_old_non_persistent_checkpoint,
     create_checkpoint_manager,
@@ -5550,3 +5551,49 @@ class TestShardedObjectsPresentInCheckpoint:
 
         assert sharded_objects_present_in_checkpoint({"mode": "disabled"}, metadata) is True
         assert sharded_objects_present_in_checkpoint({}, metadata) is True
+
+
+class TestSelectDpRngState:
+    """Tests for _select_dp_rng_state.
+
+    Without expert parallelism the RNG key omits DP entirely (DP is a
+    ShardedObject replica_id), so a key-presence check cannot tell that the
+    payload was gathered at a different DP size. The count has to be checked.
+    """
+
+    @staticmethod
+    def _pg(dp_size: int, dp_rank: int):
+        pg = Mock()
+        pg.dp.size.return_value = dp_size
+        pg.dp.rank.return_value = dp_rank
+        return pg
+
+    def test_shared_state_ignores_dp_size(self):
+        """Without data_parallel_random_init the payload is one shared entry."""
+        payload = [{"tag": "shared"}]
+
+        got = _select_dp_rng_state(payload, self._pg(dp_size=8, dp_rank=5), False)
+
+        assert got == {"tag": "shared"}
+
+    def test_per_rank_state_selects_this_rank(self):
+        payload = [{"tag": i} for i in range(4)]
+
+        got = _select_dp_rng_state(payload, self._pg(dp_size=4, dp_rank=2), True)
+
+        assert got == {"tag": 2}
+
+    def test_per_rank_state_absent_when_dp_size_changed(self):
+        """Saved at DP=2, resumed at DP=4: no correct mapping, so skip."""
+        payload = [{"tag": 0}, {"tag": 1}]
+
+        got = _select_dp_rng_state(payload, self._pg(dp_size=4, dp_rank=3), True)
+
+        assert got is None
+
+    def test_per_rank_state_absent_when_dp_size_shrank(self):
+        payload = [{"tag": i} for i in range(8)]
+
+        got = _select_dp_rng_state(payload, self._pg(dp_size=2, dp_rank=1), True)
+
+        assert got is None

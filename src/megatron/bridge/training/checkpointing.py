@@ -598,6 +598,30 @@ def sharded_objects_present_in_checkpoint(
     return present
 
 
+def _select_dp_rng_state(
+    rng_state_list: list, pg_collection: ProcessGroupCollection, data_parallel_random_init: bool
+) -> dict | None:
+    """Pick this rank's entry out of a saved RNG payload, or None if it has none.
+
+    Without ``data_parallel_random_init`` the payload is a single shared entry
+    and any DP size can read it. With it, the payload holds one entry per DP
+    rank at save time, so a run at a different DP size has no correct mapping --
+    and the key alone cannot detect that, because without expert parallelism DP
+    is a ShardedObject ``replica_id`` rather than part of the key.
+    """
+    if not data_parallel_random_init:
+        return rng_state_list[0]
+
+    dp_size = pg_collection.dp.size()
+    if len(rng_state_list) != dp_size:
+        print_rank_0(
+            f"checkpoint holds {len(rng_state_list)} per-DP RNG states but this run has "
+            f"{dp_size} data-parallel ranks: RNG state will be ignored"
+        )
+        return None
+    return rng_state_list[pg_collection.dp.rank()]
+
+
 def _skip_loaded_state(message: str) -> tuple[bool, None]:
     print_rank_0(message)
     # (ignore_flag, generated_state): suppress the restore and leave the section
@@ -3284,30 +3308,25 @@ def _load_checkpoint_from_path(
                     else:
                         print_rank_0("WARNING: RNG state not found for current TP/PP rank")
                         rng_state_list = next(iter(state_dict["rng_state"].values()))
-                    rng_state = (
-                        rng_state_list[pg_collection.dp.rank()]
-                        if cfg.rng.data_parallel_random_init
-                        else rng_state_list[0]
-                    )
                 else:
                     # torch_dist format: ShardedObject
-                    rng_state = (
-                        state_dict["rng_state"][pg_collection.dp.rank()]
-                        if cfg.rng.data_parallel_random_init
-                        else state_dict["rng_state"][0]
-                    )
+                    rng_state_list = state_dict["rng_state"]
 
-                random.setstate(rng_state["random_rng_state"])
-                np.random.set_state(rng_state["np_rng_state"])
-                torch.set_rng_state(rng_state["torch_rng_state"])
-                torch.cuda.set_rng_state(rng_state["cuda_rng_state"])
-                if not rng_state["rng_tracker_states"]:
-                    raise KeyError
-                rng_tracker_states = {
-                    k: tensor_parallel.convert_cuda_rng_state(v, to_graphable=graph_safe_rng)
-                    for k, v in rng_state["rng_tracker_states"].items()
-                }
-                cuda_rng_tracker.set_states(rng_tracker_states)
+                rng_state = _select_dp_rng_state(rng_state_list, pg_collection, cfg.rng.data_parallel_random_init)
+                # None means the saved per-DP states cannot be mapped onto this
+                # run; leave the generators as _set_random_seed left them.
+                if rng_state is not None:
+                    random.setstate(rng_state["random_rng_state"])
+                    np.random.set_state(rng_state["np_rng_state"])
+                    torch.set_rng_state(rng_state["torch_rng_state"])
+                    torch.cuda.set_rng_state(rng_state["cuda_rng_state"])
+                    if not rng_state["rng_tracker_states"]:
+                        raise KeyError
+                    rng_tracker_states = {
+                        k: tensor_parallel.convert_cuda_rng_state(v, to_graphable=graph_safe_rng)
+                        for k, v in rng_state["rng_tracker_states"].items()
+                    }
+                    cuda_rng_tracker.set_states(rng_tracker_states)
             else:  # backward compatibility
                 random.setstate(state_dict["random_rng_state"])
                 np.random.set_state(state_dict["np_rng_state"])
