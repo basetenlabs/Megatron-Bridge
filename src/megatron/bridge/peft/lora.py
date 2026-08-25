@@ -219,6 +219,8 @@ class LoRA(PEFT, ModuleMatcher):
             )
 
             logger.info(f"Adding lora to: {full_name}")
+            if attrs.replicate_adapter:
+                logger.info("Replicating LoRA matrices across TP for duplicated base: %s", full_name)
             if use_shared_outer_adapter:
                 adapter_cls = SharedOuterGroupedExpertAdapter
             elif use_per_expert_adapter:
