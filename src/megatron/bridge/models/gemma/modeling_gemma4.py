@@ -31,6 +31,7 @@ import copy
 import inspect
 import types
 import weakref
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -62,6 +63,7 @@ from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params, get_pg_rank
 from torch import Tensor
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from megatron.bridge.models.gemma.gemma3_provider import (
     TERowParallelLinearLayerNorm,
@@ -741,8 +743,188 @@ def wire_gemma4_kv_sharing(model: nn.Module) -> None:
 # ---------------------------------------------------------------------------
 
 
+class Gemma4DenseCoreAttention(TEDotProductAttention):
+    """Gemma 4 dense core attention: Transformer Engine for sliding layers, SDPA for global ones.
+
+    Gemma 4 global layers run head_dim_qk == head_dim_v == 512. TE FlashAttention and cuDNN
+    FusedAttention both reject that head dim on sm90 ("Selected backend = NoBackend"), while
+    ``megatron.core.transformer.dot_product_attention.DotProductAttention`` -- what
+    ``LocalSpecProvider.core_attention()`` returns, and the only other backend that accepts the
+    head dim -- does run but materializes a [b, np, sq, sk] score matrix and so OOMs well before
+    production sequence lengths. Those layers therefore go through torch SDPA's memory-efficient
+    backend, which has neither limitation.
+
+    Sliding layers (head_dim 256) are already served well by TE and keep the inherited path
+    unchanged. The choice is made once per layer at construction from ``layer_number``; it is
+    never a runtime fallback, so a TE failure on a sliding layer stays loud.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        attention_dropout: Optional[float] = None,
+        softmax_scale: Optional[float] = None,
+        **kwargs,
+    ):
+        is_sliding = _is_gemma4_sliding_layer(config, layer_number)
+
+        # Shallow copy: only window_size is rebound, and deep-copying a TransformerConfig
+        # drags in process-group and init-method references.
+        config = copy.copy(config)
+        config.window_size = (config.window_size or (511, 0)) if is_sliding else None
+
+        super().__init__(
+            config=config,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            attention_type=attention_type,
+            attention_dropout=attention_dropout,
+            softmax_scale=softmax_scale,
+            **kwargs,
+        )
+
+        self.is_gemma4_sliding_layer = is_sliding
+        if is_sliding:
+            return
+
+        # Global layers bypass TE entirely, so whatever TE would have resolved for them
+        # has to be resolved here instead.
+        if getattr(config, "softmax_type", "vanilla") != "vanilla":
+            raise ValueError(
+                "Gemma 4 global attention runs through torch SDPA, which implements only the "
+                f"vanilla softmax; got softmax_type={config.softmax_type!r}."
+            )
+        # Gemma4DenseSelfAttention pins softmax_scale to 1.0. Letting SDPA fall back to its
+        # own 1/sqrt(head_dim) default would rescale every global layer's logits.
+        self.sdpa_softmax_scale = softmax_scale if softmax_scale is not None else config.softmax_scale
+        self.sdpa_attention_dropout = config.attention_dropout if attention_dropout is None else attention_dropout
+        self.sdpa_attn_mask_type = attn_mask_type
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        num_splits: Optional[int] = None,
+    ) -> Tensor:
+        """Route sliding layers to Transformer Engine and global layers to torch SDPA."""
+        if self.is_gemma4_sliding_layer:
+            return super().forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                num_splits=num_splits,
+            )
+
+        if packed_seq_params is not None or attention_bias is not None or num_splits is not None:
+            raise ValueError(
+                "Gemma 4 global attention runs through torch SDPA, which supports none of "
+                "packed_seq_params, attention_bias, or num_splits."
+            )
+
+        # Expand K/V heads the way DotProductAttention.forward does (see
+        # megatron/core/transformer/dot_product_attention.py, the repeat_interleave on
+        # num_attention_heads_per_partition // num_query_groups_per_partition). The ratio comes
+        # from the tensors rather than the config because Gemma4DenseSelfAttention may have
+        # sliced query heads per TP rank when num_query_groups < world_size, and because the TE
+        # base class does not carry those *_per_partition attributes at all.
+        heads_per_group = query.size(2) // key.size(2)
+        if heads_per_group > 1:
+            key = key.repeat_interleave(heads_per_group, dim=2)
+            value = value.repeat_interleave(heads_per_group, dim=2)
+
+        # [s, b, np, hn] -> [b, np, s, hn]; hn stays stride-1, so these are views.
+        query, key, value = (tensor.permute(1, 2, 0, 3) for tensor in (query, key, value))
+
+        attn_mask, is_causal = self._sdpa_attention_mask(attention_mask, attn_mask_type, query.size(2), key.size(2))
+        dropout_p = self.sdpa_attention_dropout if self.training else 0.0
+        scale = self.sdpa_softmax_scale if self.sdpa_softmax_scale is not None else query.size(-1) ** -0.5
+        # Match DotProductAttention.forward (megatron/core/transformer/dot_product_attention.py):
+        # it applies attention dropout under get_cuda_rng_tracker().fork() unless sequence
+        # parallelism already gives each rank a distinct stream. Gemma 4 runs dropout at 0, so
+        # this preserves the contract rather than serving a live path.
+        rng_context = (
+            tensor_parallel.get_cuda_rng_tracker().fork()
+            if dropout_p > 0.0 and not self.config.sequence_parallel
+            else nullcontext()
+        )
+
+        # EFFICIENT_ATTENTION only: it is the one backend that both accepts 512-dim heads and
+        # never materializes [b, np, sq, sk]. MATH would run but reintroduces exactly the
+        # quadratic allocation this path exists to avoid, so an unavailable kernel must raise.
+        with rng_context, sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+            context = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+            )
+
+        # [b, np, sq, hn] -> [sq, b, np * hn]
+        context = context.permute(2, 0, 1, 3).contiguous()
+        return context.view(context.size(0), context.size(1), -1)
+
+    def _sdpa_attention_mask(
+        self,
+        attention_mask: Optional[Tensor],
+        attn_mask_type: Optional[AttnMaskType],
+        q_len: int,
+        kv_len: int,
+    ) -> Tuple[Optional[Tensor], bool]:
+        """Translate a Megatron attention mask into torch SDPA's convention.
+
+        Megatron masks are True where a position must be dropped: DotProductAttention hands the
+        mask to ``megatron.core.transformer.utils.attention_mask_func``, which does
+        ``attention_scores.masked_fill_(attention_mask, -10000.0)`` on exactly those entries, and
+        ``get_default_causal_mask`` builds ``triu(ones, diagonal=1).bool()``. SDPA boolean masks
+        are the exact inverse: True means keep. The mask is negated here, never forwarded.
+
+        Note the two also differ in fill value -- Megatron uses a finite -10000.0 where SDPA uses
+        -inf. They agree for causal self-attention, where no row is ever fully masked, but a
+        fully masked row would give a uniform distribution under Megatron and NaN under SDPA.
+        """
+        mask_type = self.sdpa_attn_mask_type if attn_mask_type is None else attn_mask_type
+
+        if attention_mask is None:
+            # megatron.core.fusions.fused_softmax.FusedScaleMaskSoftmax.forward_torch_softmax
+            # synthesizes a causal mask when the caller passes None; is_causal reaches the same
+            # result without ever allocating [sq, sk]. The q_len == 1 guard mirrors the one there:
+            # sq == 1 means decode against a KV cache, where causal masking is a no-op.
+            if mask_type not in (AttnMaskType.causal, AttnMaskType.padding_causal) or q_len == 1:
+                return None, False
+            if q_len != kv_len:
+                raise ValueError(f"Causal masking without an explicit mask needs sq == sk; got {q_len} != {kv_len}.")
+            return None, True
+
+        if attention_mask.dtype != torch.bool:
+            raise TypeError(
+                "Gemma 4 global attention expects a boolean Megatron attention mask "
+                f"(True == masked out); got dtype {attention_mask.dtype}."
+            )
+        return ~attention_mask, False
+
+
 def get_gemma4_layer_spec(config: Optional[TransformerConfig] = None) -> ModuleSpec:
-    """Return a ModuleSpec for a Gemma-4 Dense transformer layer (local/non-TE)."""
+    """Return a ModuleSpec for a Gemma-4 Dense transformer layer.
+
+    Linear layers use the local (non-TE) backend. Core attention is
+    ``Gemma4DenseCoreAttention``, which dispatches sliding layers to Transformer Engine
+    and global layers to torch SDPA.
+    """
     backend = LocalSpecProvider()
 
     submodules = Gemma4DenseTransformerLayerSubmodules(
@@ -752,7 +934,7 @@ def get_gemma4_layer_spec(config: Optional[TransformerConfig] = None) -> ModuleS
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
                 linear_qkv=backend.column_parallel_linear(),
-                core_attention=backend.core_attention(),
+                core_attention=Gemma4DenseCoreAttention,
                 linear_proj=backend.row_parallel_linear(),
                 q_layernorm=RMSNorm,
                 k_layernorm=RMSNorm,
