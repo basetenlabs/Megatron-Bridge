@@ -219,6 +219,8 @@ class LoRA(PEFT, ModuleMatcher):
             )
 
             logger.info(f"Adding lora to: {full_name}")
+            if attrs.replicate_adapter:
+                logger.info("Replicating LoRA matrices across TP for duplicated base: %s", full_name)
             if use_shared_outer_adapter:
                 adapter_cls = SharedOuterGroupedExpertAdapter
             elif use_per_expert_adapter:
@@ -251,6 +253,7 @@ class LoRA(PEFT, ModuleMatcher):
                     sequence_parallel_input_regather=self.sequence_parallel_input_regather,
                     disable_tensor_parallel_comm=attrs.disable_tensor_parallel_comm,
                     disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
+                    replicate_adapter=attrs.replicate_adapter,
                 )
             adapter = adapter_cls(attrs.in_features, attrs.out_features, dim, **adapter_kwargs)
             if isinstance(module, TopKRouter):
