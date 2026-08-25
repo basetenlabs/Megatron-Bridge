@@ -587,9 +587,27 @@ class Gemma4Bridge(MegatronModelBridge):
         qkv_total_sliding = config.num_attention_heads + 2 * config.num_query_groups
         expected_numel_sliding = qkv_total_sliding * config.kv_channels * (feature_dim or 1)
 
-        if linear_out_weight.numel() != expected_numel_sliding and hasattr(config, "global_head_dim"):
-            num_kv_global = config.num_global_key_value_heads
-            head_size_global = config.global_head_dim
+        # Gemma 4's global layers have a different attention geometry than its
+        # sliding ones (on gemma-4-31B: 4 KV heads at head_dim 512, versus 16 at
+        # 256), so a global layer's fused QKV cannot be reshaped with the sliding
+        # dims that live on config. The branch below re-splits it with the global
+        # ones. It has to accept both spellings because the two providers name the
+        # same two fields differently -- Gemma4ModelProvider (MoE) uses HF's
+        # global_head_dim / num_global_key_value_heads, Gemma4DenseProvider uses
+        # Megatron's global_kv_channels / num_global_query_groups. Gating on the
+        # MoE names alone made this branch dead code for dense models: global
+        # layers fell through to the sliding reshape and raised
+        # "shape '[64, 256, r]' is invalid for input of size ...".
+        head_size_global = getattr(config, "global_head_dim", None) or getattr(config, "global_kv_channels", None)
+        num_kv_global = getattr(config, "num_global_key_value_heads", None) or getattr(
+            config, "num_global_query_groups", None
+        )
+
+        if (
+            linear_out_weight.numel() != expected_numel_sliding
+            and head_size_global is not None
+            and num_kv_global is not None
+        ):
 
             class _GlobalAttnCfg:
                 num_attention_heads = config.num_attention_heads
