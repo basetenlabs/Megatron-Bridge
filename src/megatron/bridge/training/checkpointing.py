@@ -596,13 +596,10 @@ def sharded_objects_present_in_checkpoint(
     return present
 
 
-def _skip_loaded_state(kind: str, reason: str | None) -> tuple[bool, None]:
-    """Drop ``kind`` state from the load, logging ``reason`` when there is one.
-
-    Returns the ``(ignore_flag, generated_state)`` pair the caller assigns.
-    """
-    if reason:
-        print_rank_0(f"{reason}: {kind} state will be ignored")
+def _skip_loaded_state(message: str) -> tuple[bool, None]:
+    print_rank_0(message)
+    # (ignore_flag, generated_state): suppress the restore and leave the section
+    # out of the load state dict.
     return True, None
 
 
@@ -2919,10 +2916,14 @@ def _load_checkpoint_from_path(
             )
             if not sharded_objects_present_in_checkpoint(gen_sd_rng_state, state_dict_metadata):
                 ignore_rng_state, gen_sd_rng_state = _skip_loaded_state(
-                    "RNG", "checkpoint RNG shards do not match this parallel layout"
+                    "checkpoint RNG shards do not match this parallel layout: RNG state will be ignored"
                 )
         else:
-            ignore_rng_state, gen_sd_rng_state = _skip_loaded_state("RNG", mismatch_msg if not tp_pp_match else None)
+            ignore_rng_state, gen_sd_rng_state = _skip_loaded_state(
+                "{}: RNG state will be ignored".format(mismatch_msg)
+                if not tp_pp_match
+                else "RNG state will not be loaded"
+            )
 
         if ckpt_type == CheckpointType.LOCAL:
             # Local checkpoints don't store content metadata in common.pt.
@@ -2975,11 +2976,13 @@ def _load_checkpoint_from_path(
             ignore_rerun_state = False
             if not sharded_objects_present_in_checkpoint(gen_sd_rerun_state, state_dict_metadata):
                 ignore_rerun_state, gen_sd_rerun_state = _skip_loaded_state(
-                    "Rerun", "checkpoint rerun shards do not match this world size"
+                    "checkpoint rerun shards do not match this world size: Rerun state will be ignored"
                 )
         else:
             ignore_rerun_state, gen_sd_rerun_state = _skip_loaded_state(
-                "Rerun", mismatch_msg if not tp_pp_match else None
+                "{}: Rerun state will be ignored".format(mismatch_msg)
+                if not tp_pp_match
+                else "Rerun state will not be loaded"
             )
 
         if sharded_sd_metadata is None:
