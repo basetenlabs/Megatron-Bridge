@@ -28,12 +28,13 @@ from enum import Enum, auto
 from logging import getLogger
 from pathlib import Path
 from time import time
-from typing import Any, Callable, Iterator, Literal, Optional, Protocol, Union, runtime_checkable
+from typing import Any, Callable, Literal, Mapping, Optional, Protocol, Union, runtime_checkable
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from megatron.core import dist_checkpointing, tensor_parallel
+from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, ShardedTensor
 from megatron.core.dist_checkpointing.serialization import StateDict
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
@@ -558,7 +559,10 @@ def get_rng_state(
     return rng_state_list
 
 
-def sharded_objects_present_in_checkpoint(sharded_state: Any, state_dict_metadata: dict[str, Any]) -> bool:
+def sharded_objects_present_in_checkpoint(
+    sharded_state: ShardedStateDict | ShardedObject,
+    state_dict_metadata: Mapping[str, object],
+) -> bool:
     """Check that every ShardedObject in ``sharded_state`` exists in the checkpoint.
 
     ``ShardedObject.unique_key`` embeds the global shape, so an object sharded
@@ -567,25 +571,21 @@ def sharded_objects_present_in_checkpoint(sharded_state: Any, state_dict_metadat
     build the same load state dict even if the checkpoint is partially written.
 
     Args:
-        sharded_state: A ShardedObject, or a nested dict/list containing some.
-        state_dict_metadata: ``state_dict_metadata`` from the checkpoint.
+        sharded_state: A bare ShardedObject (what ``get_rng_state`` returns for
+            torch_dist) or a sharded state dict containing some.
+        state_dict_metadata: The checkpoint's ``state_dict_metadata``. Only its
+            keys are consulted.
 
     Returns:
         False if any ShardedObject is missing on any rank. Empty metadata means
         "cannot verify" and returns True, preserving the previous behavior.
     """
+    if isinstance(sharded_state, ShardedObject):
+        objects = [sharded_state]
+    else:
+        objects = [v for v in nested_values(sharded_state) if isinstance(v, ShardedObject)]
 
-    def _walk(node: Any) -> Iterator[ShardedObject]:
-        if isinstance(node, ShardedObject):
-            yield node
-        elif isinstance(node, dict):
-            for value in node.values():
-                yield from _walk(value)
-        elif isinstance(node, (list, tuple)):
-            for value in node:
-                yield from _walk(value)
-
-    present = not state_dict_metadata or all(obj.unique_key in state_dict_metadata for obj in _walk(sharded_state))
+    present = not state_dict_metadata or all(obj.unique_key in state_dict_metadata for obj in objects)
 
     if torch.distributed.is_initialized():
         device = "cuda" if torch.distributed.get_backend() == "nccl" else "cpu"

@@ -5980,7 +5980,8 @@ class TestShardedObjectsPresentInCheckpoint:
         assert sharded_objects_present_in_checkpoint(rng_state, {}) is True
 
     def test_state_without_sharded_objects_is_present(self):
+        """Nothing to verify is not the same as something missing."""
         metadata = {"rng_state/shard_0.0.0_1.8.8": object()}
 
         assert sharded_objects_present_in_checkpoint({"mode": "disabled"}, metadata) is True
-        assert sharded_objects_present_in_checkpoint(None, metadata) is True
+        assert sharded_objects_present_in_checkpoint({}, metadata) is True
