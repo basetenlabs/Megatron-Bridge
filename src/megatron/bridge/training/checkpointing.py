@@ -565,6 +565,8 @@ def sharded_objects_present_in_checkpoint(
 ) -> bool:
     """Check that every ShardedObject in ``sharded_state`` exists in the checkpoint.
 
+    Collective: every rank must call this, or the reduce below hangs.
+
     ``ShardedObject.unique_key`` embeds the global shape, so an object sharded
     over a dimension that changed since the save is unreadable: every rank asks
     for a key the checkpoint does not contain. Reduced with MIN so all ranks
