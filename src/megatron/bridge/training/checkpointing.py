@@ -595,6 +595,16 @@ def sharded_objects_present_in_checkpoint(sharded_state: Any, state_dict_metadat
     return present
 
 
+def _skip_loaded_state(kind: str, reason: str | None) -> tuple[bool, None]:
+    """Drop ``kind`` state from the load, logging ``reason`` when there is one.
+
+    Returns the ``(ignore_flag, generated_state)`` pair the caller assigns.
+    """
+    if reason:
+        print_rank_0(f"{reason}: {kind} state will be ignored")
+    return True, None
+
+
 class CheckpointType(Enum):
     """Types of checkpoints to save."""
 
@@ -2907,17 +2917,11 @@ def _load_checkpoint_from_path(
                 module_name=module_name,
             )
             if not sharded_objects_present_in_checkpoint(gen_sd_rng_state, state_dict_metadata):
-                ignore_rng_state = True
-                gen_sd_rng_state = None
-                print_rank_0(
-                    "RNG state was saved under a different parallel layout than this run "
-                    "(most likely a different data-parallel size): RNG state will be ignored"
+                ignore_rng_state, gen_sd_rng_state = _skip_loaded_state(
+                    "RNG", "checkpoint RNG shards do not match this parallel layout"
                 )
         else:
-            ignore_rng_state = True
-            gen_sd_rng_state = None
-            if not tp_pp_match:
-                print_rank_0("{}: RNG state will be ignored".format(mismatch_msg))
+            ignore_rng_state, gen_sd_rng_state = _skip_loaded_state("RNG", mismatch_msg if not tp_pp_match else None)
 
         if ckpt_type == CheckpointType.LOCAL:
             # Local checkpoints don't store content metadata in common.pt.
@@ -2969,15 +2973,13 @@ def _load_checkpoint_from_path(
             )
             ignore_rerun_state = False
             if not sharded_objects_present_in_checkpoint(gen_sd_rerun_state, state_dict_metadata):
-                ignore_rerun_state = True
-                gen_sd_rerun_state = None
-                print_rank_0(
-                    "Rerun state was saved under a different world size than this run: rerun state will be ignored"
+                ignore_rerun_state, gen_sd_rerun_state = _skip_loaded_state(
+                    "Rerun", "checkpoint rerun shards do not match this world size"
                 )
         else:
-            gen_sd_rerun_state = None
-            if not tp_pp_match:
-                print_rank_0("{}: Rerun state will be ignored".format(mismatch_msg))
+            ignore_rerun_state, gen_sd_rerun_state = _skip_loaded_state(
+                "Rerun", mismatch_msg if not tp_pp_match else None
+            )
 
         if sharded_sd_metadata is None:
             sharded_sd_metadata = {}
