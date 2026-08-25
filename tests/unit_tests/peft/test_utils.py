@@ -434,6 +434,24 @@ class TestGetAdapterAttributes:
             row_linear
         ).base_linear_is_parallel  # Should be True for parallel linear layers
 
+    def test_get_adapter_attributes_replicates_adapter_for_duplicated_te_linear(self, monkeypatch):
+        class FakeTELinear(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(sequence_parallel=True, tensor_model_parallel_size=2)
+                self.in_features = 16
+                self.out_features = 8
+                self.parallel_mode = None
+                self._pg_collection = make_mock_pg_collection(tp_size=2)
+
+        monkeypatch.setattr(peft_utils, "HAVE_TE", True)
+        monkeypatch.setattr(peft_utils, "TELinear", FakeTELinear)
+
+        attrs = get_adapter_attributes_from_linear(FakeTELinear())
+
+        assert attrs.base_linear_is_parallel is False
+        assert attrs.replicate_adapter is True
+
 
 class TestParallelLinearAdapter:
     """Test ParallelLinearAdapter class."""
@@ -493,6 +511,37 @@ class TestParallelLinearAdapter:
         assert adapter.input_is_parallel
         assert adapter.linear_in is mock_linear_in  # RowParallelLinear
         assert adapter.linear_out is mock_linear_out  # ColumnParallelLinear
+
+    @patch("megatron.bridge.peft.utils.HAVE_TE", True)
+    @patch("megatron.bridge.peft.utils.ColumnParallelLinear")
+    @patch("megatron.bridge.peft.utils.RowParallelLinear")
+    @patch("megatron.bridge.peft.utils._ReplicatedLinear")
+    def test_parallel_linear_adapter_replicates_both_factors(
+        self, mock_te_linear, mock_row_linear, mock_col_linear, mock_config
+    ):
+        mock_config.sequence_parallel = True
+        linear_in = Mock()
+        linear_out = Mock()
+        mock_te_linear.side_effect = [linear_in, linear_out]
+
+        adapter = ParallelLinearAdapter(
+            in_features=16,
+            out_features=8,
+            dim=4,
+            base_linear_name="linear_q_down_proj",
+            model_parallel_config=mock_config,
+            base_linear_is_parallel=False,
+            replicate_adapter=True,
+            pg_collection=make_mock_pg_collection(tp_size=2),
+        )
+
+        assert adapter.linear_in is linear_in
+        assert adapter.linear_out is linear_out
+        assert mock_te_linear.call_count == 2
+        assert all(call.kwargs["parallel_mode"] == "duplicated" for call in mock_te_linear.call_args_list)
+        assert mock_config.sequence_parallel is True
+        mock_row_linear.assert_not_called()
+        mock_col_linear.assert_not_called()
 
     @patch("megatron.bridge.peft.utils.ColumnParallelLinear")
     @patch("megatron.bridge.peft.utils.RowParallelLinear")

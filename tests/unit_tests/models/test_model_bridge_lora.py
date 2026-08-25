@@ -754,7 +754,7 @@ def test_megatron_global_adapters_info_all_pp_ranks(monkeypatch):
     ) = info[0]
     assert global_base_name == "decoder.layers.0.mlp.linear_fc1.adapter"
     assert local_base_prefix == "decoder.layers.0.mlp.linear_fc1"
-    assert input_is_parallel is True and base_linear_is_parallel is True
+    assert input_is_parallel is True and base_linear_is_parallel is False
     assert requires_expert_splits is False
     assert alpha == 8 and dim == 2 and pp_rank == 0 and vp_stage == 0
 
