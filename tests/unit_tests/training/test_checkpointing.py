@@ -377,6 +377,48 @@ class TestRNGState:
         assert rng_state["np_rng_state"] == "np_state"
         assert rng_state["rng_tracker_states"] == "tracker_states"
 
+    @patch("megatron.bridge.training.checkpointing.get_pg_size", return_value=1)
+    @patch("megatron.bridge.training.checkpointing.tensor_parallel")
+    @patch("torch.distributed.all_gather_object")
+    @patch("torch.distributed.is_initialized", return_value=True)
+    @patch("torch.cuda.get_rng_state", return_value="cuda_state")
+    @patch("torch.get_rng_state", return_value="torch_state")
+    @patch("numpy.random.get_state", return_value="np_state")
+    @patch("random.getstate", return_value="random_state")
+    def test_get_rng_state_gathers_over_dp_when_context_parallelism_is_enabled(
+        self,
+        mock_random,
+        mock_np,
+        mock_torch,
+        mock_cuda,
+        mock_dist_init,
+        mock_all_gather,
+        mock_tp,
+        mock_get_pg_size,
+    ):
+        mock_tp.get_cuda_rng_tracker.return_value.get_states.return_value = "tracker_states"
+        mock_pg_collection = Mock()
+        mock_pg_collection.pp.rank.return_value = 0
+        mock_pg_collection.pp.size.return_value = 1
+        mock_pg_collection.tp.rank.return_value = 0
+        mock_pg_collection.tp.size.return_value = 1
+        mock_pg_collection.dp.rank.return_value = 1
+        mock_pg_collection.dp.size.return_value = 2
+        mock_pg_collection.dp_cp.rank.return_value = 3
+        mock_pg_collection.dp_cp.size.return_value = 4
+
+        result = get_rng_state(
+            data_parallel_random_init=True, ckpt_format="torch_dist", pg_collection=mock_pg_collection
+        )
+
+        assert len(result.data) == 2
+        mock_all_gather.assert_called_once()
+        gathered_states, gathered_state = mock_all_gather.call_args.args
+        assert len(gathered_states) == 2
+        assert gathered_state["random_rng_state"] == "random_state"
+        assert mock_all_gather.call_args.kwargs == {"group": mock_pg_collection.dp}
+        assert result.replica_id == 3
+
     @patch("megatron.bridge.training.checkpointing.get_pg_size")
     @patch("megatron.bridge.training.checkpointing.tensor_parallel")
     @patch("torch.distributed.is_initialized")

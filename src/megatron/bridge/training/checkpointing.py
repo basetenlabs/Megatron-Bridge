@@ -511,9 +511,9 @@ def get_rng_state(
     }
 
     rng_state_list = None
-    if torch.distributed.is_initialized() and pg_collection.dp_cp.size() > 1 and data_parallel_random_init:
-        rng_state_list = [None for i in range(pg_collection.dp_cp.size())]
-        torch.distributed.all_gather_object(rng_state_list, rng_state, group=pg_collection.dp_cp)
+    if torch.distributed.is_initialized() and pg_collection.dp.size() > 1 and data_parallel_random_init:
+        rng_state_list = [None for i in range(pg_collection.dp.size())]
+        torch.distributed.all_gather_object(rng_state_list, rng_state, group=pg_collection.dp)
     else:
         rng_state_list = [rng_state]
 
