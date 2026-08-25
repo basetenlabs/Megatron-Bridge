@@ -28,7 +28,7 @@ from enum import Enum, auto
 from logging import getLogger
 from pathlib import Path
 from time import time
-from typing import Any, Callable, Literal, Mapping, Optional, Protocol, Union, runtime_checkable
+from typing import Any, Callable, Literal, Mapping, NamedTuple, Optional, Protocol, Union, runtime_checkable
 
 import numpy as np
 import torch
@@ -559,11 +559,22 @@ def get_rng_state(
     return rng_state_list
 
 
+class StateToLoad(NamedTuple):
+    """One checkpoint section's load decision.
+
+    ``ignore`` suppresses the restore; ``state`` is what to request from the
+    checkpoint, or None when the section is being skipped.
+    """
+
+    ignore: bool
+    state: ShardedStateDict | ShardedObject | None
+
+
 def resolve_state_to_load(
     kind: str,
     sharded_state: ShardedStateDict | ShardedObject | None,
     state_dict_metadata: Mapping[str, STORAGE_TYPES],
-) -> tuple[bool, ShardedStateDict | ShardedObject | None]:
+) -> StateToLoad:
     """Decide whether ``kind`` state can be loaded from this checkpoint.
 
     Collective: every rank must call this, or the reduce below hangs.
@@ -583,11 +594,11 @@ def resolve_state_to_load(
             keys are consulted; empty means "cannot verify", which loads.
 
     Returns:
-        ``(ignore_flag, state)`` for the caller to assign: the state itself when
-        every shard is present, otherwise ``(True, None)``.
+        A :class:`StateToLoad`: the state itself when every shard is present,
+        otherwise ``ignore=True`` with no state.
     """
     if sharded_state is None:
-        return True, None
+        return StateToLoad(ignore=True, state=None)
 
     if isinstance(sharded_state, ShardedObject):
         objects = [sharded_state]
@@ -603,10 +614,10 @@ def resolve_state_to_load(
         present = bool(vote.item())
 
     if present:
-        return False, sharded_state
+        return StateToLoad(ignore=False, state=sharded_state)
 
     print_rank_0(f"checkpoint {kind} shards do not match this parallel layout: {kind} state will be ignored")
-    return True, None
+    return StateToLoad(ignore=True, state=None)
 
 
 def _select_dp_rng_state(

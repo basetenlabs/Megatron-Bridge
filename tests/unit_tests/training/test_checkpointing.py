@@ -5508,7 +5508,11 @@ class TestResolveStateToLoad:
         rng_state = self._rng_state(pp_size=1, tp_size=8, dp_size=8)
         metadata = {"rng_state/shard_0.0.0_1.8.8": object()}
 
-        assert resolve_state_to_load("RNG", rng_state, metadata) == (False, rng_state)
+        decision = resolve_state_to_load("RNG", rng_state, metadata)
+
+        assert decision.ignore is False
+        assert decision.state is rng_state
+        assert decision == (False, rng_state)  # still unpacks at the call sites
 
     def test_ignored_when_data_parallel_size_changed(self):
         """DP 8 -> 12 with TP/PP unchanged: the exact production failure."""
