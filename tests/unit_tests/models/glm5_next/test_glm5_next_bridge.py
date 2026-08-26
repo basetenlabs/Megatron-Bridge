@@ -93,6 +93,7 @@ def test_provider_preserves_full_hybrid_sparse_moe_contract(pretrained):
     assert provider.packed_sequence_phantom_length == 64
     assert provider.enable_mhc_connections is True
     assert provider.mhc_num_residual_streams == 4
+    assert provider.mhc_recompute_layer_num == 2
     assert provider.mtp_num_layers is None
     assert provider.position_embedding_type == "none"
 
