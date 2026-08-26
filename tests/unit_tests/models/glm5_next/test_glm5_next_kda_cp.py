@@ -178,14 +178,38 @@ def _run_rank(rank: int, world: int, rdv_file: str, result_file: str):
     torch.distributed.destroy_process_group()
 
 
+def _server_venv_python() -> str:
+    """The interpreter whose megatron/fla resolve from the build clone.
+
+    runctl's pytest harness runs under the benchmarking venv, which does not
+    ship megatron; the layer under test lives in the vendored Megatron-Bridge
+    checkout that only the server component venv resolves. The test therefore
+    re-executes this file standalone under that interpreter.
+    """
+    clone = os.environ.get("BT_BUILD_CLONE", "/root/trainers")
+    for component in ("server-megatron-bridge", "server"):
+        candidate = os.path.join(clone, component, ".venv", "bin", "python")
+        if os.path.exists(candidate):
+            return candidate
+    raise FileNotFoundError(f"no server venv python under {clone}")
+
+
 @requires_2gpu_fla
-def test_glm5_next_kda_cp2_matches_cp1(tmp_path):
-    rdv = tmp_path / "rdv"
-    result = tmp_path / "result"
-    torch.multiprocessing.spawn(
-        _run_rank, args=(CP, str(rdv), str(result)), nprocs=CP, join=True
+def test_glm5_next_kda_cp2_matches_cp1():
+    import re
+    import subprocess
+
+    proc = subprocess.run(
+        [_server_venv_python(), os.path.abspath(__file__)],
+        capture_output=True,
+        text=True,
+        timeout=1800,
     )
-    fwd_err, grad_rel_err = (float(x) for x in result.read_text().split())
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, f"standalone parity run failed:\n{output[-4000:]}"
+    match = re.search(r"RESULT fwd=([0-9.eE+-]+) grad=([0-9.eE+-]+)", output)
+    assert match, f"no RESULT line in output:\n{output[-4000:]}"
+    fwd_err, grad_rel_err = float(match.group(1)), float(match.group(2))
     # bf16 activations with fp32 state; the a2a itself is exact so tolerances
     # only absorb reduction-order noise.
     assert fwd_err < 5e-2, f"cp2 forward diverges from cp1: max abs err {fwd_err}"
@@ -198,4 +222,5 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         rdv, result = os.path.join(d, "rdv"), os.path.join(d, "result")
         torch.multiprocessing.spawn(_run_rank, args=(CP, rdv, result), nprocs=CP, join=True)
-        print("fwd_max_err grad_rel_err:", open(result).read())
+        fwd_err, grad_rel_err = open(result).read().split()
+        print(f"RESULT fwd={fwd_err} grad={grad_rel_err}")
