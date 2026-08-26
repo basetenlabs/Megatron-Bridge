@@ -21,6 +21,7 @@ class Glm5NextKPoolIndexer(DSAIndexer):
     """
 
     supports_full_fused_attention = False
+    supports_local_indexer_varlen = False
     pool_size = 4
 
     def __init__(self, *args, **kwargs) -> None:
@@ -46,6 +47,8 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         self._pool_prefix: Optional[torch.Tensor] = None
         self._raw_cu_seqlens: Optional[torch.Tensor] = None
         self._local_gate: Optional[torch.Tensor] = None
+        self._tail_start: Optional[torch.Tensor] = None
+        self._tail_size: Optional[torch.Tensor] = None
 
     def forward_before_topk(self, x, qr, packed_seq_params=None):
         if packed_seq_params is None or packed_seq_params.qkv_format != "thd":
@@ -130,54 +133,69 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         sequence_ids = torch.bucketize(starts.to(torch.int64), cu[1:], right=True)
         local_starts = starts.to(torch.int64) - cu[sequence_ids]
         local_ends = ends.to(torch.int64) - cu[sequence_ids]
+        self._tail_size = local_ends.remainder(self.pool_size)
+        self._tail_start = ends.to(torch.int64) - self._tail_size
         pool_base = self._pool_prefix[sequence_ids]
         pool_starts = pool_base + torch.div(local_starts, self.pool_size, rounding_mode="floor")
         pool_ends = pool_base + torch.div(local_ends, self.pool_size, rounding_mode="floor")
         return q, pooled_k, weights, index_topk // self.pool_size, (pool_starts, pool_ends)
 
     def finalize_topk_indices(self, topk_indices, topk_length, packed_seq_params=None):
-        if self._pool_to_raw is None or self._raw_cu_seqlens is None:
+        del packed_seq_params
+        if self._pool_to_raw is None or self._tail_start is None or self._tail_size is None:
             raise RuntimeError("GLM-5 Next pool metadata was not prepared")
-        safe_indices = topk_indices.to(torch.int64).clamp(min=0, max=max(0, self._pool_to_raw.size(0) - 1))
-        expanded = self._pool_to_raw[safe_indices].flatten(-2)
         valid_pools = topk_indices >= 0
         if topk_length is not None:
             positions = torch.arange(topk_indices.size(-1), device=topk_indices.device)
             valid_pools &= positions.view(1, 1, -1) < topk_length.unsqueeze(-1)
-        expanded = expanded.masked_fill(
-            ~valid_pools.unsqueeze(-1).expand(*valid_pools.shape, self.pool_size).flatten(-2), -1
+
+        batch_size, query_rows, candidate_count = topk_indices.shape
+        if self._tail_start.numel() != query_rows or self._tail_size.numel() != query_rows:
+            raise RuntimeError(
+                "GLM-5 Next pooled DSA tail metadata row mismatch: "
+                f"topk_rows={query_rows}, tail_rows={self._tail_start.numel()}"
+            )
+
+        expanded_width = candidate_count * self.pool_size
+        result = torch.full(
+            (batch_size, query_rows, expanded_width + self.pool_size - 1),
+            -1,
+            dtype=torch.int64,
+            device=topk_indices.device,
         )
 
-        # A query may see up to three tokens in the current incomplete pool.
-        # The tail is computed in global packed coordinates: under CP each
-        # local top-k row maps to its zigzag global position.
-        n_rows = expanded.size(-2)
-        cp_group = self.pg_collection.cp
-        cp_size = cp_group.size()
-        if cp_size > 1:
-            if self._local_gate is None or n_rows != self._local_gate.size(0):
-                raise RuntimeError(
-                    "GLM-5 Next pooled DSA requires top-k rows to cover the full local CP "
-                    f"shard: rows={n_rows}, local_shard_rows="
-                    f"{self._local_gate.size(0) if self._local_gate is not None else None}"
-                )
-            rows = dsa_layout.build_packed_allgather_cp_local_positions(
-                self._raw_cu_seqlens,
-                cp_size,
-                cp_group.rank(),
-                expanded.device,
-                output_size=n_rows,
+        # Compact valid selected pools into the prefix consumed by FlashMLA.
+        if self._pool_to_raw.size(0) > 0:
+            safe_indices = topk_indices.to(torch.int64).clamp(
+                min=0, max=self._pool_to_raw.size(0) - 1
             )
-        else:
-            rows = torch.arange(n_rows, device=expanded.device, dtype=torch.int64)
-        sequence_ids = torch.bucketize(rows, self._raw_cu_seqlens[1:], right=True)
-        local_rows = rows - self._raw_cu_seqlens[sequence_ids]
-        tail_size = (local_rows + 1).remainder(self.pool_size)
-        tail_start = rows - tail_size + 1
-        offsets = torch.arange(self.pool_size - 1, device=expanded.device, dtype=torch.int64)
-        tail = tail_start[:, None] + offsets[None, :]
-        tail = tail.masked_fill(offsets[None, :] >= tail_size[:, None], -1)
-        tail = tail.unsqueeze(0).expand(expanded.size(0), -1, -1)
-        result = torch.cat((expanded, tail), dim=-1)
-        result_length = valid_pools.sum(dim=-1) * self.pool_size + tail_size.unsqueeze(0)
+            expanded_pools = self._pool_to_raw[safe_indices]
+            pool_slots = (valid_pools.cumsum(dim=-1) - 1).clamp_min(0) * self.pool_size
+            token_offsets = torch.arange(
+                self.pool_size, device=topk_indices.device, dtype=torch.int64
+            )
+            pool_targets = pool_slots.unsqueeze(-1) + token_offsets
+            invalid_target = torch.full_like(pool_targets, expanded_width)
+            pool_targets = torch.where(valid_pools.unsqueeze(-1), pool_targets, invalid_target)
+            pool_values = expanded_pools.masked_fill(~valid_pools.unsqueeze(-1), -1)
+            result.scatter_(
+                -1,
+                pool_targets.flatten(-2),
+                pool_values.flatten(-2),
+            )
+
+        valid_token_count = valid_pools.sum(dim=-1) * self.pool_size
+
+        # A query may always select the one-to-three raw tokens in its current
+        # incomplete pool. Place that tail directly after the valid pool prefix.
+        tail_offsets = torch.arange(
+            self.pool_size - 1, device=topk_indices.device, dtype=torch.int64
+        )
+        tail = self._tail_start[:, None] + tail_offsets
+        tail = tail.masked_fill(tail_offsets >= self._tail_size[:, None], -1)
+        tail = tail.unsqueeze(0).expand(batch_size, -1, -1)
+        tail_targets = valid_token_count.unsqueeze(-1) + tail_offsets
+        result.scatter_(-1, tail_targets, tail)
+
+        result_length = valid_token_count + self._tail_size.unsqueeze(0)
         return result, result_length

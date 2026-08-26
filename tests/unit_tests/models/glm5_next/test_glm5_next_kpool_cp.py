@@ -32,10 +32,12 @@ requires_gpus = pytest.mark.skipif(
 )
 HIDDEN = 256
 INDEX_HEAD_DIM = 64
-INDEX_TOPK = 16
-# Doc lengths must divide 2*CP (zigzag) and exercise incomplete tail pools.
-DOC_LENS = (128, 64)
-SEQ_LEN = sum(DOC_LENS)
+INDEX_TOPK = 2048
+# Physical lengths divide 2*CP for zigzag sharding. Real lengths deliberately
+# leave padding at each document end and exercise every incomplete-tail size.
+REAL_DOC_LENS = (7, 9)
+PADDED_DOC_LENS = (8, 12)
+SEQ_LEN = sum(PADDED_DOC_LENS)
 DTYPE = torch.bfloat16
 
 
@@ -45,9 +47,9 @@ class _PGs:
     cp: torch.distributed.ProcessGroup
 
 
-def _cu_seqlens(device):
-    cu = torch.zeros(len(DOC_LENS) + 1, dtype=torch.int32, device=device)
-    cu[1:] = torch.cumsum(torch.tensor(DOC_LENS, device=device), 0)
+def _cu_seqlens(lengths, device):
+    cu = torch.zeros(len(lengths) + 1, dtype=torch.int32, device=device)
+    cu[1:] = torch.cumsum(torch.tensor(lengths, device=device), 0)
     return cu
 
 
@@ -84,6 +86,8 @@ def _build_indexer(pgs, device):
     indexer._pool_prefix = None
     indexer._raw_cu_seqlens = None
     indexer._local_gate = None
+    indexer._tail_start = None
+    indexer._tail_size = None
     return indexer
 
 
@@ -156,8 +160,17 @@ def _run_rank(rank: int, world: int, rdv_file: str, result_file: str):
     self_group = singletons[rank]
 
     device = torch.device("cuda", rank)
-    cu = _cu_seqlens(device)
-    psp = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
+    cu = _cu_seqlens(REAL_DOC_LENS, device)
+    cu_padded = _cu_seqlens(PADDED_DOC_LENS, device)
+    psp = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        cu_seqlens_q_padded=cu_padded,
+        cu_seqlens_kv_padded=cu_padded,
+        max_seqlen_q=max(PADDED_DOC_LENS),
+        max_seqlen_kv=max(PADDED_DOC_LENS),
+    )
 
     torch.manual_seed(7)  # identical stream on both ranks
     full = torch.randn(SEQ_LEN, 1, HIDDEN, dtype=DTYPE, device=device)
@@ -165,7 +178,7 @@ def _run_rank(rank: int, world: int, rdv_file: str, result_file: str):
     from megatron.core.transformer.experimental_attention_variant import dsa_layout
 
     local_positions = dsa_layout.build_packed_allgather_cp_local_positions(
-        cu, world, rank, device, output_size=SEQ_LEN // world
+        cu_padded, world, rank, device, output_size=SEQ_LEN // world
     )
     local = full.index_select(0, local_positions).contiguous()
 
@@ -186,6 +199,16 @@ def _run_rank(rank: int, world: int, rdv_file: str, result_file: str):
     ref_lens = ref_length.index_select(0, cp_positions)
     rows_equal = bool(torch.equal(cp_result, ref_rows))
     lens_equal = bool(torch.equal(cp_length.to(ref_lens.dtype), ref_lens))
+
+    assert cp_result.size(-1) == INDEX_TOPK + cp.pool_size - 1
+    doc_start = 0
+    for real_len, padded_len in zip(REAL_DOC_LENS, PADDED_DOC_LENS):
+        for query_position in range(doc_start, doc_start + real_len):
+            length = int(ref_length[query_position].item())
+            expected = torch.arange(doc_start, query_position + 1, device=device)
+            torch.testing.assert_close(ref_result[query_position, :length], expected)
+            assert torch.all(ref_result[query_position, length:] == -1)
+        doc_start += padded_len
 
     verdicts = torch.tensor(
         [pooled_err, 0.0 if rows_equal else 1.0, 0.0 if lens_equal else 1.0],
