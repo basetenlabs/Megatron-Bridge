@@ -86,8 +86,7 @@ def _layer_mappings(megatron_layer: str, hf_layer: str) -> list:
         (f"{indexer}.k_norm.weight", f"{hf_attention}.indexer.k_norm.weight"),
         (f"{indexer}.k_norm.bias", f"{hf_attention}.indexer.k_norm.bias"),
         (f"{indexer}.linear_weights_proj.weight", f"{hf_attention}.indexer.weights_proj.weight"),
-        (f"{indexer}.index_kpool_compress_ape", f"{hf_attention}.indexer.index_kpool_compress_ape"),
-        (f"{indexer}.index_kpool_compress_gate", f"{hf_attention}.indexer.index_kpool_compress_gate"),
+
         # MoE router and experts.
         (f"{megatron_layer}.mlp.router.weight", f"{hf_layer}.mlp.gate.weight"),
         (f"{megatron_layer}.mlp.router.expert_bias", f"{hf_layer}.mlp.gate.e_score_correction_bias"),
@@ -121,6 +120,12 @@ def _layer_mappings(megatron_layer: str, hf_layer: str) -> list:
         (f"{megatron_attention}.dt_bias", f"{hf_attention}.dt_bias"),
     ]
     replicated = [
+        # GLM-5.3's two k-pool tensors are raw nn.Parameters on the indexer, not parallel
+        # linears, so AutoMapping cannot infer their sharding ("Cannot determine
+        # parallelism type for module 'Glm5NextKPoolIndexer'"). They are replicated: the
+        # indexer is frozen and every rank holds the same copy.
+        (f"{indexer}.index_kpool_compress_ape", f"{hf_attention}.indexer.index_kpool_compress_ape"),
+        (f"{indexer}.index_kpool_compress_gate", f"{hf_attention}.indexer.index_kpool_compress_gate"),
         (f"{megatron_attention}.f_a_proj.weight", f"{hf_attention}.f_a_proj.weight"),
         (f"{megatron_attention}.g_a_proj.weight", f"{hf_attention}.g_a_proj.weight"),
         # KDA gated output RMSNorm. MCore names it out_norm (see
@@ -506,7 +511,13 @@ class Glm5NextBridge(MegatronModelBridge):
         # Vision tower. The module is HuggingFace's own, so the parameter names match
         # the checkpoint one for one and a single wildcard covers the whole tower --
         # patch_embed, the 24 blocks, downsample, post_layernorm and the merger.
-        mappings.append(AutoMapping(megatron_param="visual.**", hf_param="model.visual.**"))
+        #
+        # ReplicatedMapping, not AutoMapping: the tower is plain torch modules held
+        # identically on every rank, and AutoMapping infers sharding from the Megatron
+        # module class, so it raises on the first nn.Linear it meets
+        # ("Cannot determine parallelism type for module 'Linear' at weight
+        # visual.blocks.0.attn.proj.bias"). Same choice GLM-4.5V makes.
+        mappings.append(ReplicatedMapping(megatron_param="visual.**", hf_param="model.visual.**"))
 
         # STILL OPEN -- deliberately absent rather than guessed:
         #
