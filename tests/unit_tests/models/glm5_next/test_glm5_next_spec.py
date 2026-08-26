@@ -15,7 +15,7 @@
 """Unit tests for the GLM-5.3-Flash heterogeneous block spec.
 
 The interesting property is the per-layer assignment: KDA layers must get
-``Glm5NextLinearAttention`` and MLA+DSA layers must get Megatron-Core's DSA spec, at the
+Megatron-Core's ``KimiDeltaAttention`` and MLA+DSA layers must get Megatron-Core's DSA spec, at the
 right depths, with a valid input layernorm on both. Getting the depths wrong produces a
 model that still builds and still trains, so it is worth testing directly rather than
 relying on an end-to-end loss curve to reveal it.
@@ -29,7 +29,7 @@ from types import SimpleNamespace
 import pytest
 
 from megatron.bridge.models.glm5_next import glm5_next_spec
-from megatron.bridge.models.glm5_next.glm5_next_layers import Glm5NextLinearAttention
+from megatron.core.ssm.gated_delta_net import KimiDeltaAttention
 from megatron.bridge.models.glm5_next.glm5_next_spec import build_glm5_next_spec
 
 
@@ -100,7 +100,7 @@ class TestLayerAssignment:
         kda_at = [
             i + 1
             for i, s in enumerate(block.layer_specs)
-            if s.submodules.self_attention.module is Glm5NextLinearAttention
+            if s.submodules.self_attention.module is KimiDeltaAttention
         ]
         dsa_at = [
             i + 1

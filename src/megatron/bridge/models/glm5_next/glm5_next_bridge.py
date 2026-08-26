@@ -37,6 +37,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     ReplicatedMapping,
     RowParallelMapping,
 )
+from megatron.bridge.models.glm5_next.glm5_next_kda_mapping import Glm5NextKdaFusedMapping
 from megatron.bridge.models.glm5_next.glm5_next_provider import Glm5NextModelProvider
 from megatron.bridge.models.glm5_next.glm5_next_spec import build_glm5_next_spec
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
@@ -122,10 +123,25 @@ class Glm5NextBridge(MegatronModelBridge):
             raise ValueError(f"GLM-5.3 expects NoPE attention (qk_rope_head_dim=0), got {cfg.qk_rope_head_dim}")
         provider.qk_pos_emb_head_dim = 0
 
-        provider.glm5_next_linear_num_heads = cfg.linear_num_heads
-        provider.glm5_next_linear_head_dim = cfg.linear_head_dim
-        provider.glm5_next_linear_conv_kernel_size = cfg.linear_conv_kernel_dim
-        provider.glm5_next_kda_gate_lower_bound = cfg.linear_lower_bound
+        # KDA geometry goes onto Megatron-Core's own KDA fields -- the layers are
+        # MCore's KimiDeltaAttention, so there is no second set to keep in sync.
+        provider.linear_num_key_heads = cfg.linear_num_heads
+        provider.linear_num_value_heads = cfg.linear_num_heads
+        provider.linear_key_head_dim = cfg.linear_head_dim
+        provider.linear_value_head_dim = cfg.linear_head_dim
+        provider.linear_conv_kernel_dim = cfg.linear_conv_kernel_dim
+
+        # HF builds both bottlenecks as Linear(hidden_size, linear_head_dim), so the
+        # rank is the head dim. Derived rather than defaulted: these two fields are also
+        # what selects MCore's low-rank KDA layout over its legacy fused projection.
+        provider.kda_f_lora_rank = cfg.linear_head_dim
+        provider.kda_gate_lora_rank = cfg.linear_head_dim
+
+        # linear_lower_bound is None only when HF's safe_gate is off. Carrying the
+        # pair together keeps the bounded-sigmoid gate and the unbounded-softplus gate
+        # from being mixed -- see Glm5NextModelProvider.kda_safe_gate.
+        provider.kda_lower_bound = cfg.linear_lower_bound
+        provider.kda_safe_gate = cfg.linear_lower_bound is not None
 
     def _apply_dsa(self, provider, cfg) -> None:
         # Kept at "dsa": the block is built as all-DSA and the KDA layers replace their
@@ -261,15 +277,15 @@ class Glm5NextBridge(MegatronModelBridge):
         # registry, so it cannot infer how they shard.
         column_parallel = [
             (f"{megatron_attention}.{name}", f"{hf_attention}.{name}")
-            for name in ("q_proj.weight", "k_proj.weight", "v_proj.weight", "b_proj.weight", "g_b_proj.weight")
+            for name in ("g_b_proj.weight",)
         ]
         column_parallel += [
-            (f"{megatron_attention}.f_b_proj.weight", f"{hf_attention}.forget_gate.f_b_proj.weight"),
-            (f"{megatron_attention}.A_log", f"{hf_attention}.forget_gate.A_log"),
-            (f"{megatron_attention}.dt_bias", f"{hf_attention}.forget_gate.dt_bias"),
+            (f"{megatron_attention}.f_b_proj.weight", f"{hf_attention}.f_b_proj.weight"),
+            (f"{megatron_attention}.A_log", f"{hf_attention}.A_log"),
+            (f"{megatron_attention}.dt_bias", f"{hf_attention}.dt_bias"),
         ]
         replicated = [
-            (f"{megatron_attention}.f_a_proj.weight", f"{hf_attention}.forget_gate.f_a_proj.weight"),
+            (f"{megatron_attention}.f_a_proj.weight", f"{hf_attention}.f_a_proj.weight"),
             (f"{megatron_attention}.g_a_proj.weight", f"{hf_attention}.g_a_proj.weight"),
             (f"{megatron_attention}.o_norm.weight", f"{hf_attention}.o_norm.weight"),
         ]
@@ -302,19 +318,43 @@ class Glm5NextBridge(MegatronModelBridge):
             ),
         ]
 
+        # KDA's fused input projection and short convolution. Direction is the
+        # opposite of Qwen3-Next's: GLM-5.3 ships three per-projection tensors and
+        # Megatron-Core's KimiDeltaAttention keeps one fused tensor for each, so this
+        # concatenates 3 -> 1 while preserving per-component TP head sharding.
+        mappings += [
+            Glm5NextKdaFusedMapping(
+                megatron_param=f"{megatron_attention}.in_proj.weight",
+                q=f"{hf_attention}.q_proj.weight",
+                k=f"{hf_attention}.k_proj.weight",
+                v=f"{hf_attention}.v_proj.weight",
+            ),
+            Glm5NextKdaFusedMapping(
+                megatron_param=f"{megatron_attention}.conv1d.weight",
+                q=f"{hf_attention}.q_conv1d.weight",
+                k=f"{hf_attention}.k_conv1d.weight",
+                v=f"{hf_attention}.v_conv1d.weight",
+            ),
+            # Beta is its own module in Megatron-Core, one value per key head
+            # (b_proj [64, 4096] against beta_proj's num_key_heads).
+            ColumnParallelMapping(
+                megatron_param=f"{megatron_attention}.beta_proj.weight",
+                hf_param=f"{hf_attention}.b_proj.weight",
+            ),
+        ]
+
         # STILL OPEN -- deliberately absent rather than guessed:
         #
-        # 1. The KDA short convolution. HF holds one depthwise conv1d over 3*qkv_dim
-        #    covering q, k and v; this layer keeps three per-projection convolutions
-        #    because they shard by head under TP while one fused kernel does not. The
-        #    mapping therefore has to split one HF tensor three ways, which needs a
-        #    custom mapping rather than a name pair.
-        # 2. mHC (hc_attn_fn / hc_attn_base / hc_attn_scale and the ffn equivalents).
+        # 1. mHC (hc_attn_fn / hc_attn_base / hc_attn_scale and the ffn equivalents).
         #    Blocked on the same question as _apply_mhc, and `scale` is one [3] tensor on
         #    the HF side against three scalar parameters on the Megatron side -- also a
         #    shape-changing mapping.
-        # 3. Quantization. The checkpoint's format is not stated in the HF config, so
-        #    whether a dequant-on-load step is needed is unresolved.
+        # 2. Quantization. Resolved to *what* but not *wired*: zai-org/GLM-5.3-Flash
+        #    is block FP8 e4m3, weight_block_size [128, 128], dynamic activations,
+        #    1509 modules_to_not_convert, 328 GB. That is GLM-5.2's format, so the
+        #    dequant-on-load path is reuse rather than new work. Until it is wired,
+        #    point the trainer at zai-org/GLM-5.3-Flash-BF16 (642.6 GB, 321B params,
+        #    no quantization_config, identical parameter names).
         return MegatronMappingRegistry(*mappings)
 
 

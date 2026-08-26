@@ -63,8 +63,18 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelLinear,
+    TELinear,
+    TENorm,
+    TERowParallelLinear,
+)
+from megatron.core.ssm.gated_delta_net import (
+    KimiDeltaAttention,
+    KimiDeltaAttentionSubmodules,
+)
+
 from megatron.bridge.models.glm5_next.glm5_next_kpool import Glm5NextKPoolIndexer
-from megatron.bridge.models.glm5_next.glm5_next_layers import Glm5NextLinearAttention
 
 
 def _install_kpool_indexer(attention_spec) -> None:
@@ -126,8 +136,28 @@ def build_glm5_next_spec(config, vp_stage=None, pp_rank=None):
         config, vp_stage=vp_stage, pp_rank=pp_rank
     )
 
+    # Megatron-Core's own KDA, not a bridge-local reimplementation. It is a shape-exact
+    # match for GLM-5.3's KDA weights (verified against the checkpoint: q/k/v_proj
+    # [8192, 4096] = 64 heads x 128; b_proj [64, 4096] = beta_proj's num_key_heads;
+    # f_a/g_a [128, 4096] = the low-rank ranks; A_log [64] per head; dt_bias [8192]
+    # per channel), and -- unlike a hand-written layer -- it carries context
+    # parallelism: headwise and chunkwise CP, THD packed sequences and zigzag
+    # partitioning, all inherited from ``_GDNBase``. 34 of GLM-5.3's 45 layers are KDA,
+    # so a KDA that refuses CP is what caps the model's sequence length.
     kda_attention_spec = ModuleSpec(
-        module=Glm5NextLinearAttention,
+        module=KimiDeltaAttention,
+        submodules=KimiDeltaAttentionSubmodules(
+            in_proj=TEColumnParallelLinear,
+            beta_proj=TEColumnParallelLinear,
+            out_norm=TENorm,
+            f_proj=TEColumnParallelLinear,
+            f_a_proj=TELinear,
+            f_b_proj=TEColumnParallelLinear,
+            g_proj=TEColumnParallelLinear,
+            g_a_proj=TELinear,
+            g_b_proj=TEColumnParallelLinear,
+            out_proj=TERowParallelLinear,
+        ),
         # KDA does not fuse the input layernorm into its projections. The variant
         # builder chooses each layer's input_layernorm from this same key, so declaring
         # it lets the assertion below confirm the norm it already picked for the DSA

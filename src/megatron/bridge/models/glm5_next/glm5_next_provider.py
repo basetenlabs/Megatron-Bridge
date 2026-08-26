@@ -81,20 +81,81 @@ class Glm5NextModelProvider(MLAModelProvider):
     layer's top-k). Diagnostics and FLOP accounting only; cross-layer sharing itself is
     driven by ``dsa_indexer_topk_freq`` / ``dsa_indexer_skip_topk_offset``."""
 
-    # -------------------------------------------------------------------- KDA
-    glm5_next_linear_num_heads: int = 64
-    """Number of KDA heads (HF ``linear_num_heads``)."""
+    # ------------------------------------------------------------------- KDA
+    # GLM-5.3's KDA layers are Megatron-Core's ``KimiDeltaAttention`` (see
+    # glm5_next_spec), so its own config fields are the single source of truth for KDA
+    # geometry -- these override MCore defaults that do not match GLM-5.3. Verified
+    # shape-by-shape against zai-org/GLM-5.3-Flash-BF16:
+    #
+    #   q/k/v_proj [8192, 4096]  -> 64 heads x 128 head_dim
+    #   b_proj     [64, 4096]    -> beta_proj, width num_key_heads
+    #   f_a/g_a    [128, 4096]   -> low-rank bottlenecks, width head_dim
+    #   f_b/g_b    [8192, 128]   -> back out to qk_dim / v_dim
+    #   A_log      [64]          -> per head
+    #   dt_bias    [8192]        -> per channel
+    #   q_conv1d   [8192, 1, 4]  -> depthwise, kernel 4 (fused across q/k/v in MCore)
+    linear_num_key_heads: int | None = 64
+    """KDA query/key heads (HF ``linear_num_heads``). MCore defaults to 16."""
 
-    glm5_next_linear_head_dim: int = 128
-    """Dimension per KDA head (HF ``linear_head_dim``)."""
+    linear_num_value_heads: int | None = 64
+    """KDA value heads. GLM-5.3 is not grouped, so this equals the key-head count.
+    MCore defaults to 32."""
 
-    glm5_next_linear_conv_kernel_size: int = 4
-    """Short-convolution kernel size applied to KDA q/k/v (HF ``linear_conv_kernel_dim``)."""
+    linear_key_head_dim: int | None = 128
+    """Dimension per KDA key head (HF ``linear_head_dim``)."""
 
-    glm5_next_kda_gate_lower_bound: float = -5.0
-    """Lower clamp on the KDA forget gate (HF ``linear_lower_bound``)."""
+    linear_value_head_dim: int | None = 128
+    """Dimension per KDA value head."""
 
-    # --------------------------------------------------------------- k-pool
+    linear_conv_kernel_dim: int | None = 4
+    """KDA short-convolution kernel size (HF ``linear_conv_kernel_dim``)."""
+
+    kda_f_lora_rank: int | None = 128
+    """Rank of the forget-gate bottleneck. HF builds ``f_a_proj`` as
+    ``Linear(hidden_size, linear_head_dim)``, so the rank *is* the head dim -- the
+    bridge derives it rather than carrying a second constant.
+
+    Setting this (with ``kda_gate_lora_rank``) is also what selects MCore's low-rank
+    KDA projection layout over its legacy fused one. Left at MCore's ``None`` default,
+    KDA would expect a single fused q/k/v/f/g projection that GLM-5.3 does not ship."""
+
+    kda_gate_lora_rank: int | None = 128
+    """Rank of the output-gate bottleneck (HF ``g_a_proj``), likewise the head dim."""
+
+    kda_safe_gate: bool = True
+    """Whether the KDA kernel bounds the forget gate. **Load-bearing, and MCore
+    defaults it to False.**
+
+    GLM-5.3 sets ``safe_gate`` (HF defaults it True) and ships
+    ``gate_lower_bound = -5.0``, which selects a different gate function entirely::
+
+        safe_gate:  g = lower_bound * sigmoid(exp(A_log) * (f + dt_bias))   # in (-5, 0)
+        otherwise:  g = -exp(A_log) * softplus(f + dt_bias)                 # unbounded
+
+    ``fla.ops.kda.chunk_kda`` takes ``safe_gate``/``lower_bound`` and fuses whichever
+    form is selected. With this left False the kernel raises nothing and trains the
+    unbounded gate -- the same silent-divergence shape as the Kimi-K3 fla floor. The
+    required kernel support landed in flash-linear-attention 0.5.2, which is already
+    the floor this stack pins for Kimi-K3, so no new dependency floor is needed."""
+
+    kda_lower_bound: float | None = -5.0
+    """Lower bound on the KDA forget gate (HF ``linear_lower_bound``). Only consumed
+    when ``kda_safe_gate`` is set."""
+
+    linear_cp_mode: str | None = "headwise"
+    """How the KDA layers shard under context parallelism.
+
+    ``"headwise"`` all-to-alls from sequence-sharded to head-sharded around the kernel,
+    so each rank sees whole sequences for a subset of the 64 heads and the recurrent
+    state is never split. This is the mode Megatron-Core's own KDA + gated-MLA
+    functional test covers (``hybrid_..._ep8_cp2_kda_gated_mla_1N8G``).
+
+    ``"chunkwise"`` (MCore's default) keeps the sequence sharded and passes a CP context
+    into the kernel. Both are implemented; headwise is the validated one, and it is why
+    GLM-5.3 is not stuck at cp=1 -- 34 of its 45 layers are KDA."""
+
+    # ---------------------------------------------------------------- k-pool
+
     glm5_next_index_kpool: int = 4
     """DSA indexer pool size.
 

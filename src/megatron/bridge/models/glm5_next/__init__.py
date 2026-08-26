@@ -16,7 +16,6 @@
 
 from megatron.bridge.models.glm5_next.glm5_next_bridge import Glm5NextBridge
 from megatron.bridge.models.glm5_next.glm5_next_kpool import Glm5NextKPoolIndexer
-from megatron.bridge.models.glm5_next.glm5_next_layers import Glm5NextLinearAttention
 from megatron.bridge.models.glm5_next.glm5_next_provider import Glm5NextModelProvider
 from megatron.bridge.models.glm5_next.glm5_next_spec import build_glm5_next_spec
 
@@ -24,7 +23,6 @@ from megatron.bridge.models.glm5_next.glm5_next_spec import build_glm5_next_spec
 __all__ = [
     "Glm5NextBridge",
     "Glm5NextKPoolIndexer",
-    "Glm5NextLinearAttention",
     "Glm5NextModelProvider",
     "build_glm5_next_spec",
 ]
