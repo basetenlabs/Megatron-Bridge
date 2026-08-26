@@ -47,6 +47,15 @@ class Glm5NextModelProvider(MLAModelProvider):
 
     variable_seq_lengths: bool = True
 
+    experimental_attention_variant: str | None = "dsa"
+    """Selects Megatron-Core's DSA attention for every layer.
+
+    The block builder starts from the all-DSA block this produces and then replaces
+    attention on the KDA layers (see ``glm5_next_spec``). Overrides the base default of
+    ``None``, which would build a standard-attention block instead -- so, like
+    ``qk_pos_emb_head_dim``, this is an architectural invariant rather than a tunable.
+    """
+
     qk_pos_emb_head_dim: int = 0
     """GLM-5.3 attention is NoPE. Overrides the MLA default of 64.
 
@@ -86,13 +95,21 @@ class Glm5NextModelProvider(MLAModelProvider):
     """Lower clamp on the KDA forget gate (HF ``linear_lower_bound``)."""
 
     # --------------------------------------------------------------- k-pool
-    glm5_next_index_kpool: int = 16
+    glm5_next_index_kpool: int = 4
     """DSA indexer pool size.
 
     GLM-5.3 scores compressed *groups* of ``index_kpool`` keys rather than individual
     keys, selecting ``dsa_indexer_topk // index_kpool`` pools and expanding each winner
     back into raw token indices. This is the one genuinely new algorithm relative to
-    GLM-5.2; see ``dsa_kpool``.
+    GLM-5.2.
+
+    Defaults to 4, the value in the ``zai-org/GLM-5.3-Flash`` checkpoint qualified on
+    B200 (revision ``84c6a6aa9497188e15a635ba793b0f95a79b1033``, which allocates
+    ``index_kpool_compress_ape`` as ``[4, index_head_dim]`` and requires the sequence
+    length to be divisible by 4). Note this differs from the ``Glm5NextTextConfig``
+    class default of 16 -- the bridge reads the real value from the checkpoint, and
+    this default exists only so a hand-built provider matches the shipped model rather
+    than the library default.
     """
 
     glm5_next_index_kpool_always_select_tail: bool = True
@@ -107,15 +124,16 @@ class Glm5NextModelProvider(MLAModelProvider):
     glm5_next_requires_fp32_lm_head: bool = True
     """Whether the output projection must run in fp32.
 
-    GLM-5.3 needs the fp32 head for the same reason GLM-5.2 does, but -- unlike
-    GLM-5.2 -- it cannot advertise that through ``experimental_attention_variant``:
-    the block builder requires that scalar to be ``None`` (see ``glm5_next_spec``).
+    GLM-5.3 needs the fp32 head for the same reason GLM-5.2 does, and -- because the
+    block is built on the experimental-variant path -- it *does* advertise
+    ``experimental_attention_variant == "dsa"``, so consumers that infer the fp32 head
+    from that scalar keep working.
 
-    Downstream code that currently infers the fp32 head from
-    ``experimental_attention_variant == "dsa"`` must key off this field instead. If it
-    does not, the fp32 head silently turns off on the trainer *and* on the sampler,
-    which mirrors the same condition -- consistent on both sides, so nothing raises and
-    the only symptom is degraded numerics.
+    This field is the explicit signal for the same property. It exists because tying a
+    numerics decision to a string scalar chosen for spec dispatch is fragile: if the
+    block ever moves off the variant path, that inference flips to False on the trainer
+    *and* on the sampler, which mirrors the same condition -- consistent on both sides,
+    so nothing raises and the only symptom is degraded numerics. Prefer this field.
     """
 
     def is_kda_layer(self, layer_number: int) -> bool:
@@ -180,14 +198,15 @@ class Glm5NextModelProvider(MLAModelProvider):
         if not self.multi_latent_attention:
             raise ValueError("GLM-5.3 requires multi_latent_attention=True for its DSA layers")
 
-        if self.experimental_attention_variant is not None:
-            # get_gpt_decoder_layer_specs asserts this is None, and the DSA layers get
-            # their spec directly instead. Fail here with the reason rather than at the
-            # bare assert inside Megatron-Core.
+        if self.experimental_attention_variant != "dsa":
+            # The block is built on the experimental-variant path as all-DSA, and the
+            # KDA layers then replace their attention. Keeping the scalar at "dsa" also
+            # keeps downstream inferences drawn from it correct -- see
+            # glm5_next_requires_fp32_lm_head.
             raise ValueError(
-                "GLM-5.3 builds its block from get_gpt_decoder_block_spec, which requires "
-                "experimental_attention_variant=None; DSA layers receive their module spec "
-                f"directly. Got {self.experimental_attention_variant!r}."
+                "GLM-5.3 builds on the experimental-variant block builder and requires "
+                "experimental_attention_variant='dsa'; its KDA layers replace their "
+                f"attention afterwards. Got {self.experimental_attention_variant!r}."
             )
 
         if self.qk_pos_emb_head_dim:
