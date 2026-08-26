@@ -6,6 +6,8 @@ from typing import Optional, Tuple
 
 import torch
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.transformer.experimental_attention_variant import dsa_layout
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer
 from torch import nn
 
@@ -43,46 +45,25 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         self._pool_to_raw: Optional[torch.Tensor] = None
         self._pool_prefix: Optional[torch.Tensor] = None
         self._raw_cu_seqlens: Optional[torch.Tensor] = None
+        self._local_gate: Optional[torch.Tensor] = None
 
     def forward_before_topk(self, x, qr, packed_seq_params=None):
         if packed_seq_params is None or packed_seq_params.qkv_format != "thd":
             raise ValueError("GLM-5 Next pooled DSA requires packed THD sequences")
-        if self.pg_collection.cp.size() != 1:
-            raise ValueError("GLM-5 Next pooled DSA currently requires context parallel size 1")
 
         q, raw_k, weights = super().forward_before_topk(x, qr, packed_seq_params)
-        cu = packed_seq_params.cu_seqlens_kv
-        if cu is None:
-            cu = packed_seq_params.cu_seqlens_q
-        if cu is None:
-            raise ValueError("GLM-5 Next pooled DSA requires packed cu_seqlens")
-        cu = cu.to(device=raw_k.device, dtype=torch.int64)
-
-        lengths = cu[1:] - cu[:-1]
-        pools_per_sequence = torch.div(lengths, self.pool_size, rounding_mode="floor")
-        pool_prefix = torch.cat((torch.zeros_like(pools_per_sequence[:1]), pools_per_sequence.cumsum(0)))
-        raw_positions = torch.arange(raw_k.size(0), device=raw_k.device, dtype=torch.int64)
-        raw_sequence_ids = torch.bucketize(raw_positions, cu[1:], right=True)
-        local_positions = raw_positions - cu[raw_sequence_ids]
-        complete_pool_start = (local_positions.remainder(self.pool_size) == 0) & (
-            local_positions + self.pool_size <= lengths[raw_sequence_ids]
+        if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
+            # super() gathered its own copy; the gate input must cover the same rows.
+            x = gather_from_sequence_parallel_region(x, group=self.pg_collection.tp)
+        _, cu = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
+        self._raw_cu_seqlens = cu.to(device=raw_k.device, dtype=torch.int64)
+        # Pooling is deferred to prepare_topk_inputs: under CP the caller
+        # allgathers keys and restores global packed order between these hooks,
+        # and pool groups must be formed over that global order.
+        self._local_gate = torch.nn.functional.linear(
+            x.squeeze(1), self.index_kpool_compress_gate
         )
-        pool_bases = raw_positions[complete_pool_start]
-        pool_to_raw = (
-            pool_bases[:, None] + torch.arange(self.pool_size, device=raw_k.device, dtype=torch.int64)[None, :]
-        )
-
-        flat_x = x.squeeze(1)
-        flat_k = raw_k.squeeze(1)
-        gate = torch.nn.functional.linear(flat_x, self.index_kpool_compress_gate)
-        pool_gate = gate[pool_to_raw] + self.index_kpool_compress_ape[None, :, :]
-        pool_weights = pool_gate.float().softmax(dim=1).to(dtype=flat_k.dtype)
-        pooled_k = (flat_k[pool_to_raw] * pool_weights).sum(dim=1).unsqueeze(1)
-
-        self._pool_to_raw = pool_to_raw
-        self._pool_prefix = pool_prefix
-        self._raw_cu_seqlens = cu
-        return q, pooled_k, weights
+        return q, raw_k, weights
 
     def prepare_topk_inputs(
         self,
@@ -93,23 +74,68 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         fused_bounds: Optional[Tuple[torch.Tensor, torch.Tensor]],
         packed_seq_params: Optional[PackedSeqParams],
     ):
-        del packed_seq_params
         if fused_bounds is None:
             raise RuntimeError("GLM-5 Next requires fused bounded top-k; quadratic fallback is forbidden")
-        if self._pool_prefix is None or self._raw_cu_seqlens is None:
+        if self._local_gate is None or self._raw_cu_seqlens is None:
             raise RuntimeError("GLM-5 Next pool metadata was not prepared")
-        starts, ends = fused_bounds
+
+        gate = self._local_gate
+        cp_group = self.pg_collection.cp
+        cp_size = cp_group.size()
+        if cp_size > 1:
+            # k arrives allgathered and restored to global packed order by
+            # DSAttention; the gate rows must follow the same permutation.
+            cu_seqlens_q, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
+            _, kv_reorder = dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                cp_size=cp_size,
+                cp_rank=cp_group.rank(),
+                device=k.device,
+                local_output_size=gate.size(0),
+                key_local_output_size=gate.size(0),
+                global_output_size=gate.size(0) * cp_size,
+            )
+            gate = gather_from_sequence_parallel_region(gate.unsqueeze(1), group=cp_group)
+            gate = gate.squeeze(1).index_select(0, kv_reorder)
+        if k.size(0) != gate.size(0):
+            raise RuntimeError(
+                "GLM-5 Next pooled DSA key/gate row mismatch: "
+                f"k_rows={k.size(0)}, gate_rows={gate.size(0)}, cp_size={cp_size}"
+            )
+
         cu = self._raw_cu_seqlens
+        lengths = cu[1:] - cu[:-1]
+        pools_per_sequence = torch.div(lengths, self.pool_size, rounding_mode="floor")
+        pool_prefix = torch.cat((torch.zeros_like(pools_per_sequence[:1]), pools_per_sequence.cumsum(0)))
+        raw_positions = torch.arange(k.size(0), device=k.device, dtype=torch.int64)
+        raw_sequence_ids = torch.bucketize(raw_positions, cu[1:], right=True)
+        local_positions = raw_positions - cu[raw_sequence_ids]
+        complete_pool_start = (local_positions.remainder(self.pool_size) == 0) & (
+            local_positions + self.pool_size <= lengths[raw_sequence_ids]
+        )
+        pool_bases = raw_positions[complete_pool_start]
+        pool_to_raw = (
+            pool_bases[:, None] + torch.arange(self.pool_size, device=k.device, dtype=torch.int64)[None, :]
+        )
+
+        flat_k = k.squeeze(1)
+        pool_gate = gate[pool_to_raw] + self.index_kpool_compress_ape[None, :, :]
+        pool_weights = pool_gate.float().softmax(dim=1).to(dtype=flat_k.dtype)
+        pooled_k = (flat_k[pool_to_raw] * pool_weights).sum(dim=1).unsqueeze(1)
+        self._pool_to_raw = pool_to_raw
+        self._pool_prefix = pool_prefix
+
+        starts, ends = fused_bounds
         sequence_ids = torch.bucketize(starts.to(torch.int64), cu[1:], right=True)
         local_starts = starts.to(torch.int64) - cu[sequence_ids]
         local_ends = ends.to(torch.int64) - cu[sequence_ids]
         pool_base = self._pool_prefix[sequence_ids]
         pool_starts = pool_base + torch.div(local_starts, self.pool_size, rounding_mode="floor")
         pool_ends = pool_base + torch.div(local_ends, self.pool_size, rounding_mode="floor")
-        return q, k, weights, index_topk // self.pool_size, (pool_starts, pool_ends)
+        return q, pooled_k, weights, index_topk // self.pool_size, (pool_starts, pool_ends)
 
     def finalize_topk_indices(self, topk_indices, topk_length, packed_seq_params=None):
-        del packed_seq_params
         if self._pool_to_raw is None or self._raw_cu_seqlens is None:
             raise RuntimeError("GLM-5 Next pool metadata was not prepared")
         safe_indices = topk_indices.to(torch.int64).clamp(min=0, max=max(0, self._pool_to_raw.size(0) - 1))
@@ -123,7 +149,27 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         )
 
         # A query may see up to three tokens in the current incomplete pool.
-        rows = torch.arange(expanded.size(-2), device=expanded.device, dtype=torch.int64)
+        # The tail is computed in global packed coordinates: under CP each
+        # local top-k row maps to its zigzag global position.
+        n_rows = expanded.size(-2)
+        cp_group = self.pg_collection.cp
+        cp_size = cp_group.size()
+        if cp_size > 1:
+            if self._local_gate is None or n_rows != self._local_gate.size(0):
+                raise RuntimeError(
+                    "GLM-5 Next pooled DSA requires top-k rows to cover the full local CP "
+                    f"shard: rows={n_rows}, local_shard_rows="
+                    f"{self._local_gate.size(0) if self._local_gate is not None else None}"
+                )
+            rows = dsa_layout.build_packed_allgather_cp_local_positions(
+                self._raw_cu_seqlens,
+                cp_size,
+                cp_group.rank(),
+                expanded.device,
+                output_size=n_rows,
+            )
+        else:
+            rows = torch.arange(n_rows, device=expanded.device, dtype=torch.int64)
         sequence_ids = torch.bucketize(rows, self._raw_cu_seqlens[1:], right=True)
         local_rows = rows - self._raw_cu_seqlens[sequence_ids]
         tail_size = (local_rows + 1).remainder(self.pool_size)
