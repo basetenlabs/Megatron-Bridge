@@ -29,6 +29,7 @@ def text_config():
         hc_sinkhorn_iters=20,
         hidden_act="silu",
         hidden_size=4096,
+        head_dim=0,
         index_head_dim=128,
         index_n_heads=32,
         index_topk=2048,
@@ -87,6 +88,7 @@ def test_provider_preserves_full_hybrid_sparse_moe_contract(pretrained):
     assert provider.num_moe_experts == 288
     assert provider.moe_router_topk == 8
     assert provider.dsa_indexer_topk == 2048
+    assert provider.kv_channels == 256
     assert provider.enable_mhc_connections is True
     assert provider.mhc_num_residual_streams == 4
     assert provider.mtp_num_layers is None

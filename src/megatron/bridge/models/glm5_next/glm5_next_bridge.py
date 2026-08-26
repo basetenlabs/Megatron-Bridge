@@ -111,6 +111,13 @@ class Glm5NextBridge(MegatronModelBridge):
 
         provider.num_layers = config.num_hidden_layers
         provider.num_attention_heads = config.num_attention_heads
+        # The released GLM-5.3 config deliberately reports ``head_dim=0`` because
+        # its DSA layers use the MLA-specific Q/K dimensions below.  MCore's base
+        # Attention constructor still creates the configured core-attention once
+        # before AbsorbedMLA replaces it, and that path uses ``kv_channels`` to
+        # initialize the softmax scale.  Keep it aligned with the actual Q/K head
+        # width so construction cannot divide by the placeholder zero.
+        provider.kv_channels = config.qk_head_dim
         provider.q_lora_rank = config.q_lora_rank
         provider.kv_lora_rank = config.kv_lora_rank
         provider.qk_head_dim = config.qk_nope_head_dim
