@@ -67,6 +67,17 @@ class Glm5NextModelProvider(MLAModelProvider):
     it after the fact would mean every provider is briefly alive in a state its own
     __post_init__ rejects."""
 
+    position_embedding_type: str = "none"
+    """GLM-5.3 has no position embeddings on the text side at all.
+
+    NoPE means no rotary, and the checkpoint ships no learned table either. Megatron's
+    default is ``"learned_absolute"``, which builds a position-embedding matrix that no
+    checkpoint tensor maps onto -- so it would be randomly initialised, trained, and
+    added to every token. Caught by the VL path, where the embedding is called with
+    ``position_ids=None`` and raised ``embedding(): argument 'indices' must be Tensor,
+    not NoneType``; the text path would instead have silently added a spurious learned
+    positional signal."""
+
     qk_pos_emb_head_dim: int = 0
     """GLM-5.3 attention is NoPE. Overrides the MLA default of 64.
 
@@ -312,6 +323,17 @@ class Glm5NextVLModelProvider(Glm5NextModelProvider):
     # Set by the bridge from the HF config; typed loosely because it is a transformers
     # config object, not a Megatron dataclass.
     vision_config: object = None
+
+    # Multimodal token ids. HF's get_placeholder_mask -- which this model reuses rather
+    # than reimplementing -- reads image_token_id, video_start_token_id and
+    # video_end_token_id off the *Megatron* config, so they have to live here. Defaults
+    # are zai-org/GLM-5.3-Flash's; the bridge overwrites them from the checkpoint.
+    image_token_id: int = 154854
+    video_token_id: int = 154855
+    image_start_token_id: int = 154830
+    image_end_token_id: int = 154831
+    video_start_token_id: int = 154832
+    video_end_token_id: int = 154833
 
     freeze_language_model: bool = False
     freeze_vision_model: bool = False

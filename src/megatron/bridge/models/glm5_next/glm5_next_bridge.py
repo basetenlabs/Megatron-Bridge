@@ -31,6 +31,8 @@ A checkpoint that stores its text fields at the top level has them promoted into
 either way.
 """
 
+import torch.nn.functional as F
+
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.param_mapping import (
@@ -199,6 +201,24 @@ class Glm5NextBridge(MegatronModelBridge):
         # The tower is HF's own module built from this config object, so it is handed
         # over whole rather than copied field by field.
         provider.vision_config = getattr(hf_config, "vision_config", None)
+
+        # These live on the top-level config, not text_config, and HF's
+        # get_placeholder_mask reads them off the Megatron config at forward time.
+        for field in (
+            "image_token_id",
+            "video_token_id",
+            "image_start_token_id",
+            "image_end_token_id",
+            "video_start_token_id",
+            "video_end_token_id",
+        ):
+            value = getattr(hf_config, field, None)
+            if value is None:
+                raise ValueError(
+                    f"GLM-5.3 checkpoint config is missing {field}; the vision path needs "
+                    "it to locate image placeholders in the token stream."
+                )
+            setattr(provider, field, value)
         if provider.vision_config is None:
             raise ValueError(
                 "GLM-5.3 checkpoint has no vision_config; Glm5NextForConditionalGeneration "
@@ -266,6 +286,18 @@ class Glm5NextBridge(MegatronModelBridge):
                     "schedule covers the whole stack, which contradicts layer_types."
                 )
             provider.mtp_source_layer_number = dsa_layers[-1]
+
+        # SwiGLU. GLM-5.3's hidden_act is silu; Megatron's default is gelu, and nothing
+        # else in this path sets it. KDA refuses to run on anything but SiLU
+        # ("FLA causal convolution requires SiLU, got gelu"), which is how this was
+        # caught -- but a stack without KDA layers would have trained GELU MLPs against
+        # SiLU weights with nothing raised, so it is asserted rather than assumed.
+        if cfg.hidden_act != "silu":
+            raise ValueError(
+                f"GLM-5.3 expects hidden_act='silu', got {cfg.hidden_act!r}. The MLPs and "
+                "the KDA short convolution both depend on it."
+            )
+        provider.activation_func = F.silu
 
         # Clamped SwiGLU. NOTE: activation_func_clamp_value is documented as applying to
         # MoE layers; GLM-5.3's first three layers are dense and also clamp. Verify the

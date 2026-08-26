@@ -102,6 +102,15 @@ class Glm5NextVLModel(MegatronModule):
 
         self.config.spatial_merge_size = getattr(config.vision_config, "spatial_merge_size", 2)
 
+        # The borrowed HF methods reach through ``self.config``, which here is the
+        # Megatron provider rather than a transformers config, so anything they read has
+        # to be present on it. ``spatial_merge_size`` above is the same arrangement
+        # GLM-4.5V uses. ``return_dict`` is read by transformers' generic output wrapper
+        # as of 5.16 (``generic.py`` consults ``self.config.return_dict``); older
+        # versions did not, which is why the GLM-4.5V model never needed it.
+        if not hasattr(self.config, "return_dict"):
+            self.config.return_dict = True
+
     def set_input_tensor(self, input_tensor) -> None:
         """Set this model chunk's input tensor."""
         self.language_model.set_input_tensor(input_tensor)
