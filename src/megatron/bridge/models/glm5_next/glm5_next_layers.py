@@ -14,10 +14,11 @@
 
 """KDA linear-attention layer for GLM-5.3-Flash.
 
-Only the **KDA half** of GLM-5.3's attention lives here. The MLA+DSA layers reuse
-Megatron-Core's ``get_dsa_module_spec_for_backend`` spec unmodified -- see
-``glm5_next_spec``. That asymmetry is deliberate: it keeps the sparse-attention path
-on a maintained upstream code path and confines new code to the linear-attention half.
+Only the **KDA half** of GLM-5.3's attention lives here. The MLA+DSA layers keep the
+spec Megatron-Core's experimental-variant block builder produces for them, unmodified
+-- see ``glm5_next_spec``. That asymmetry is deliberate: it keeps the sparse-attention
+path on a maintained upstream code path and confines new code to the linear-attention
+half.
 
 GLM-5.3 and Kimi K3 use the same underlying linear-attention kernel
 (``fla.ops.kda.chunk_kda``) and the same short-convolution + forget-gate structure, so

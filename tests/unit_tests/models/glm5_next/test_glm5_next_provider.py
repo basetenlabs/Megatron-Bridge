@@ -33,7 +33,7 @@ pytestmark = pytest.mark.unit
 NUM_LAYERS = 45
 KDA_LAYERS = tuple(i + 1 for i in range(NUM_LAYERS) if i % 4 != 3)
 INDEX_TOPK = 2048
-INDEX_KPOOL = 16
+INDEX_KPOOL = 4  # the shipped GLM-5.3-Flash value, not Glm5NextTextConfig's default of 16
 
 
 def make_provider(**overrides) -> Glm5NextModelProvider:
@@ -100,9 +100,9 @@ class TestKPool:
     """k-pool indexing invariants."""
 
     def test_output_width_includes_the_tail(self):
-        # 128 pools x 16 tokens = 2048, plus up to kpool-1 tail tokens.
+        # 512 pools x 4 tokens = 2048, plus up to kpool-1 tail tokens.
         provider = make_provider()
-        assert provider.kpool_output_width == INDEX_TOPK + INDEX_KPOOL - 1 == 2063
+        assert provider.kpool_output_width == INDEX_TOPK + INDEX_KPOOL - 1 == 2051
 
     def test_output_width_without_tail(self):
         provider = make_provider(glm5_next_index_kpool_always_select_tail=False)
@@ -112,7 +112,7 @@ class TestKPool:
         # Selection takes topk // kpool pools and expands each by kpool; a non-multiple
         # would silently select fewer tokens than index_topk implies.
         with pytest.raises(ValueError, match="must be divisible"):
-            make_provider(glm5_next_index_kpool=17)
+            make_provider(glm5_next_index_kpool=3)
 
     def test_non_positive_kpool_is_rejected(self):
         with pytest.raises(ValueError, match="must be positive"):
@@ -130,15 +130,17 @@ class TestAttentionInvariants:
         with pytest.raises(ValueError, match="NoPE"):
             make_provider(qk_pos_emb_head_dim=64)
 
-    def test_experimental_attention_variant_must_be_unset(self):
-        """GLM-5.2 sets this to "dsa"; GLM-5.3 cannot.
+    def test_dsa_variant_is_the_default(self):
+        """The block is built as all-DSA, then KDA layers replace their attention.
 
-        ``get_gpt_decoder_layer_specs`` asserts the variant is None, and the block
-        builder goes through it. Failing here names the reason; the bare Megatron-Core
-        assert does not.
+        Keeping the scalar at "dsa" also keeps downstream inferences drawn from it
+        correct -- notably the fp32 output projection, which the inference side mirrors.
         """
-        with pytest.raises(ValueError, match="experimental_attention_variant=None"):
-            make_provider(experimental_attention_variant="dsa")
+        assert make_provider().experimental_attention_variant == "dsa"
+
+    def test_a_non_dsa_variant_is_rejected(self):
+        with pytest.raises(ValueError, match="experimental_attention_variant='dsa'"):
+            make_provider(experimental_attention_variant=None)
 
     def test_mla_is_required(self):
         with pytest.raises(ValueError, match="multi_latent_attention"):
@@ -147,10 +149,11 @@ class TestAttentionInvariants:
 
 class TestMarkers:
     def test_fp32_lm_head_is_requested_by_default(self):
-        """The fp32 head cannot be inferred from experimental_attention_variant.
+        """Explicit signal for a property that is currently also inferable.
 
-        That scalar is None for GLM-5.3 (see TestAttentionInvariants), so consumers
-        that key off it would silently fall back to a bf16 head on both the trainer
-        and the sampler -- consistently, so nothing raises.
+        The variant scalar is "dsa", so consumers keying off it still work. This field
+        exists because tying a numerics decision to a scalar chosen for spec dispatch is
+        fragile: if the block moves off the variant path, that inference flips to False
+        on the trainer and the sampler alike -- consistently, so nothing raises.
         """
         assert make_provider().glm5_next_requires_fp32_lm_head is True

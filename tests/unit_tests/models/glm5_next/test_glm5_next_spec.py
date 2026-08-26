@@ -52,7 +52,7 @@ def make_config(**overrides) -> _FakeConfig:
     kwargs = dict(
         num_layers=NUM_LAYERS,
         glm5_next_kda_layers=KDA_LAYERS,
-        experimental_attention_variant=None,
+        experimental_attention_variant="dsa",
         multi_latent_attention=True,
         virtual_pipeline_model_parallel_size=None,
         normalization="RMSNorm",
@@ -61,12 +61,21 @@ def make_config(**overrides) -> _FakeConfig:
     return _FakeConfig(**kwargs)
 
 
+def _fake_dsa_spec():
+    return SimpleNamespace(
+        module="GlmAbsorbedMLASelfAttention",
+        metainfo={"fuse_input_layernorm": False},
+    )
+
+
 def _fake_layer_spec():
-    # input_layernorm starts as a sentinel so the test can prove the builder overwrote
-    # it rather than leaving whatever the standard block chose.
+    """A layer as the variant builder returns it: DSA attention, norm already chosen."""
     return SimpleNamespace(
         module="TransformerLayer",
-        submodules=SimpleNamespace(self_attention="UNSET", input_layernorm="SENTINEL"),
+        submodules=SimpleNamespace(
+            self_attention=_fake_dsa_spec(),
+            input_layernorm="LayerNorm",
+        ),
     )
 
 
@@ -75,22 +84,9 @@ def stub_megatron(monkeypatch):
     """Stub the Megatron-Core entry points the builder calls."""
     monkeypatch.setattr(
         glm5_next_spec,
-        "get_gpt_decoder_block_spec",
-        lambda config, use_transformer_engine, vp_stage: SimpleNamespace(
+        "get_transformer_block_with_experimental_attention_variant_spec",
+        lambda config, vp_stage=None, pp_rank=None: SimpleNamespace(
             layer_specs=[_fake_layer_spec() for _ in range(config.num_layers)]
-        ),
-    )
-    monkeypatch.setattr(
-        glm5_next_spec,
-        "_get_backend_spec_provider",
-        lambda config: SimpleNamespace(layer_norm=lambda rms_norm, for_qk: f"LayerNorm(rms={rms_norm})"),
-    )
-    monkeypatch.setattr(
-        glm5_next_spec,
-        "get_dsa_module_spec_for_backend",
-        lambda config, backend: SimpleNamespace(
-            module="GlmAbsorbedMLASelfAttention",
-            metainfo={"fuse_input_layernorm": False},
         ),
     )
     monkeypatch.setattr(glm5_next_spec, "get_transformer_layer_offset", lambda config, vp_stage: 0)
@@ -119,27 +115,35 @@ class TestLayerAssignment:
         # The 3:1 schedule puts DSA on every fourth layer starting at 4.
         assert dsa_at == [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44]
 
-    def test_every_layer_gets_an_input_layernorm(self, stub_megatron):
-        """Neither replacement spec fuses the input norm, so all 45 need a real one.
+    def test_the_builders_input_layernorm_is_preserved(self, stub_megatron):
+        """The variant builder already chose a norm valid for both attention kinds.
 
-        Replacing self_attention can strand an IdentityOp that the standard MLA block
-        chose because *its* attention fused the norm. That would drop the pre-attention
-        normalization silently -- no error, just different numerics.
+        It picks input_layernorm from the attention spec's fuse_input_layernorm, and
+        KDA declares the same value as DSA, so swapping the module keeps the norm
+        correct. If that ever stopped holding, swapping would strand an IdentityOp and
+        drop the pre-attention normalization silently -- hence the guard below.
         """
         block = build_glm5_next_spec(make_config())
+        assert all(s.submodules.input_layernorm == "LayerNorm" for s in block.layer_specs)
 
-        assert all(s.submodules.input_layernorm == "LayerNorm(rms=True)" for s in block.layer_specs)
-        assert not any(s.submodules.input_layernorm == "SENTINEL" for s in block.layer_specs)
+    def test_a_fusing_dsa_spec_is_rejected(self, monkeypatch, stub_megatron):
+        """If DSA started fusing its norm, KDA layers could not reuse the same one."""
 
-    def test_dsa_spec_is_shared_not_rebuilt(self, stub_megatron):
-        """One ModuleSpec instance is reused across DSA layers; it is a description."""
-        block = build_glm5_next_spec(make_config())
-        dsa_specs = [
-            s.submodules.self_attention
-            for s in block.layer_specs
-            if s.submodules.self_attention.module == "GlmAbsorbedMLASelfAttention"
-        ]
-        assert all(spec is dsa_specs[0] for spec in dsa_specs)
+        def fusing_layer_spec():
+            spec = _fake_layer_spec()
+            spec.submodules.self_attention.metainfo["fuse_input_layernorm"] = True
+            spec.submodules.input_layernorm = "IdentityOp"
+            return spec
+
+        monkeypatch.setattr(
+            glm5_next_spec,
+            "get_transformer_block_with_experimental_attention_variant_spec",
+            lambda config, vp_stage=None, pp_rank=None: SimpleNamespace(
+                layer_specs=[fusing_layer_spec() for _ in range(config.num_layers)]
+            ),
+        )
+        with pytest.raises(ValueError, match="fuse_input_layernorm"):
+            build_glm5_next_spec(make_config())
 
     def test_pipeline_offset_shifts_the_schedule(self, monkeypatch, stub_megatron):
         """On a later PP rank, local index 0 is not global layer 1.
@@ -163,14 +167,10 @@ class TestGuards:
         with pytest.raises(ValueError, match="virtual pipeline"):
             build_glm5_next_spec(make_config(virtual_pipeline_model_parallel_size=2))
 
-    def test_experimental_attention_variant_must_be_unset(self, stub_megatron):
-        """GLM-5.2 sets this to "dsa"; GLM-5.3 cannot.
-
-        get_gpt_decoder_layer_specs asserts it is None. Raising here names the reason --
-        the bare Megatron-Core assert does not.
-        """
-        with pytest.raises(ValueError, match="experimental_attention_variant=None"):
-            build_glm5_next_spec(make_config(experimental_attention_variant="dsa"))
+    def test_a_non_dsa_variant_is_rejected(self, stub_megatron):
+        """Building on the wrong variant would silently change every layer's attention."""
+        with pytest.raises(ValueError, match="experimental_attention_variant='dsa'"):
+            build_glm5_next_spec(make_config(experimental_attention_variant=None))
 
     def test_mla_is_required(self, stub_megatron):
         with pytest.raises(ValueError, match="multi_latent_attention"):
