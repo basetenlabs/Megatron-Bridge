@@ -22,11 +22,15 @@ GLM-5.3 interleaves two attention mechanisms in a single stack:
 Megatron-Core selects an experimental attention variant with one scalar per model
 (``experimental_attention_variant``), and its dispatch admits either *{linear attention
 mixed with standard attention}* or *{every layer the variant}* -- never *{KDA mixed with
-DSA}*. GLM-5.3 therefore leaves that scalar unset and assigns per-layer attention specs
-in :func:`~megatron.bridge.models.glm5_next.glm5_next_spec.build_glm5_next_spec`.
+DSA}*. GLM-5.3 keeps that scalar at ``"dsa"`` and replaces attention on the KDA layers
+afterwards, in
+:func:`~megatron.bridge.models.glm5_next.glm5_next_spec.build_glm5_next_spec`. Keeping
+the scalar is deliberate: consumers infer the fp32 output projection from it, on the
+trainer and on the sampler alike.
 
-Only the language backbone is provided. The vision tower is out of scope, following the
-Kimi K3 precedent.
+The vision tower is included -- see ``Glm5NextVLModelProvider`` below and
+``glm5_next_vl_model``. ``Glm5NextForConditionalGeneration`` is GLM-5.3's only
+architecture, so the text path is simply the one that passes no images.
 """
 
 from dataclasses import dataclass
@@ -55,6 +59,13 @@ class Glm5NextModelProvider(MLAModelProvider):
     ``None``, which would build a standard-attention block instead -- so, like
     ``qk_pos_emb_head_dim``, this is an architectural invariant rather than a tunable.
     """
+
+    multi_latent_attention: bool = True
+    """GLM-5.3's 11 sparse layers are MLA, so this is an architectural invariant rather
+    than a tunable -- declared here, like ``experimental_attention_variant`` and
+    ``qk_pos_emb_head_dim``, so ``validate_attention`` holds from construction. Assigning
+    it after the fact would mean every provider is briefly alive in a state its own
+    __post_init__ rejects."""
 
     qk_pos_emb_head_dim: int = 0
     """GLM-5.3 attention is NoPE. Overrides the MLA default of 64.
@@ -134,9 +145,14 @@ class Glm5NextModelProvider(MLAModelProvider):
 
     ``fla.ops.kda.chunk_kda`` takes ``safe_gate``/``lower_bound`` and fuses whichever
     form is selected. With this left False the kernel raises nothing and trains the
-    unbounded gate -- the same silent-divergence shape as the Kimi-K3 fla floor. The
-    required kernel support landed in flash-linear-attention 0.5.2, which is already
-    the floor this stack pins for Kimi-K3, so no new dependency floor is needed."""
+    unbounded gate -- the same silent-divergence shape as the Kimi-K3 fla floor.
+
+    No new dependency floor is needed: the support is present as far back as
+    flash-linear-attention 0.4.2, verified on a B300 pod against the installed 0.4.2,
+    where ``safe_gate``/``lower_bound`` are explicit parameters threaded through both
+    forward and backward and validated to ``-5 <= lower_bound < 0`` -- the docstring
+    there even says to set -5, which is GLM-5.3's value. (An earlier revision of this
+    comment claimed 0.5.2; that came from checking only the 0.5.2 tag and was wrong.)"""
 
     kda_lower_bound: float | None = -5.0
     """Lower bound on the KDA forget gate (HF ``linear_lower_bound``). Only consumed

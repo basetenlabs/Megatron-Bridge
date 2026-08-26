@@ -218,6 +218,15 @@ class Glm5NextBridge(MegatronModelBridge):
             num_query_groups=cfg.num_key_value_heads,
             vocab_size=cfg.vocab_size,
             layernorm_epsilon=cfg.rms_norm_eps,
+            # Passed at construction, not assigned afterwards: the provider validates
+            # its own layout in __post_init__, so a provider is never briefly alive
+            # holding an empty schedule. HF indexes layers from 0 and Megatron-Core's
+            # layer_number is 1-indexed; this is the single place that shift happens.
+            glm5_next_kda_layers=tuple(
+                index + 1
+                for index, kind in enumerate(cfg.layer_types)
+                if kind == "linear_attention"
+            ),
         )
         provider.transformer_layer_spec = build_glm5_next_spec
 
@@ -266,14 +275,11 @@ class Glm5NextBridge(MegatronModelBridge):
         return provider
 
     def _apply_layout(self, provider, cfg) -> None:
-        """Translate HF's per-layer schedules onto the provider.
+        """Translate HF's remaining per-layer schedules onto the provider.
 
-        HF indexes layers from 0; the provider uses Megatron-Core's 1-indexed
-        ``layer_number``. Converting here, once, is the only place that shift happens.
+        The KDA schedule itself is passed at construction (see ``_base_provider``)
+        because the provider validates it in ``__post_init__``.
         """
-        provider.glm5_next_kda_layers = tuple(
-            index + 1 for index, kind in enumerate(cfg.layer_types) if kind == "linear_attention"
-        )
         provider.glm5_next_indexer_full_layers = tuple(
             index + 1 for index, kind in enumerate(cfg.indexer_types) if kind == "full"
         )
