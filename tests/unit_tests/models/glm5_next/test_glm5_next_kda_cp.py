@@ -24,12 +24,14 @@ try:
 except ImportError:
     HAVE_FLA = False
 
-requires_2gpu_fla = pytest.mark.skipif(
-    not HAVE_FLA or not torch.cuda.is_available() or torch.cuda.device_count() < 2,
-    reason="needs FLA and 2 CUDA devices",
-)
+# CP world size under test; the box needs that many GPUs. Document lengths
+# must divide 2*CP (zigzag) and NUM_HEADS must divide CP (head-parallel a2a).
+CP = int(os.environ.get("BT_KDA_CP_SIZE", "2"))
 
-CP = 2
+requires_2gpu_fla = pytest.mark.skipif(
+    not HAVE_FLA or not torch.cuda.is_available() or torch.cuda.device_count() < CP,
+    reason=f"needs FLA and {CP} CUDA devices",
+)
 HIDDEN = 512
 NUM_HEADS = 8
 HEAD_DIM = 64
@@ -195,7 +197,7 @@ def _server_venv_python() -> str:
 
 
 @requires_2gpu_fla
-def test_glm5_next_kda_cp2_matches_cp1():
+def test_glm5_next_kda_cp_matches_cp1():
     import re
     import subprocess
 
