@@ -38,6 +38,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     RowParallelMapping,
 )
 from megatron.bridge.models.glm5_next.glm5_next_kda_mapping import Glm5NextKdaFusedMapping
+from megatron.bridge.models.glm5_next.glm5_next_mhc_mapping import mhc_mappings
 from megatron.bridge.models.glm5_next.glm5_next_provider import Glm5NextModelProvider
 from megatron.bridge.models.glm5_next.glm5_next_spec import build_glm5_next_spec
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
@@ -192,27 +193,35 @@ class Glm5NextBridge(MegatronModelBridge):
         """Manifold-constrained hyper-connections.
 
         GLM-5.3's parameterization matches Megatron-Core's ``HyperConnectionModule``
-        exactly -- ``fn`` is ``mapping_proj.weight`` (both ``[(2+n)*n, n*hidden]``),
-        ``base`` is ``bias``, and ``scale`` holds the three alphas.
+        term by term: ``fn`` is ``mapping_proj.weight`` (both ``[(2+n)*n, n*hidden]``),
+        ``base`` is ``bias``, ``scale`` holds the three alphas, and
+        ``_sinkhorn_iterations`` is line-for-line HF's loop. ``_MHC_COMPUTE_H_EPS`` is
+        1e-6, which is GLM-5.3's ``hc_eps``.
 
-        NOT WIRED YET, deliberately. Two Megatron-Core versions disagree about how this
-        is spelled and whether it works at all with MoE:
-
-        * The production trainer image exposes ``enable_hyper_connections`` /
-          ``num_residual_streams`` / ``use_fused_mhc``, and mHC over sparse MoE is
-          qualified there.
-        * The Megatron-Core pinned by this repository exposes
-          ``enable_mhc_connections`` / ``mhc_num_residual_streams``, and its
-          ``HyperConnectionTransformerLayer`` raises ``NotImplementedError`` on any MoE
-          layer. GLM-5.3 is 42 MoE layers of 45, and the ``HyperConnectionHybridLayer``
-          that error points to does not exist in this pin or upstream.
-
-        Setting the production spelling against this pin would assign undeclared
-        attributes: a non-frozen dataclass accepts them, nothing reads them, and mHC
-        would silently never turn on. Leaving it unset is the honest state until the
-        target Megatron-Core is settled.
+        The pin this repository now tracks exposes the production spelling
+        (``enable_hyper_connections`` / ``num_residual_streams`` / ``use_fused_mhc``),
+        where mHC over sparse MoE is qualified -- so the earlier ambiguity between that
+        and ``enable_mhc_connections`` / ``mhc_num_residual_streams`` is resolved. The
+        variant block builder constructs the hyper-connection modules itself once
+        ``enable_hyper_connections`` is set.
         """
-        del provider, cfg
+        if not getattr(cfg, "mhc", False):
+            raise ValueError(
+                "GLM-5.3-Flash is defined with mHC hyper-connections (config mhc=True); "
+                "refusing to build it without them, since the residual stream shape "
+                "differs throughout the stack."
+            )
+
+        provider.enable_hyper_connections = True
+        provider.num_residual_streams = cfg.hc_mult
+        provider.mhc_sinkhorn_iterations = cfg.hc_sinkhorn_iters
+
+        # GLM-5.3 contracts the residual streams with an unweighted mean and ships no
+        # hc_head_* weights. DeepSeek-V4's learned contraction is Megatron-Core's
+        # default, and leaving it on would apply a randomly-initialized gated sum to the
+        # final hidden states with nothing raised. See the flag's docstring in
+        # TransformerConfig.
+        provider.mhc_learned_output_contract = False
 
     # ----------------------------------------------------------------- weights
 
@@ -343,13 +352,12 @@ class Glm5NextBridge(MegatronModelBridge):
             ),
         ]
 
+        # mHC, one hyper-connection around attention and one around the MLP.
+        mappings += mhc_mappings(megatron_layer, hf_layer)
+
         # STILL OPEN -- deliberately absent rather than guessed:
         #
-        # 1. mHC (hc_attn_fn / hc_attn_base / hc_attn_scale and the ffn equivalents).
-        #    Blocked on the same question as _apply_mhc, and `scale` is one [3] tensor on
-        #    the HF side against three scalar parameters on the Megatron side -- also a
-        #    shape-changing mapping.
-        # 2. Quantization. Resolved to *what* but not *wired*: zai-org/GLM-5.3-Flash
+        # 1. Quantization. Resolved to *what* but not *wired*: zai-org/GLM-5.3-Flash
         #    is block FP8 e4m3, weight_block_size [128, 128], dynamic activations,
         #    1509 modules_to_not_convert, 328 GB. That is GLM-5.2's format, so the
         #    dequant-on-load path is reuse rather than new work. Until it is wired,
