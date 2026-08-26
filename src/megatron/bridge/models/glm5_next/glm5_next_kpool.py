@@ -50,6 +50,7 @@ rather than reaching into the attention path, so ``DSAttention`` needs no change
 
 import torch
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer, fused_qk_topk_naive
 
 
@@ -178,6 +179,24 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         # Per-slot gate logits, plus the learned within-pool position embedding, give a
         # softmax over the members of each pool. Computed in fp32: the softmax is over
         # only index_kpool entries, but it weights the keys the whole selection depends on.
+        # The gate must cover the same positions as the keys. The base implementation may
+        # gather ``x`` out of the sequence-parallel region before building ``k`` -- the
+        # indexer needs the whole sequence to pick a global top-k -- so ``x`` as handed to
+        # this method can be shorter than ``k``.
+        #
+        # Decided on the observed shapes rather than by re-deriving the base's condition
+        # from config flags. Duplicating that predicate is what produced two different
+        # wrong answers here: a gate 1/tp as long as the keys when the base had gathered,
+        # then one tp times too long when it had not.
+        if x.shape[0] != seqlen:
+            tp_size = self.pg_collection.tp.size()
+            if x.shape[0] * tp_size != seqlen:
+                raise RuntimeError(
+                    f"k-pool cannot align the gate: x has {x.shape[0]} positions, the "
+                    f"pooled keys {seqlen}, and tp={tp_size} does not bridge them."
+                )
+            x = gather_from_sequence_parallel_region(x, group=self.pg_collection.tp)
+
         gate = torch.nn.functional.linear(x, self.index_kpool_compress_gate)
         gate = gate.reshape(pools, self.index_kpool, batch, head_dim)
         logits = gate.float() + self.index_kpool_compress_ape.float()[None, :, None, :]

@@ -335,6 +335,23 @@ class Glm5NextVLModelProvider(Glm5NextModelProvider):
     video_start_token_id: int = 154832
     video_end_token_id: int = 154833
 
+    scatter_embedding_sequence_parallel: bool = False
+    """The vision-language wrapper owns the sequence-parallel scatter, not the embedding.
+
+    The splice has to happen on the *whole* sequence -- ``get_placeholder_mask`` and
+    ``masked_scatter`` work over ``[batch, seq, hidden]`` with every image placeholder
+    present -- so the wrapper needs unsharded embeddings and scatters afterwards. Left at
+    Megatron's ``True`` default the sequence is scattered twice: measured at TP=8 with
+    seq 8192, the DSA indexer saw ``x`` of 128 positions where 1024 was correct.
+
+    It cannot be fixed by flipping the flag after construction:
+    ``LanguageModelEmbedding`` derives ``reduce_scatter_embeddings`` from it in
+    ``__init__`` and passes that into ``VocabParallelEmbedding``, so a late flip leaves
+    the reduce-scatter path active and the sequence still sharded twice.
+
+    ``GPTModel`` reads the same flag to decide whether to scatter a supplied
+    ``decoder_input`` itself, so this keeps exactly one scatter in the graph."""
+
     freeze_language_model: bool = False
     freeze_vision_model: bool = False
     freeze_vision_projection: bool = False
@@ -347,6 +364,31 @@ class Glm5NextVLModelProvider(Glm5NextModelProvider):
             raise ValueError(
                 "Glm5NextVLModelProvider requires vision_config; GLM-5.3-Flash ships a "
                 "vision tower and its weights would otherwise have nowhere to load."
+            )
+
+        # MTP + sequence parallelism + the vision splice cannot all hold at once, and the
+        # symptom is an opaque shape error deep in MTP rather than anything nameable:
+        #
+        #   RuntimeError: The size of tensor a (65536) must match the size of tensor b
+        #   (8192) at non-singleton dimension 0
+        #   multi_token_prediction.py:2172 _concat_embeddings
+        #
+        # The splice needs unsharded embeddings, so this provider sets
+        # scatter_embedding_sequence_parallel=False. MTP then re-embeds input_ids through
+        # that same non-scattering embedding while its hidden states are SP-sharded, and
+        # the two no longer line up. Measured at TP=8 / EP=1 / ETP=8, seq 8192.
+        #
+        # Not a blocker in practice: GLM-5.2's published B300 rows are tp=1 too, and
+        # GLM-5.3 at tp=1 / ep=8 reaches 32K on one node with full recompute (215 GiB of
+        # 268 per rank). Resolving it properly means teaching MTP to scatter its own
+        # embedding output, which is a Megatron-Core change.
+        if self.sequence_parallel and self.mtp_num_layers and self.tensor_model_parallel_size > 1:
+            raise ValueError(
+                "GLM-5.3 cannot combine MTP with sequence parallelism: the vision splice "
+                "requires an embedding that does not scatter, and MTP's own embedding call "
+                "then disagrees with its SP-sharded hidden states. Use "
+                "tensor_model_parallel_size=1 (the shape validated on B300, which reaches "
+                "32K with full recompute), or set mtp_num_layers=None."
             )
 
         model = Glm5NextVLModel(
