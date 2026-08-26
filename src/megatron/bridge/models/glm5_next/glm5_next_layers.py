@@ -26,8 +26,29 @@ the layer is adapted from ``KimiK3Attention``'s KDA branch. Two structural diffe
 * This module is instantiated **only** for KDA layers, so it has no ``is_kda`` branch.
   ``KimiK3Attention`` is built for every layer and dispatches internally, because K3
   hand-rolls its MLA half too.
-* GLM-5.3's MLA is ungated, so there is no shared ``g_proj`` convention to preserve
-  across the two halves; the ``g_proj`` here is KDA's own output gate.
+* **The output gate is low-rank.** GLM-5.3 factors it through the head dimension
+  (``g_a_proj`` -> ``g_b_proj``), mirroring its forget gate. Kimi K3 uses a single
+  full-rank ``g_proj``.
+
+Two further differences are handled in the bridge's weight mapping rather than here,
+because they are layout choices rather than different math:
+
+* **HF fuses the short convolution.** ``Glm5NextTextLinearAttention`` holds one
+  depthwise ``conv1d`` over ``3 * qkv_dim`` channels covering q, k and v together. A
+  depthwise convolution applies an independent kernel per channel, so three separate
+  ``qkv_dim``-channel convolutions are numerically identical, and they shard cleanly by
+  head under tensor parallelism where one fused convolution would not. We keep three;
+  the bridge splits HF's fused weight three ways.
+* **HF nests the forget gate.** Its ``f_a_proj``, ``f_b_proj``, ``A_log`` and
+  ``dt_bias`` live on a ``forget_gate`` submodule. They are flat here, matching Kimi K3,
+  so the bridge maps the nested names onto flat ones.
+
+.. note::
+   HF computes the forget gate in Python and passes only ``g`` to the kernel, whereas
+   this layer passes ``A_log``, ``dt_bias`` and the lower bound through so the kernel
+   fuses the same computation (``use_gate_in_kernel=True, safe_gate=True``). The two are
+   expected to be numerically equivalent and the fused path is faster, but that
+   equivalence has not been verified yet -- it needs a parity test against HF.
 """
 
 import copy
@@ -200,7 +221,13 @@ class Glm5NextLinearAttention(MegatronModule):
         self.f_a_proj = self._duplicated_linear(hidden_size, self.head_dim)
         self.f_b_proj = self._column_linear(self.head_dim, self.projection_size)
         self.b_proj = self._column_linear(hidden_size, self.num_heads)
-        self.g_proj = self._column_linear(hidden_size, self.projection_size)
+
+        # Output gate. GLM-5.3 factors this through the head dimension (g_a -> g_b),
+        # mirroring its forget gate; Kimi K3 uses a single full-rank g_proj instead.
+        # The low-rank stage is small and unsharded, so g_a is replicated and only g_b
+        # is column-parallel.
+        self.g_a_proj = self._duplicated_linear(hidden_size, self.head_dim)
+        self.g_b_proj = self._column_linear(self.head_dim, self.projection_size)
 
         # Kept in fp32: these feed the fused gate computation inside chunk_kda, where
         # bf16 rounding measurably changes the decay.
@@ -268,7 +295,11 @@ class Glm5NextLinearAttention(MegatronModule):
             cu_seqlens=cu_seqlens,
         )
 
-        gate = rearrange(_linear(self.g_proj, x), "b s (h d) -> b s h d", h=self.local_num_heads)
+        gate = rearrange(
+            _linear(self.g_b_proj, _linear(self.g_a_proj, x)),
+            "b s (h d) -> b s h d",
+            h=self.local_num_heads,
+        )
         output = self.o_norm(output.reshape(-1, self.head_dim), gate.reshape(-1, self.head_dim))
         output = output.view(*gate.shape).flatten(-2)
         return _linear(self.o_proj, output.to(hidden_states.dtype)).transpose(0, 1)
