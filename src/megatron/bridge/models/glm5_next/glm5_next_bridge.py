@@ -2,8 +2,8 @@
 
 """Checkpoint and model configuration bridge for GLM-5.3-Flash."""
 
-from typing import os
-import Mapping
+import os
+from typing import Mapping
 
 import torch
 from megatron.core.models.gpt.gpt_model import GPTModel
