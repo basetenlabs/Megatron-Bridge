@@ -15,18 +15,21 @@
 """Megatron Bridge for the GLM-5.3-Flash (``glm5_next``) language backbone.
 
 Registration is by architecture *string* because ``glm5_next`` may be resolved through
-remote code, and because GLM-5.3-Flash is a ``ForConditionalGeneration`` checkpoint
-whose language backbone is bridged on its own -- the same arrangement Kimi K3 uses.
+remote code.
 
 ``AutoBridge.from_hf_pretrained`` resolves the bridge from the checkpoint config, so
 this decorator is the whole dispatch story: nothing else needs to know GLM-5.3 exists.
 
-The vision tower is out of scope. A text-only Flash checkpoint stores its text fields
-at the top level and ``Glm5NextConfig.__post_init__`` promotes them into
-``text_config``, so reading from ``text_config`` works either way.
-"""
+``Glm5NextForConditionalGeneration`` is GLM-5.3's only architecture -- there is no
+text-only variant -- so this bridge builds the vision-language model and the text path
+is simply the one that passes no images. The tower itself is HuggingFace's
+``Glm5NextVisionModel``, embedded verbatim as for GLM-4.5V, which is why its weights map
+with a single ``visual.**`` wildcard.
 
-from megatron.core.models.gpt.gpt_model import GPTModel
+A checkpoint that stores its text fields at the top level has them promoted into
+``text_config`` by ``Glm5NextConfig.__post_init__``, so reading ``text_config`` works
+either way.
+"""
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
@@ -40,7 +43,11 @@ from megatron.bridge.models.conversion.param_mapping import (
 from megatron.bridge.models.glm5_next.glm5_next_kda_mapping import Glm5NextKdaFusedMapping
 from megatron.bridge.models.glm5_next.glm5_next_mhc_mapping import mhc_mappings
 from megatron.bridge.models.glm5_next.glm5_next_mtp_mapping import mtp_eh_proj_mappings
-from megatron.bridge.models.glm5_next.glm5_next_provider import Glm5NextModelProvider
+from megatron.bridge.models.glm5_next.glm5_next_vl_model import Glm5NextVLModel
+from megatron.bridge.models.glm5_next.glm5_next_provider import (
+    Glm5NextModelProvider,
+    Glm5NextVLModelProvider,
+)
 from megatron.bridge.models.glm5_next.glm5_next_spec import build_glm5_next_spec
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 
@@ -171,14 +178,14 @@ def _layer_mappings(megatron_layer: str, hf_layer: str) -> list:
 
 @MegatronModelBridge.register_bridge(
     source="Glm5NextForConditionalGeneration",
-    target=GPTModel,
-    provider=Glm5NextModelProvider,
+    target=Glm5NextVLModel,
+    provider=Glm5NextVLModelProvider,
     model_type="glm5_next",
 )
 class Glm5NextBridge(MegatronModelBridge):
-    """HF <-> Megatron conversion for GLM-5.3-Flash (text backbone only)."""
+    """HF <-> Megatron conversion for GLM-5.3-Flash, vision tower included."""
 
-    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> Glm5NextModelProvider:
+    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> Glm5NextVLModelProvider:
         hf_config = hf_pretrained.config
         text_config = getattr(hf_config, "text_config", hf_config)
 
@@ -188,12 +195,22 @@ class Glm5NextBridge(MegatronModelBridge):
         self._apply_dsa(provider, text_config)
         self._apply_moe(provider, text_config)
         self._apply_mhc(provider, text_config)
+
+        # The tower is HF's own module built from this config object, so it is handed
+        # over whole rather than copied field by field.
+        provider.vision_config = getattr(hf_config, "vision_config", None)
+        if provider.vision_config is None:
+            raise ValueError(
+                "GLM-5.3 checkpoint has no vision_config; Glm5NextForConditionalGeneration "
+                "is a vision-language architecture and its model.visual.* weights would "
+                "have nowhere to load."
+            )
         return provider
 
     # ------------------------------------------------------------------ config
 
-    def _base_provider(self, cfg) -> Glm5NextModelProvider:
-        provider = Glm5NextModelProvider(
+    def _base_provider(self, cfg) -> Glm5NextVLModelProvider:
+        provider = Glm5NextVLModelProvider(
             num_layers=cfg.num_hidden_layers,
             hidden_size=cfg.hidden_size,
             ffn_hidden_size=cfg.intermediate_size,
@@ -428,6 +445,11 @@ class Glm5NextBridge(MegatronModelBridge):
             # matches.
             for layer_prefix in ("transformer_layer", "mtp_model_layer"):
                 mappings += _layer_mappings(f"{megatron_mtp}.{layer_prefix}", hf_mtp)
+
+        # Vision tower. The module is HuggingFace's own, so the parameter names match
+        # the checkpoint one for one and a single wildcard covers the whole tower --
+        # patch_embed, the 24 blocks, downsample, post_layernorm and the merger.
+        mappings.append(AutoMapping(megatron_param="visual.**", hf_param="model.visual.**"))
 
         # STILL OPEN -- deliberately absent rather than guessed:
         #

@@ -275,3 +275,55 @@ class Glm5NextModelProvider(MLAModelProvider):
             # Checked here so a checkpoint that reintroduces RoPE fails at construction
             # rather than training without position information.
             raise ValueError(f"GLM-5.3 expects NoPE attention (qk_pos_emb_head_dim=0), got {self.qk_pos_emb_head_dim}")
+
+
+@dataclass
+class Glm5NextVLModelProvider(Glm5NextModelProvider):
+    """GLM-5.3-Flash with its vision tower.
+
+    ``Glm5NextForConditionalGeneration`` is the model's only architecture, so this is
+    the provider the bridge builds for every GLM-5.3 checkpoint. Passing no
+    ``pixel_values`` gives the text path; the tower is then constructed but never
+    called.
+
+    Vision geometry is not declared here. The tower is HuggingFace's own
+    ``Glm5NextVisionModel``, built from ``vision_config``, so the config object is the
+    single source of truth and there is no second copy to drift. For reference, the
+    shipped values are depth 24, hidden 1024, 16 heads, image 448, patch 14, spatial
+    merge 2, temporal patch 2, out_hidden 4096 -- the GLM-4.5V tower rescaled.
+    """
+
+    # Set by the bridge from the HF config; typed loosely because it is a transformers
+    # config object, not a Megatron dataclass.
+    vision_config: object = None
+
+    freeze_language_model: bool = False
+    freeze_vision_model: bool = False
+    freeze_vision_projection: bool = False
+
+    def provide(self, pre_process=None, post_process=None, vp_stage=None):
+        """Build the VL model, applying any requested freezes."""
+        from megatron.bridge.models.glm5_next.glm5_next_vl_model import Glm5NextVLModel
+
+        if self.vision_config is None:
+            raise ValueError(
+                "Glm5NextVLModelProvider requires vision_config; GLM-5.3-Flash ships a "
+                "vision tower and its weights would otherwise have nowhere to load."
+            )
+
+        model = Glm5NextVLModel(
+            self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
+        )
+        if self.freeze_language_model or self.freeze_vision_model or self.freeze_vision_projection:
+            model.freeze(
+                freeze_language_model=self.freeze_language_model,
+                freeze_vision_model=self.freeze_vision_model,
+                freeze_vision_projection=self.freeze_vision_projection,
+            )
+        return model
+
+    def provide_language_model(self, pre_process=None, post_process=None, vp_stage=None):
+        """Build only the Megatron language backbone, for the VL model to wrap."""
+        return MLAModelProvider.provide(
+            self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
+        )

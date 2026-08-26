@@ -12,17 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GLM-5.3-Flash (``glm5_next``) language backbone."""
+"""GLM-5.3-Flash (``glm5_next``): hybrid KDA/MLA-DSA backbone plus vision tower."""
 
 from megatron.bridge.models.glm5_next.glm5_next_bridge import Glm5NextBridge
 from megatron.bridge.models.glm5_next.glm5_next_kpool import Glm5NextKPoolIndexer
-from megatron.bridge.models.glm5_next.glm5_next_provider import Glm5NextModelProvider
+from megatron.bridge.models.glm5_next.glm5_next_provider import (
+    Glm5NextModelProvider,
+    Glm5NextVLModelProvider,
+)
 from megatron.bridge.models.glm5_next.glm5_next_spec import build_glm5_next_spec
+from megatron.bridge.models.glm5_next.glm5_next_vl_model import Glm5NextVLModel
 
 
 __all__ = [
     "Glm5NextBridge",
     "Glm5NextKPoolIndexer",
     "Glm5NextModelProvider",
+    "Glm5NextVLModel",
+    "Glm5NextVLModelProvider",
     "build_glm5_next_spec",
 ]

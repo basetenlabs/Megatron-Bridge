@@ -53,6 +53,46 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer, fused_qk_topk_naive
 
 
+def visible_tail_indices(
+    queries: int,
+    index_kpool: int,
+    seqlen: int,
+    device=None,
+    dtype=torch.long,
+) -> torch.Tensor:
+    """Per-query indices of the visible tokens no *complete* pool covers.
+
+    Complete pools cover the first ``floor(visible / index_kpool) * index_kpool`` visible
+    tokens, so the trailing ``visible % index_kpool`` are unreachable through pool
+    selection. Mirrors HF's ``append_visible_tail``::
+
+        tail_count = visible % index_kpool
+        tail_start = visible - tail_count
+        tail       = tail_start + [0 .. index_kpool - 2], while offset < tail_count
+
+    With no left padding a query at position ``t`` sees ``t + 1`` tokens.
+
+    The query's own token is included, which is the point: it is causally visible, and at
+    ``t % index_kpool == 0`` it belongs to no complete pool. Masking to positions strictly
+    before ``t`` instead leaves such a query with no guaranteed index at all -- every slot
+    ``-1`` at ``t = 0`` -- so reaching itself would depend on the top-k happening to pick
+    its own partly-future pool.
+
+    Returns:
+        ``[queries, index_kpool - 1]`` token indices, ``-1`` for unused slots.
+    """
+    positions = torch.arange(queries, device=device, dtype=dtype)
+    visible = positions + 1
+    tail_count = visible % index_kpool
+    tail_start = visible - tail_count
+    offsets = torch.arange(index_kpool - 1, device=device, dtype=dtype)
+
+    tail = tail_start[:, None] + offsets[None, :]
+    # Drop slots that exist only to pad the fixed width, and anything past the end.
+    tail = tail.masked_fill(offsets[None, :] >= tail_count[:, None], -1)
+    return tail.masked_fill(tail >= seqlen, -1)
+
+
 class Glm5NextKPoolIndexer(DSAIndexer):
     """DSA indexer with learned key pooling, as GLM-5.3 uses it.
 
@@ -202,35 +242,6 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         return token_indices[..., :width].to(torch.int32)
 
     def _visible_tail(self, batch: int, queries: int, seqlen: int, device, dtype) -> torch.Tensor:
-        """The visible tokens that no *complete* pool covers.
-
-        Complete pools cover the first ``floor(visible / index_kpool) * index_kpool``
-        visible tokens, so the trailing ``visible % index_kpool`` are unreachable through
-        pool selection and are appended as raw indices. That is what
-        ``index_kpool_always_select_tail`` guarantees, and it mirrors HF's
-        ``append_visible_tail``::
-
-            tail_count = visible % index_kpool
-            tail_start = visible - tail_count
-            tail       = tail_start + [0 .. index_kpool - 2], while offset < tail_count
-
-        With no left padding a query at position ``t`` sees ``t + 1`` tokens.
-
-        The query's own token is included, which is the whole point: it is causally
-        visible, and at ``t % index_kpool == 0`` it belongs to no complete pool. Masking
-        the tail to positions *strictly before* ``t`` instead leaves such a query with no
-        guaranteed index at all -- every slot ``-1`` at ``t = 0`` -- so reaching itself
-        would depend on the top-k happening to select its own partly-future pool.
-        """
-        positions = torch.arange(queries, device=device, dtype=dtype)
-        visible = positions + 1
-        tail_count = visible % self.index_kpool
-        tail_start = visible - tail_count
-        offsets = torch.arange(self.index_kpool - 1, device=device, dtype=dtype)
-
-        tail = tail_start[:, None] + offsets[None, :]
-        # Drop slots that exist only to pad the fixed width, and anything past the end.
-        tail = tail.masked_fill(offsets[None, :] >= tail_count[:, None], -1)
-        tail = tail.masked_fill(tail >= seqlen, -1)
-
+        """Broadcast :func:`visible_tail_indices` across the batch."""
+        tail = visible_tail_indices(queries, self.index_kpool, seqlen, device=device, dtype=dtype)
         return tail[None].expand(batch, queries, self.index_kpool - 1).contiguous()
