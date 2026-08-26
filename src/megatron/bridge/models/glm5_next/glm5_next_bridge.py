@@ -150,6 +150,9 @@ class Glm5NextBridge(MegatronModelBridge):
         provider.dsa_indexer_use_sparse_loss = False
         provider.dsa_kernel_backend = "cudnn"
         provider.cp_comm_type = "allgather"
+        # KPool derives sequence-local pool boundaries from packed cu_seqlens,
+        # including when context parallelism is one.
+        provider.requires_packed_sequence = True
 
         provider.enable_mhc_connections = True
         provider.mhc_num_residual_streams = config.hc_mult

@@ -89,6 +89,7 @@ def test_provider_preserves_full_hybrid_sparse_moe_contract(pretrained):
     assert provider.moe_router_topk == 8
     assert provider.dsa_indexer_topk == 2048
     assert provider.kv_channels == 256
+    assert provider.requires_packed_sequence is True
     assert provider.enable_mhc_connections is True
     assert provider.mhc_num_residual_streams == 4
     assert provider.mtp_num_layers is None
