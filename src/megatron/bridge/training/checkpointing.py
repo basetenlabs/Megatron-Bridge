@@ -30,7 +30,7 @@ from functools import partial
 from logging import getLogger
 from pathlib import Path
 from time import time
-from typing import Any, Callable, Literal, Optional, Protocol, Union, runtime_checkable
+from typing import Any, Callable, Literal, Mapping, NamedTuple, Optional, Protocol, Union, runtime_checkable
 
 import numpy as np
 import torch
@@ -69,6 +69,7 @@ from modelopt.torch.opt.plugins import (
     save_modelopt_state,
     save_sharded_modelopt_state,
 )
+from torch.distributed.checkpoint.metadata import STORAGE_TYPES
 from torch.distributed.tensor import DTensor
 
 from megatron.bridge.peft.base import PEFT
@@ -697,6 +698,65 @@ def _match_rng_state_metadata(
         global_offset=stored.global_offset,
         replica_id=dp_rank if len(stored.global_offset) == 2 else 0,
     )
+
+class StateToLoad(NamedTuple):
+    """One checkpoint section's load decision.
+
+    ``ignore`` suppresses the restore; ``state`` is what to request from the
+    checkpoint, or None when the section is being skipped.
+    """
+
+    ignore: bool
+    state: ShardedStateDict | ShardedObject | None
+
+
+def resolve_state_to_load(
+    kind: str,
+    sharded_state: ShardedStateDict | ShardedObject | None,
+    state_dict_metadata: Mapping[str, STORAGE_TYPES],
+) -> StateToLoad:
+    """Decide whether ``kind`` state can be loaded from this checkpoint.
+
+    Collective: every rank must call this, or the reduce below hangs.
+
+    ``ShardedObject.unique_key`` embeds the global shape, so an object sharded
+    over a dimension that changed since the save is unreadable: every rank asks
+    for a key the checkpoint does not contain. Reduced with MIN so all ranks
+    reach the same decision even if the checkpoint is partially written.
+
+    Args:
+        kind: Name of the section, for the log line.
+        sharded_state: The state this run would request -- a bare ShardedObject
+            or a sharded state dict containing some. ``None`` when the caller already decided not
+            to load, which passes straight through.
+        state_dict_metadata: The checkpoint's ``state_dict_metadata``. Only its
+            keys are consulted; empty means "cannot verify", which loads.
+
+    Returns:
+        A :class:`StateToLoad`: the state itself when every shard is present,
+        otherwise ``ignore=True`` with no state.
+    """
+    if sharded_state is None:
+        return StateToLoad(ignore=True, state=None)
+
+    if isinstance(sharded_state, ShardedObject):
+        objects = [sharded_state]
+    else:
+        objects = [v for v in nested_values(sharded_state) if isinstance(v, ShardedObject)]
+
+    present = not state_dict_metadata or all(obj.unique_key in state_dict_metadata for obj in objects)
+
+    if torch.distributed.is_initialized():
+        device = "cuda" if torch.distributed.get_backend() == "nccl" else "cpu"
+        vote = torch.tensor([1 if present else 0], dtype=torch.int, device=device)
+        torch.distributed.all_reduce(vote, op=torch.distributed.ReduceOp.MIN)
+        present = bool(vote.item())
+
+    if present:
+        return StateToLoad(ignore=False, state=sharded_state)
+
+    print_rank_0(f"checkpoint {kind} shards do not match this parallel layout: {kind} state will be ignored")
+    return StateToLoad(ignore=True, state=None)
 
 
 class CheckpointType(Enum):
@@ -3046,17 +3106,33 @@ def _load_checkpoint_from_path(
                 ignore_optimizer_state = True
                 print_rank_0("Optimizer state was not saved in the torch-dist checkpoint; using a fresh optimizer")
 
+        # Rerun state is sharded by world size, which run_config.yaml does not
+        # record, so consult the checkpoint's own metadata.
+        if ckpt_type == CheckpointType.LOCAL:
+            state_dict_metadata = {}  # local checkpoints always resume with the same parallelism
+        else:
+            reader = _get_filesystem_reader(checkpoint_name)
+            try:
+                state_dict_metadata = reader.read_metadata().state_dict_metadata
+            except FileNotFoundError:
+                state_dict_metadata = {}
+
         # Determine if rerun state will be loaded
         if tp_pp_match and not release and not cfg.checkpoint.finetune and "rerun_state_machine" in state_dict:
             rerun_state_machine = get_rerun_state_machine()
-            gen_sd_rerun_state = rerun_state_machine.state_dict(
+            candidate_rerun_state = rerun_state_machine.state_dict(
                 data_iterator=None, ckpt_format=ckpt_format, force=True
             )
-            ignore_rerun_state = False
         else:
-            gen_sd_rerun_state = None
-            if not tp_pp_match:
-                print_rank_0("{}: Rerun state will be ignored".format(mismatch_msg))
+            candidate_rerun_state = None
+            print_rank_0(
+                "{}: Rerun state will be ignored".format(mismatch_msg)
+                if not tp_pp_match
+                else "Rerun state will not be loaded"
+            )
+        ignore_rerun_state, gen_sd_rerun_state = resolve_state_to_load(
+            "Rerun", candidate_rerun_state, state_dict_metadata
+        )
 
         if sharded_sd_metadata is None:
             sharded_sd_metadata = {}
