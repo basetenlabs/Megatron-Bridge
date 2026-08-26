@@ -160,11 +160,6 @@ class Glm5NextBridge(MegatronModelBridge):
         provider.enable_mhc_connections = True
         provider.mhc_num_residual_streams = config.hc_mult
         provider.mhc_sinkhorn_iterations = config.hc_sinkhorn_iters
-        # Bound unified mHC recompute graphs. A single graph across all 45
-        # heterogeneous layers can reach saved tensors after an earlier
-        # checkpoint backward has released them; two-layer blocks are the
-        # backward-tested MCore configuration and retain the memory benefit.
-        provider.mhc_recompute_layer_num = 2
         provider.mtp_num_layers = None
 
         first_dense = config.first_k_dense_replace
