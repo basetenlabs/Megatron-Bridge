@@ -53,6 +53,22 @@ This builds on ``get_transformer_block_with_experimental_attention_variant_spec`
 This mirrors the arrangement qualified on B200 in the GLM-5.3-Flash bring-up
 (``dev_job/model_bringup_hooks/glm53_flash/trainer_block.py`` in the trainers repo),
 which preserves production mHC/MoE construction and replaces only the DSA attention.
+
+Hyper-connections
+-----------------
+Every layer is built as ``HyperConnectionTransformerLayer`` with both hyper-connection
+sites populated. GLM-5.3's residual stream is manifold-constrained hyper-connections, so
+a model without them is a different architecture rather than a slower one.
+
+Megatron-Core's own layer is used rather than a hand-rolled equivalent because the mHC
+residual commit is not the whole feature: that layer also implements mHC activation
+recompute (``mhc_recompute_layer_num``), selective layernorm recompute, activation
+offload, and the CUDA-graph kwarg threading that ``TransformerBlock`` relies on when it
+passes ``mhc_recompute_manager``. Reimplementing the commit alone would quietly drop all
+of it.
+
+This requires a Megatron-Core whose ``HyperConnectionTransformerLayer`` does not reject
+MoE layers -- GLM-5.3 is 42 MoE layers of 45. See the pinned ``3rdparty/Megatron-LM``.
 """
 
 import copy
@@ -60,11 +76,12 @@ import copy
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
 )
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+from megatron.core.transformer.transformer_layer import HyperConnectionTransformerLayer, get_transformer_layer_offset
 
 from megatron.bridge.models.glm5_next.glm5_next_kpool import Glm5NextKPoolIndexer
-from megatron.bridge.models.glm5_next.glm5_next_layers import Glm5NextLinearAttention, Glm5NextTransformerLayer
+from megatron.bridge.models.glm5_next.glm5_next_layers import Glm5NextLinearAttention
 
 
 def _install_kpool_indexer(attention_spec) -> None:
@@ -104,6 +121,10 @@ def build_glm5_next_spec(config, vp_stage=None, pp_rank=None):
         ``TransformerBlockSubmodules`` whose per-layer ``self_attention`` is KDA or
         MLA+DSA according to ``config.glm5_next_kda_layers``.
     """
+    if (config.pipeline_model_parallel_size or 1) != 1:
+        # The mHC layer carries n residual streams across the layer boundary, and the
+        # pipeline send/recv path has not been qualified for that wider hidden state.
+        raise ValueError("GLM-5.3 mHC currently requires pipeline_model_parallel_size=1")
     if config.virtual_pipeline_model_parallel_size is not None:
         # Same restriction Kimi K3 carries. Lifting it means resolving how the per-layer
         # KDA/DSA pattern maps onto interleaved virtual stages, which also interacts
@@ -152,9 +173,12 @@ def build_glm5_next_spec(config, vp_stage=None, pp_rank=None):
         layer_number = layer_offset + local_idx + 1
 
         # mHC wraps both sublayers of every layer, KDA and DSA alike. Megatron-Core's
-        # own HyperConnectionTransformerLayer cannot be used here because it refuses MoE
-        # layers, which is 42 of GLM-5.3's 45 -- see Glm5NextTransformerLayer.
-        layer_spec.module = Glm5NextTransformerLayer
+        # own layer is used rather than a hand-rolled one so that mHC activation
+        # recompute, selective layernorm recompute, activation offload and the
+        # CUDA-graph kwarg handling all come with it -- see the module docstring.
+        layer_spec.module = HyperConnectionTransformerLayer
+        layer_spec.submodules.self_attention_hyper_connection = HyperConnectionModule
+        layer_spec.submodules.mlp_hyper_connection = HyperConnectionModule
 
         if config.is_kda_layer(layer_number):
             dsa_spec = layer_spec.submodules.self_attention

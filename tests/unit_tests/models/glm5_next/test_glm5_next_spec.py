@@ -27,9 +27,11 @@ logic and the guards, not about Megatron-Core's spec builder.
 from types import SimpleNamespace
 
 import pytest
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.transformer_layer import HyperConnectionTransformerLayer
 
 from megatron.bridge.models.glm5_next import glm5_next_spec
-from megatron.bridge.models.glm5_next.glm5_next_layers import Glm5NextLinearAttention, Glm5NextTransformerLayer
+from megatron.bridge.models.glm5_next.glm5_next_layers import Glm5NextLinearAttention
 from megatron.bridge.models.glm5_next.glm5_next_spec import build_glm5_next_spec
 
 
@@ -54,6 +56,7 @@ def make_config(**overrides) -> _FakeConfig:
         glm5_next_kda_layers=KDA_LAYERS,
         experimental_attention_variant="dsa",
         multi_latent_attention=True,
+        pipeline_model_parallel_size=1,
         virtual_pipeline_model_parallel_size=None,
         normalization="RMSNorm",
     )
@@ -75,6 +78,8 @@ def _fake_layer_spec():
         submodules=SimpleNamespace(
             self_attention=_fake_dsa_spec(),
             input_layernorm="LayerNorm",
+            self_attention_hyper_connection=None,
+            mlp_hyper_connection=None,
         ),
     )
 
@@ -115,14 +120,16 @@ class TestLayerAssignment:
         # The 3:1 schedule puts DSA on every fourth layer starting at 4.
         assert dsa_at == [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44]
 
-    def test_every_layer_uses_the_mhc_layer(self, stub_megatron):
-        """Both KDA and DSA layers carry mHC.
+    def test_every_layer_carries_both_hyper_connection_sites(self, stub_megatron):
+        """mHC wraps attention and MLP on every layer, KDA and DSA alike.
 
-        Megatron-Core's own HyperConnectionTransformerLayer cannot be used: it refuses
-        MoE layers, which is 42 of GLM-5.3's 45.
+        Megatron-Core's own layer is used so mHC recompute, layernorm recompute,
+        activation offload and CUDA-graph kwarg handling come with it.
         """
         block = build_glm5_next_spec(make_config())
-        assert all(s.module is Glm5NextTransformerLayer for s in block.layer_specs)
+        assert all(s.module is HyperConnectionTransformerLayer for s in block.layer_specs)
+        assert all(s.submodules.self_attention_hyper_connection is HyperConnectionModule for s in block.layer_specs)
+        assert all(s.submodules.mlp_hyper_connection is HyperConnectionModule for s in block.layer_specs)
 
     def test_the_builders_input_layernorm_is_preserved(self, stub_megatron):
         """The variant builder already chose a norm valid for both attention kinds.
@@ -172,6 +179,11 @@ class TestLayerAssignment:
 
 
 class TestGuards:
+    def test_pipeline_parallelism_is_rejected(self, stub_megatron):
+        """mHC widens the hidden state to n streams; the PP send/recv path is unqualified."""
+        with pytest.raises(ValueError, match="pipeline_model_parallel_size=1"):
+            build_glm5_next_spec(make_config(pipeline_model_parallel_size=2))
+
     def test_virtual_pipeline_is_rejected(self, stub_megatron):
         with pytest.raises(ValueError, match="virtual pipeline"):
             build_glm5_next_spec(make_config(virtual_pipeline_model_parallel_size=2))
