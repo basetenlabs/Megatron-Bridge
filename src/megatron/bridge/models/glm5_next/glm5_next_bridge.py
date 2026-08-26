@@ -39,9 +39,134 @@ from megatron.bridge.models.conversion.param_mapping import (
 )
 from megatron.bridge.models.glm5_next.glm5_next_kda_mapping import Glm5NextKdaFusedMapping
 from megatron.bridge.models.glm5_next.glm5_next_mhc_mapping import mhc_mappings
+from megatron.bridge.models.glm5_next.glm5_next_mtp_mapping import mtp_eh_proj_mappings
 from megatron.bridge.models.glm5_next.glm5_next_provider import Glm5NextModelProvider
 from megatron.bridge.models.glm5_next.glm5_next_spec import build_glm5_next_spec
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+
+
+def _layer_mappings(megatron_layer: str, hf_layer: str) -> list:
+    """Every per-layer mapping, for one layer-name prefix pair.
+
+    Called once for the main decoder stack and again for each MTP layer, whose inner
+    transformer layer has the same shape. Wildcards make this safe across the hybrid
+    stack: a KDA-only name simply does not match on an MLA+DSA layer and vice versa, so
+    one set covers both -- including GLM-5.3's MTP layer, which is MLA+DSA.
+    """
+    megatron_attention = f"{megatron_layer}.self_attention"
+    hf_attention = f"{hf_layer}.self_attn"
+    indexer = f"{megatron_attention}.core_attention.indexer"
+
+    auto = [
+        (f"{megatron_layer}.input_layernorm.weight", f"{hf_layer}.input_layernorm.weight"),
+        (f"{megatron_layer}.pre_mlp_layernorm.weight", f"{hf_layer}.post_attention_layernorm.weight"),
+        # MLA. These names come from Megatron-Core's absorbed-MLA modules, which the
+        # DSA spec builds, so they match GLM-5.2's mapping.
+        (f"{megatron_attention}.linear_q_down_proj.weight", f"{hf_attention}.q_a_proj.weight"),
+        (f"{megatron_attention}.linear_q_up_proj.weight", f"{hf_attention}.q_b_proj.weight"),
+        (f"{megatron_attention}.linear_q_up_proj.layer_norm_weight", f"{hf_attention}.q_a_layernorm.weight"),
+        (f"{megatron_attention}.q_layernorm.weight", f"{hf_attention}.q_a_layernorm.weight"),
+        (f"{megatron_attention}.linear_kv_down_proj.weight", f"{hf_attention}.kv_a_proj_with_mqa.weight"),
+        (f"{megatron_attention}.linear_kv_up_proj.weight", f"{hf_attention}.kv_b_proj.weight"),
+        (f"{megatron_attention}.linear_kv_up_proj.layer_norm_weight", f"{hf_attention}.kv_a_layernorm.weight"),
+        (f"{megatron_attention}.kv_layernorm.weight", f"{hf_attention}.kv_a_layernorm.weight"),
+        (f"{megatron_attention}.linear_proj.weight", f"{hf_attention}.o_proj.weight"),
+        # DSA indexer, including GLM-5.3's two k-pool tensors.
+        (f"{indexer}.linear_wq_b.weight", f"{hf_attention}.indexer.wq_b.weight"),
+        (f"{indexer}.linear_wk.weight", f"{hf_attention}.indexer.wk.weight"),
+        (f"{indexer}.k_norm.weight", f"{hf_attention}.indexer.k_norm.weight"),
+        (f"{indexer}.k_norm.bias", f"{hf_attention}.indexer.k_norm.bias"),
+        (f"{indexer}.linear_weights_proj.weight", f"{hf_attention}.indexer.weights_proj.weight"),
+        (f"{indexer}.index_kpool_compress_ape", f"{hf_attention}.indexer.index_kpool_compress_ape"),
+        (f"{indexer}.index_kpool_compress_gate", f"{hf_attention}.indexer.index_kpool_compress_gate"),
+        # MoE router and experts.
+        (f"{megatron_layer}.mlp.router.weight", f"{hf_layer}.mlp.gate.weight"),
+        (f"{megatron_layer}.mlp.router.expert_bias", f"{hf_layer}.mlp.gate.e_score_correction_bias"),
+        (f"{megatron_layer}.mlp.experts.linear_fc2.weight*", f"{hf_layer}.mlp.experts.*.down_proj.weight"),
+        (
+            f"{megatron_layer}.mlp.experts.local_experts.*.linear_fc2.weight",
+            f"{hf_layer}.mlp.experts.*.down_proj.weight",
+        ),
+        (
+            f"{megatron_layer}.mlp.shared_experts.linear_fc2.weight",
+            f"{hf_layer}.mlp.shared_experts.down_proj.weight",
+        ),
+        (f"{megatron_layer}.mlp.linear_fc2.weight", f"{hf_layer}.mlp.down_proj.weight"),
+    ]
+
+    # KDA. Split by parallelism explicitly: these modules are not in AutoMapping's
+    # registry, so it cannot infer how they shard.
+    column_parallel = [
+        (f"{megatron_attention}.{name}", f"{hf_attention}.{name}")
+        for name in ("g_b_proj.weight",)
+    ]
+    column_parallel += [
+        (f"{megatron_attention}.f_b_proj.weight", f"{hf_attention}.f_b_proj.weight"),
+        (f"{megatron_attention}.A_log", f"{hf_attention}.A_log"),
+        (f"{megatron_attention}.dt_bias", f"{hf_attention}.dt_bias"),
+    ]
+    replicated = [
+        (f"{megatron_attention}.f_a_proj.weight", f"{hf_attention}.f_a_proj.weight"),
+        (f"{megatron_attention}.g_a_proj.weight", f"{hf_attention}.g_a_proj.weight"),
+        (f"{megatron_attention}.o_norm.weight", f"{hf_attention}.o_norm.weight"),
+    ]
+    row_parallel = [(f"{megatron_attention}.o_proj.weight", f"{hf_attention}.o_proj.weight")]
+
+    mappings = [
+        *(AutoMapping(megatron_param=m, hf_param=h) for m, h in auto),
+        *(ColumnParallelMapping(megatron_param=m, hf_param=h) for m, h in column_parallel),
+        *(ReplicatedMapping(megatron_param=m, hf_param=h) for m, h in replicated),
+        *(RowParallelMapping(megatron_param=m, hf_param=h) for m, h in row_parallel),
+        GatedMLPMapping(
+            megatron_param=f"{megatron_layer}.mlp.linear_fc1.weight",
+            gate=f"{hf_layer}.mlp.gate_proj.weight",
+            up=f"{hf_layer}.mlp.up_proj.weight",
+        ),
+        GatedMLPMapping(
+            megatron_param=f"{megatron_layer}.mlp.shared_experts.linear_fc1.weight",
+            gate=f"{hf_layer}.mlp.shared_experts.gate_proj.weight",
+            up=f"{hf_layer}.mlp.shared_experts.up_proj.weight",
+        ),
+        GatedMLPMapping(
+            megatron_param=f"{megatron_layer}.mlp.experts.linear_fc1.weight*",
+            gate=f"{hf_layer}.mlp.experts.*.gate_proj.weight",
+            up=f"{hf_layer}.mlp.experts.*.up_proj.weight",
+        ),
+        GatedMLPMapping(
+            megatron_param=f"{megatron_layer}.mlp.experts.local_experts.*.linear_fc1.weight",
+            gate=f"{hf_layer}.mlp.experts.*.gate_proj.weight",
+            up=f"{hf_layer}.mlp.experts.*.up_proj.weight",
+        ),
+    ]
+
+    # KDA's fused input projection and short convolution. Direction is the
+    # opposite of Qwen3-Next's: GLM-5.3 ships three per-projection tensors and
+    # Megatron-Core's KimiDeltaAttention keeps one fused tensor for each, so this
+    # concatenates 3 -> 1 while preserving per-component TP head sharding.
+    mappings += [
+        Glm5NextKdaFusedMapping(
+            megatron_param=f"{megatron_attention}.in_proj.weight",
+            q=f"{hf_attention}.q_proj.weight",
+            k=f"{hf_attention}.k_proj.weight",
+            v=f"{hf_attention}.v_proj.weight",
+        ),
+        Glm5NextKdaFusedMapping(
+            megatron_param=f"{megatron_attention}.conv1d.weight",
+            q=f"{hf_attention}.q_conv1d.weight",
+            k=f"{hf_attention}.k_conv1d.weight",
+            v=f"{hf_attention}.v_conv1d.weight",
+        ),
+        # Beta is its own module in Megatron-Core, one value per key head
+        # (b_proj [64, 4096] against beta_proj's num_key_heads).
+        ColumnParallelMapping(
+            megatron_param=f"{megatron_attention}.beta_proj.weight",
+            hf_param=f"{hf_attention}.b_proj.weight",
+        ),
+    ]
+
+    # mHC, one hyper-connection around attention and one around the MLP.
+    mappings += mhc_mappings(megatron_layer, hf_layer)
+    return mappings
 
 
 @MegatronModelBridge.register_bridge(
@@ -87,7 +212,34 @@ class Glm5NextBridge(MegatronModelBridge):
         provider.multi_latent_attention = True
         provider.hidden_dropout = 0.0
         provider.attention_softmax_in_fp32 = False
-        provider.mtp_num_layers = None  # MTP is unsupported, as for GLM-5.2.
+        # MTP. GLM-5.3 ships one predict layer (checkpoint layer 45), an MLA+DSA layer
+        # with its own MoE, mHC pair and indexer -- consistent with
+        # index_share_for_mtp_iteration. Enabled so those weights load and are carried
+        # through export rather than dropped on conversion.
+        #
+        # Verification limit: transformers has no MTP implementation for glm5_next, so
+        # unlike KDA / MLA / mHC there is no HF reference to check MTP numerics against.
+        # mtp_loss_scaling_factor is therefore the knob to zero for any run whose
+        # measured quantity must not be perturbed by an unverified auxiliary loss.
+        provider.mtp_num_layers = cfg.num_nextn_predict_layers or None
+        if provider.mtp_num_layers:
+            # The MTP layer is MLA+DSA, but the decoder stack ends on a KDA layer
+            # (index 44, since KDA is idx % 4 != 3), and Megatron-Core copies the last
+            # layer's spec by default. Point it at a DSA layer instead. Take the *last*
+            # one (44): any DSA layer has the right shape, but Megatron-Core resolves
+            # the source layer within the pipeline stage that owns the MTP block, so the
+            # latest one is the one most likely to live on that stage under PP > 1.
+            dsa_layers = [
+                number
+                for number in range(1, cfg.num_hidden_layers + 1)
+                if not provider.is_kda_layer(number)
+            ]
+            if not dsa_layers:
+                raise ValueError(
+                    "GLM-5.3 has no MLA+DSA layer to model the MTP layer on; the KDA "
+                    "schedule covers the whole stack, which contradicts layer_types."
+                )
+            provider.mtp_source_layer_number = dsa_layers[-1]
 
         # Clamped SwiGLU. NOTE: activation_func_clamp_value is documented as applying to
         # MoE layers; GLM-5.3's first three layers are dense and also clamp. Verify the
@@ -228,132 +380,54 @@ class Glm5NextBridge(MegatronModelBridge):
     def mapping_registry(self) -> MegatronMappingRegistry:
         """Map GLM-5.3's parameters between HF and Megatron layouts.
 
-        Wildcards are safe across the hybrid stack: a mapping resolves against the
-        parameters that actually exist, so a KDA-only name simply does not match on an
-        MLA+DSA layer and vice versa. Kimi K3 relies on the same property.
-
-        NOT COMPLETE. The MLA, DSA-indexer, MoE and embedding groups below are the ones
-        whose Megatron-side names are settled. Three groups are still open and are
-        listed at the end rather than guessed at.
+        Per-layer mappings come from ``_layer_mappings``, applied to the decoder stack
+        and again to each MTP layer. Still open: quantization, noted at the end.
         """
-        megatron_layer = "decoder.layers.*"
-        hf_layer = "model.language_model.layers.*"
-        megatron_attention = f"{megatron_layer}.self_attention"
-        hf_attention = f"{hf_layer}.self_attn"
-        indexer = f"{megatron_attention}.core_attention.indexer"
-
-        auto = [
-            ("embedding.word_embeddings.weight", "model.language_model.embed_tokens.weight"),
-            ("output_layer.weight", "lm_head.weight"),
-            ("decoder.final_layernorm.weight", "model.language_model.norm.weight"),
-            (f"{megatron_layer}.input_layernorm.weight", f"{hf_layer}.input_layernorm.weight"),
-            (f"{megatron_layer}.pre_mlp_layernorm.weight", f"{hf_layer}.post_attention_layernorm.weight"),
-            # MLA. These names come from Megatron-Core's absorbed-MLA modules, which the
-            # DSA spec builds, so they match GLM-5.2's mapping.
-            (f"{megatron_attention}.linear_q_down_proj.weight", f"{hf_attention}.q_a_proj.weight"),
-            (f"{megatron_attention}.linear_q_up_proj.weight", f"{hf_attention}.q_b_proj.weight"),
-            (f"{megatron_attention}.linear_q_up_proj.layer_norm_weight", f"{hf_attention}.q_a_layernorm.weight"),
-            (f"{megatron_attention}.q_layernorm.weight", f"{hf_attention}.q_a_layernorm.weight"),
-            (f"{megatron_attention}.linear_kv_down_proj.weight", f"{hf_attention}.kv_a_proj_with_mqa.weight"),
-            (f"{megatron_attention}.linear_kv_up_proj.weight", f"{hf_attention}.kv_b_proj.weight"),
-            (f"{megatron_attention}.linear_kv_up_proj.layer_norm_weight", f"{hf_attention}.kv_a_layernorm.weight"),
-            (f"{megatron_attention}.kv_layernorm.weight", f"{hf_attention}.kv_a_layernorm.weight"),
-            (f"{megatron_attention}.linear_proj.weight", f"{hf_attention}.o_proj.weight"),
-            # DSA indexer, including GLM-5.3's two k-pool tensors.
-            (f"{indexer}.linear_wq_b.weight", f"{hf_attention}.indexer.wq_b.weight"),
-            (f"{indexer}.linear_wk.weight", f"{hf_attention}.indexer.wk.weight"),
-            (f"{indexer}.k_norm.weight", f"{hf_attention}.indexer.k_norm.weight"),
-            (f"{indexer}.k_norm.bias", f"{hf_attention}.indexer.k_norm.bias"),
-            (f"{indexer}.linear_weights_proj.weight", f"{hf_attention}.indexer.weights_proj.weight"),
-            (f"{indexer}.index_kpool_compress_ape", f"{hf_attention}.indexer.index_kpool_compress_ape"),
-            (f"{indexer}.index_kpool_compress_gate", f"{hf_attention}.indexer.index_kpool_compress_gate"),
-            # MoE router and experts.
-            (f"{megatron_layer}.mlp.router.weight", f"{hf_layer}.mlp.gate.weight"),
-            (f"{megatron_layer}.mlp.router.expert_bias", f"{hf_layer}.mlp.gate.e_score_correction_bias"),
-            (f"{megatron_layer}.mlp.experts.linear_fc2.weight*", f"{hf_layer}.mlp.experts.*.down_proj.weight"),
-            (
-                f"{megatron_layer}.mlp.experts.local_experts.*.linear_fc2.weight",
-                f"{hf_layer}.mlp.experts.*.down_proj.weight",
-            ),
-            (
-                f"{megatron_layer}.mlp.shared_experts.linear_fc2.weight",
-                f"{hf_layer}.mlp.shared_experts.down_proj.weight",
-            ),
-            (f"{megatron_layer}.mlp.linear_fc2.weight", f"{hf_layer}.mlp.down_proj.weight"),
-        ]
-
-        # KDA. Split by parallelism explicitly: these modules are not in AutoMapping's
-        # registry, so it cannot infer how they shard.
-        column_parallel = [
-            (f"{megatron_attention}.{name}", f"{hf_attention}.{name}")
-            for name in ("g_b_proj.weight",)
-        ]
-        column_parallel += [
-            (f"{megatron_attention}.f_b_proj.weight", f"{hf_attention}.f_b_proj.weight"),
-            (f"{megatron_attention}.A_log", f"{hf_attention}.A_log"),
-            (f"{megatron_attention}.dt_bias", f"{hf_attention}.dt_bias"),
-        ]
-        replicated = [
-            (f"{megatron_attention}.f_a_proj.weight", f"{hf_attention}.f_a_proj.weight"),
-            (f"{megatron_attention}.g_a_proj.weight", f"{hf_attention}.g_a_proj.weight"),
-            (f"{megatron_attention}.o_norm.weight", f"{hf_attention}.o_norm.weight"),
-        ]
-        row_parallel = [(f"{megatron_attention}.o_proj.weight", f"{hf_attention}.o_proj.weight")]
-
         mappings = [
-            *(AutoMapping(megatron_param=m, hf_param=h) for m, h in auto),
-            *(ColumnParallelMapping(megatron_param=m, hf_param=h) for m, h in column_parallel),
-            *(ReplicatedMapping(megatron_param=m, hf_param=h) for m, h in replicated),
-            *(RowParallelMapping(megatron_param=m, hf_param=h) for m, h in row_parallel),
-            GatedMLPMapping(
-                megatron_param=f"{megatron_layer}.mlp.linear_fc1.weight",
-                gate=f"{hf_layer}.mlp.gate_proj.weight",
-                up=f"{hf_layer}.mlp.up_proj.weight",
+            AutoMapping(
+                megatron_param="embedding.word_embeddings.weight",
+                hf_param="model.language_model.embed_tokens.weight",
             ),
-            GatedMLPMapping(
-                megatron_param=f"{megatron_layer}.mlp.shared_experts.linear_fc1.weight",
-                gate=f"{hf_layer}.mlp.shared_experts.gate_proj.weight",
-                up=f"{hf_layer}.mlp.shared_experts.up_proj.weight",
-            ),
-            GatedMLPMapping(
-                megatron_param=f"{megatron_layer}.mlp.experts.linear_fc1.weight*",
-                gate=f"{hf_layer}.mlp.experts.*.gate_proj.weight",
-                up=f"{hf_layer}.mlp.experts.*.up_proj.weight",
-            ),
-            GatedMLPMapping(
-                megatron_param=f"{megatron_layer}.mlp.experts.local_experts.*.linear_fc1.weight",
-                gate=f"{hf_layer}.mlp.experts.*.gate_proj.weight",
-                up=f"{hf_layer}.mlp.experts.*.up_proj.weight",
+            AutoMapping(megatron_param="output_layer.weight", hf_param="lm_head.weight"),
+            AutoMapping(
+                megatron_param="decoder.final_layernorm.weight",
+                hf_param="model.language_model.norm.weight",
             ),
         ]
+        mappings += _layer_mappings("decoder.layers.*", "model.language_model.layers.*")
 
-        # KDA's fused input projection and short convolution. Direction is the
-        # opposite of Qwen3-Next's: GLM-5.3 ships three per-projection tensors and
-        # Megatron-Core's KimiDeltaAttention keeps one fused tensor for each, so this
-        # concatenates 3 -> 1 while preserving per-component TP head sharding.
-        mappings += [
-            Glm5NextKdaFusedMapping(
-                megatron_param=f"{megatron_attention}.in_proj.weight",
-                q=f"{hf_attention}.q_proj.weight",
-                k=f"{hf_attention}.k_proj.weight",
-                v=f"{hf_attention}.v_proj.weight",
-            ),
-            Glm5NextKdaFusedMapping(
-                megatron_param=f"{megatron_attention}.conv1d.weight",
-                q=f"{hf_attention}.q_conv1d.weight",
-                k=f"{hf_attention}.k_conv1d.weight",
-                v=f"{hf_attention}.v_conv1d.weight",
-            ),
-            # Beta is its own module in Megatron-Core, one value per key head
-            # (b_proj [64, 4096] against beta_proj's num_key_heads).
-            ColumnParallelMapping(
-                megatron_param=f"{megatron_attention}.beta_proj.weight",
-                hf_param=f"{hf_attention}.b_proj.weight",
-            ),
-        ]
-
-        # mHC, one hyper-connection around attention and one around the MLP.
-        mappings += mhc_mappings(megatron_layer, hf_layer)
+        # MTP. GLM-5.3 appends its predict layers after the main stack, so MTP layer i
+        # is checkpoint layer num_hidden_layers + i -- 45, for the single shipped layer.
+        text_config = self.hf_config.text_config
+        num_mtp_layers = getattr(text_config, "num_nextn_predict_layers", 0) or 0
+        num_transformer_layers = text_config.num_hidden_layers
+        for mtp_layer in range(num_mtp_layers):
+            megatron_mtp = f"mtp.layers.{mtp_layer}"
+            hf_mtp = f"model.language_model.layers.{mtp_layer + num_transformer_layers}"
+            mappings += [
+                AutoMapping(
+                    megatron_param=f"{megatron_mtp}.enorm.weight",
+                    hf_param=f"{hf_mtp}.enorm.weight",
+                ),
+                AutoMapping(
+                    megatron_param=f"{megatron_mtp}.hnorm.weight",
+                    hf_param=f"{hf_mtp}.hnorm.weight",
+                ),
+                # Megatron-Core calls the MTP output norm final_layernorm; HF calls it
+                # shared_head.norm, as for GLM-5.2.
+                AutoMapping(
+                    megatron_param=f"{megatron_mtp}.final_layernorm.weight",
+                    hf_param=f"{hf_mtp}.shared_head.norm.weight",
+                ),
+                # mHC is on, so Megatron-Core wants e_proj/h_proj rather than the fused
+                # eh_proj GLM-5.3 ships.
+                *mtp_eh_proj_mappings(megatron_mtp, hf_mtp),
+            ]
+            # Megatron-Core has spelled the MTP layer's inner transformer layer both
+            # ways across versions; register both and the absent one simply never
+            # matches.
+            for layer_prefix in ("transformer_layer", "mtp_model_layer"):
+                mappings += _layer_mappings(f"{megatron_mtp}.{layer_prefix}", hf_mtp)
 
         # STILL OPEN -- deliberately absent rather than guessed:
         #
