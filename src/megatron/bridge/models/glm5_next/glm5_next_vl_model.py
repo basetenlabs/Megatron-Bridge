@@ -171,8 +171,18 @@ class Glm5NextVLModel(MegatronModule):
 
         # No mRoPE step: GLM-5.3 is NoPE, so position_ids need no vision-aware
         # reconstruction and are passed through as given.
+        #
+        # input_ids are forwarded even though the embeddings are already computed.
+        # GPTModel skips its own embedding whenever decoder_input is given
+        # (``if decoder_input is not None: pass``), so they are not used twice -- but MTP
+        # needs them: _postprocess hands input_ids to self.mtp, which rolls them by one
+        # position to build its next-next-token targets. Passing None there, as the
+        # GLM-4.5V model does, raises
+        # ``roll(): argument 'input' must be Tensor, not NoneType`` as soon as MTP is
+        # enabled. GLM-4.5V never hits it because it does not enable MTP; GLM-5.3 ships
+        # a predict layer, so vision and MTP have to coexist.
         return self.language_model.forward(
-            input_ids=None,
+            input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
             decoder_input=inputs_embeds,
