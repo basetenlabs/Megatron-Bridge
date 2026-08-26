@@ -63,7 +63,29 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
+from megatron.bridge.models.glm5_next.glm5_next_kpool import Glm5NextKPoolIndexer
 from megatron.bridge.models.glm5_next.glm5_next_layers import Glm5NextLinearAttention
+
+
+def _install_kpool_indexer(attention_spec) -> None:
+    """Point a DSA attention spec at GLM-5.3's k-pool indexer.
+
+    Only the indexer *class* is replaced; its submodules (the two projections, the key
+    norm and the weights projection) are what ``Glm5NextKPoolIndexer`` inherits and
+    still needs, so they are left exactly as the variant builder created them.
+
+    Mutating in place is safe because the caller works on a per-layer deep copy.
+    """
+    try:
+        indexer_spec = attention_spec.submodules.core_attention.submodules.indexer
+    except AttributeError as error:
+        raise ValueError(
+            "expected a DSA attention spec with core_attention.submodules.indexer; "
+            "Megatron-Core's DSA spec shape has changed and the k-pool indexer can no "
+            "longer be installed"
+        ) from error
+
+    indexer_spec.module = Glm5NextKPoolIndexer
 
 
 def build_glm5_next_spec(config, vp_stage=None, pp_rank=None):
@@ -135,6 +157,8 @@ def build_glm5_next_spec(config, vp_stage=None, pp_rank=None):
                     "input_layernorm here before swapping the attention module."
                 )
             layer_spec.submodules.self_attention = kda_attention_spec
+        else:
+            _install_kpool_indexer(layer_spec.submodules.self_attention)
 
         layer_specs.append(layer_spec)
 
