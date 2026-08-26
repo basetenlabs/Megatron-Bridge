@@ -108,6 +108,16 @@ def test_attention_output_mapping_is_layer_specific(pretrained):
     assert dsa.megatron_param == "decoder.layers.3.self_attention.linear_proj.weight"
 
 
+def test_dense_mlp_fused_layernorm_maps_to_post_attention_norm(pretrained):
+    bridge = Glm5NextBridge()
+    bridge.provider_bridge(pretrained)
+    mapping = bridge.mapping_registry().megatron_to_hf_lookup(
+        "decoder.layers.0.mlp.linear_fc1.layer_norm_weight"
+    )
+
+    assert mapping.hf_param == "model.language_model.layers.0.post_attention_layernorm.weight"
+
+
 def test_layer_spec_keeps_full_block_and_selects_kpool_only_for_dsa(pretrained):
     provider = Glm5NextBridge().provider_bridge(pretrained)
     block = get_glm5_next_layer_spec(provider, pp_rank=0)

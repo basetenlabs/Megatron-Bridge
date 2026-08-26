@@ -198,6 +198,10 @@ class Glm5NextBridge(MegatronModelBridge):
             AutoMapping(
                 "decoder.layers.*.pre_mlp_layernorm.weight", f"{prefix}.layers.*.post_attention_layernorm.weight"
             ),
+            AutoMapping(
+                "decoder.layers.*.mlp.linear_fc1.layer_norm_weight",
+                f"{prefix}.layers.*.post_attention_layernorm.weight",
+            ),
             AutoMapping("decoder.layers.*.mlp.linear_fc2.weight", f"{prefix}.layers.*.mlp.down_proj.weight"),
             AutoMapping("decoder.layers.*.mlp.router.weight", f"{prefix}.layers.*.mlp.gate.weight"),
             AutoMapping(
