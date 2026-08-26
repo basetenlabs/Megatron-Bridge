@@ -22,8 +22,13 @@ GLM-5.3 interleaves two attention mechanisms in a single stack:
 Megatron-Core selects an experimental attention variant with one scalar per model
 (``experimental_attention_variant``), and its dispatch admits either *{linear attention
 mixed with standard attention}* or *{every layer the variant}* -- never *{KDA mixed with
-DSA}*. GLM-5.3 therefore leaves that scalar unset and assigns per-layer attention specs
-in :func:`~megatron.bridge.models.glm5_next.glm5_next_spec.build_glm5_next_spec`.
+DSA}*. GLM-5.3 therefore builds an all-DSA block and replaces attention on the KDA
+layers in :func:`~megatron.bridge.models.glm5_next.glm5_next_spec.build_glm5_next_spec`.
+
+Reference implementation for every HF-derived value here:
+``transformers/models/glm5_next/modular_glm5_next.py`` (cite the *modular* file --
+``modeling_glm5_next.py`` is generated from it). ``ref:`` line numbers are against
+transformers ``598d8ba`` and drift; the named symbol is the anchor.
 
 Only the language backbone is provided. The vision tower is out of scope, following the
 Kimi K3 precedent.
@@ -61,8 +66,10 @@ class Glm5NextModelProvider(MLAModelProvider):
 
     This is an architectural invariant rather than a tunable default: HF's
     ``Glm5NextTextConfig.validate_architecture`` rejects a nonzero RoPE dimension
-    outright, and ``validate_attention`` below rejects it here. Left at the MLA
-    default, every construction of this provider would fail that check.
+    outright (ref: modular:223 for the method, and the ``Expecting NoPE for the DSA
+    attention layers`` branch within it), and ``validate_attention`` below rejects it
+    here. Left at the MLA default, every construction of this provider would fail that
+    check.
     """
 
     # ----------------------------------------------------------------- layout
@@ -102,6 +109,8 @@ class Glm5NextModelProvider(MLAModelProvider):
     keys, selecting ``dsa_indexer_topk // index_kpool`` pools and expanding each winner
     back into raw token indices. This is the one genuinely new algorithm relative to
     GLM-5.2.
+
+    ref: modular:164-165 for the fields, modular:234-235 for the divisibility rule.
 
     Defaults to 4, the value in the ``zai-org/GLM-5.3-Flash`` checkpoint qualified on
     B200 (revision ``84c6a6aa9497188e15a635ba793b0f95a79b1033``, which allocates

@@ -126,6 +126,12 @@ def build_glm5_next_spec(config, vp_stage=None, pp_rank=None):
         config, vp_stage=vp_stage, pp_rank=pp_rank
     )
 
+    # The schedule itself comes from the checkpoint, not from this rule, but for the
+    # record: ref modular:171 Glm5NextTextConfig.__post_init__ derives the default
+    # layer_types as `linear_attention` where `idx % 4 != 3` and
+    # `deepseek_sparse_attention` otherwise, and normalizes a legacy `full_attention`
+    # spelling to `deepseek_sparse_attention` -- which is why the bridge keys on the
+    # latter string.
     kda_attention_spec = ModuleSpec(
         module=Glm5NextLinearAttention,
         # KDA does not fuse the input layernorm into its projections. The variant

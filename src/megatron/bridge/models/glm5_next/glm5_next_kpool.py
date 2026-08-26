@@ -14,6 +14,17 @@
 
 """k-pool index selection for the GLM-5.3 DSA indexer.
 
+Reference implementation
+------------------------
+``transformers/models/glm5_next/modular_glm5_next.py``, class ``Glm5NextTextIndexer``
+(modular:749), which subclasses ``GlmMoeDsaIndexer`` -- i.e. GLM-5.3's indexer *is*
+GLM-5.2's with pooling added, which is why subclassing ``DSAIndexer`` here mirrors the
+source's own structure rather than being a convenience.
+
+Cite the *modular* file, not ``modeling_glm5_next.py``: the latter is generated from it
+and carries a "do NOT edit" banner. Line numbers in the ``ref:`` comments are against
+transformers ``598d8ba`` and will drift; the symbol beside each one is the anchor.
+
 GLM-5.2 scores every key position and selects ``index_topk`` of them. GLM-5.3 groups
 keys into contiguous pools of ``index_kpool``, scores the *pools*, selects
 ``index_topk // index_kpool`` of them, and expands each winner back into its member
@@ -51,9 +62,11 @@ class Glm5NextKPoolIndexer(DSAIndexer):
     ``index_kpool_compress_ape``
         ``[index_kpool, index_head_dim]`` -- a learned position embedding over the slots
         *within* a pool, so pooling is order-aware.
+        ref: modular:768, and modular:960 where it is added to the gate logits.
     ``index_kpool_compress_gate``
         ``[index_head_dim, hidden_size]`` -- projects the hidden state to per-slot gate
         logits; a softmax over them gives each pool a learned weighted mean of its keys.
+        ref: modular:769 for the shape, modular:897 ``get_pooled_states`` for the use.
 
     Both are frozen at training time but must still load from the checkpoint.
     """
@@ -70,6 +83,8 @@ class Glm5NextKPoolIndexer(DSAIndexer):
             # Selection takes index_topk // index_kpool pools and expands each by
             # index_kpool, so a non-multiple would quietly select fewer tokens than
             # index_topk implies.
+            # ref: modular:234-235 -- Glm5NextTextConfig.validate_architecture raises on
+            # exactly this, so the constraint is the model's, not ours.
             raise ValueError(
                 f"dsa_indexer_topk ({self.index_topk}) must be divisible by glm5_next_index_kpool ({self.index_kpool})"
             )
@@ -126,8 +141,22 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         pools = seqlen // self.index_kpool
 
         # Per-slot gate logits, plus the learned within-pool position embedding, give a
-        # softmax over the members of each pool. Computed in fp32: the softmax is over
-        # only index_kpool entries, but it weights the keys the whole selection depends on.
+        # softmax over the members of each pool.
+        #
+        # ref: modular:897 get_pooled_states. Three details taken from there:
+        #   * modular:960 -- the APE is added to the gate logits *before* the softmax,
+        #     so it biases which slot in a pool dominates, rather than rescaling keys.
+        #   * modular:962 -- the softmax is taken in fp32 and cast back to the key
+        #     dtype afterwards (nan_to_num covers a fully-invalid pool). Kept here for
+        #     the same reason: it is only index_kpool
+        #     wide, but it weights the keys the entire selection then depends on.
+        #   * modular:965 -- the pooled key is the probability-weighted sum over the
+        #     pool's members, not a mean or a max.
+        #
+        # HF additionally starts pooling at the first *real* token (modular:938-945) so
+        # left padding does not shift every boundary. Megatron training sequences are
+        # not left-padded and packed batches are refused above, so pooling from index 0
+        # is equivalent here.
         gate = torch.nn.functional.linear(x, self.index_kpool_compress_gate)
         gate = gate.reshape(pools, self.index_kpool, batch, head_dim)
         logits = gate.float() + self.index_kpool_compress_ape.float()[None, :, None, :]
@@ -152,6 +181,11 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         """
         q, pooled_k, weights = self.forward_before_topk(x, qr, packed_seq_params)
 
+        # ref: modular:845 -- `select_k = min(self.index_topk // self.index_kpool, ...)`.
+        # The budget is in *pools*: index_topk is the token budget, and each selected
+        # pool expands to index_kpool tokens.
+        # ref: modular:824 -- scores get a ReLU before the per-head weighting, which is
+        # what dsa_indexer_scoring_relu selects on the Megatron side.
         _, pool_indices = fused_qk_topk_naive(
             q,
             pooled_k,
@@ -169,6 +203,13 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         Pool ``p`` covers tokens ``p * index_kpool ... p * index_kpool + index_kpool - 1``.
         Invalid pools (``-1``, emitted where a candidate was masked out) stay invalid
         across all of their slots.
+
+        ref: modular:854-862 -- HF gathers the member ids it stored per pool and flattens
+        ``[B, S, K, P] -> [B, S, K*P]``, masking the whole group where the pool was
+        invalid. Recomputing the ids arithmetically is equivalent because pools here are
+        fixed contiguous spans from index 0 (see ``forward_before_topk``).
+        ref: modular:873 -- ``-1`` is the source's own "unused slot" marker, which is why
+        the downstream mask scatter already treats negatives as invalid.
         """
         batch, queries, selected = pool_indices.shape
         device = pool_indices.device
@@ -198,6 +239,13 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         members are not yet causally visible and whose pooled key therefore cannot
         represent ``t`` itself. Those in-pool predecessors are appended directly so the
         most recent tokens are always reachable regardless of what the pool scores said.
+
+        ref: modular:972 ``append_visible_tail``, gated by ``index_kpool_always_select_tail``
+        at modular:866. HF computes the tail from the count of visible tokens
+        (``visible_count.remainder(index_kpool)``, modular:1005-1010) because its pools
+        start at the first real token; with pooling from index 0 the same span is
+        ``(t // kpool) * kpool ... t - 1``. modular:864-867 is where the output widens by
+        ``index_kpool - 1`` to make room for it.
         """
         positions = torch.arange(queries, device=device, dtype=dtype)
         pool_start = (positions // self.index_kpool) * self.index_kpool

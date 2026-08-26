@@ -14,6 +14,19 @@
 
 """KDA linear-attention layer for GLM-5.3-Flash.
 
+Reference implementation
+------------------------
+``transformers/models/glm5_next/modular_glm5_next.py``. Cite the *modular* file, not
+``modeling_glm5_next.py``: the latter is generated from it and carries a "do NOT edit"
+banner, so the modular file is where behaviour is actually defined.
+
+Line numbers in the ``ref:`` comments below are against transformers ``598d8ba``. They
+drift; the symbol named alongside each one is the stable anchor.
+
+The class this layer corresponds to is ``Glm5NextTextLinearAttention`` (modular:597),
+whose docstring calls it "Kimi-style KDA" -- which is why Kimi K3's implementation is
+the starting point rather than a coincidence.
+
 Only the **KDA half** of GLM-5.3's attention lives here. The MLA+DSA layers keep the
 spec Megatron-Core's experimental-variant block builder produces for them, unmodified
 -- see ``glm5_next_spec``. That asymmetry is deliberate: it keeps the sparse-attention
@@ -27,21 +40,24 @@ the layer is adapted from ``KimiK3Attention``'s KDA branch. Two structural diffe
 * This module is instantiated **only** for KDA layers, so it has no ``is_kda`` branch.
   ``KimiK3Attention`` is built for every layer and dispatches internally, because K3
   hand-rolls its MLA half too.
-* **The output gate is low-rank.** GLM-5.3 factors it through the head dimension
-  (``g_a_proj`` -> ``g_b_proj``), mirroring its forget gate. Kimi K3 uses a single
-  full-rank ``g_proj``.
+* **The output gate is low-rank** (ref: modular:633-634 for the projections, and
+  modular:742 ``gate = self.g_b_proj(self.g_a_proj(hidden_states))`` for the order).
+  GLM-5.3 factors it through the head dimension, mirroring its forget gate. Kimi K3
+  uses a single full-rank ``g_proj``.
 
 Two further differences are handled in the bridge's weight mapping rather than here,
 because they are layout choices rather than different math:
 
-* **HF fuses the short convolution.** ``Glm5NextTextLinearAttention`` holds one
+* **HF fuses the short convolution** (ref: modular:621 ``Glm5NextTextLinearAttention``
+  ``__init__``, ``conv_dim = qkv_dim * 3`` with ``groups=conv_dim``). It holds one
   depthwise ``conv1d`` over ``3 * qkv_dim`` channels covering q, k and v together. A
   depthwise convolution applies an independent kernel per channel, so three separate
   ``qkv_dim``-channel convolutions are numerically identical, and they shard cleanly by
   head under tensor parallelism where one fused convolution would not. We keep three;
   the bridge splits HF's fused weight three ways.
-* **HF nests the forget gate.** Its ``f_a_proj``, ``f_b_proj``, ``A_log`` and
-  ``dt_bias`` live on a ``forget_gate`` submodule. They are flat here, matching Kimi K3,
+* **HF nests the forget gate** (ref: modular:375 ``Glm5NextTextForgetGate``, built at
+  modular:630). Its ``f_a_proj``, ``f_b_proj``, ``A_log`` and ``dt_bias`` live on that
+  submodule. They are flat here, matching Kimi K3,
   so the bridge maps the nested names onto flat ones.
 
 .. note::
@@ -227,11 +243,17 @@ class Glm5NextLinearAttention(MegatronModule):
         # mirroring its forget gate; Kimi K3 uses a single full-rank g_proj instead.
         # The low-rank stage is small and unsharded, so g_a is replicated and only g_b
         # is column-parallel.
+        # ref: modular:633-634 -- g_a_proj is hidden_size -> head_dim and g_b_proj is
+        # head_dim -> qkv_dim, so the gate's rank is head_dim, not qkv_dim.
         self.g_a_proj = self._duplicated_linear(hidden_size, self.head_dim)
         self.g_b_proj = self._column_linear(self.head_dim, self.projection_size)
 
         # Kept in fp32: these feed the fused gate computation inside chunk_kda, where
         # bf16 rounding measurably changes the decay.
+        # ref: modular:389-399 Glm5NextTextForgetGate.forward does the whole gate in
+        # fp32 -- `g = (forget_gate.float() + self.dt_bias.float())` and
+        # `decay_rate = torch.exp(self.A_log.float())`. Storing these in bf16 here would
+        # round the inputs before that math ever runs.
         self.A_log = nn.Parameter(torch.empty(self.local_num_heads, dtype=torch.float32, device=device))
         self.dt_bias = nn.Parameter(torch.empty(self.local_projection_size, dtype=torch.float32, device=device))
         self._keep_in_float32_parameter_names = ("A_log", "dt_bias")
@@ -266,6 +288,11 @@ class Glm5NextLinearAttention(MegatronModule):
             # boundaries, silently mixing state between unrelated documents.
             raise ValueError("Packed KDA input requires cu_seqlens_q")
 
+        # ref: modular:655 (cat) and modular:698 (split) -- HF concatenates q, k and v
+        # and runs ONE depthwise conv1d over the result, then splits it back. Depthwise
+        # means one kernel per
+        # channel, so three convolutions over the three slices is the same arithmetic.
+        # It is split here only so the channels shard by head under TP.
         conv_kwargs = {"output_final_state": False, "cu_seqlens": cu_seqlens}
         q, _ = self.q_conv1d(x=_linear(self.q_proj, x), **conv_kwargs)
         k, _ = self.k_conv1d(x=_linear(self.k_proj, x), **conv_kwargs)
@@ -279,11 +306,22 @@ class Glm5NextLinearAttention(MegatronModule):
             "b s (h d) -> b s h d",
             h=self.local_num_heads,
         )
+        # ref: modular:710 -- `beta = torch.sigmoid(self.b_proj(hidden_states))`.
         beta = _linear(self.b_proj, x).float().sigmoid()
 
         # A_log and dt_bias are passed through so the kernel fuses them into the forget
         # gate. flash-linear-attention < 0.5.2 accepts and silently discards them,
         # training a different gate with nothing raised -- hence the pinned floor.
+        #
+        # ref: modular:709 -- HF takes the other route. It evaluates the gate
+        # in Python (`g = self.forget_gate(hidden_states)`) and hands the kernel only
+        # `g`. The kernel's safe-gate path should compute the same thing: modular:398-399
+        # is `lower_bound * sigmoid(decay_rate * g)`, which is exactly what
+        # `safe_gate=True, lower_bound=...` requests. That equivalence is asserted, not
+        # measured -- see the note in the module docstring.
+        #
+        # ref: modular:722 and :734 -- both HF kernel paths pass
+        # `use_qk_l2norm_in_kernel=True`, which kimi_k3_ops.kda also sets.
         output = kda(
             q,
             k,
@@ -296,6 +334,9 @@ class Glm5NextLinearAttention(MegatronModule):
             cu_seqlens=cu_seqlens,
         )
 
+        # ref: modular:742-743 -- the gate is projected from the *pre-attention* hidden
+        # state, not from the attention output, and is then consumed by the gated
+        # RMSNorm (modular:409 Glm5NextTextRMSNormGated, inherited from Qwen3.5).
         gate = rearrange(
             _linear(self.g_b_proj, _linear(self.g_a_proj, x)),
             "b s (h d) -> b s h d",
