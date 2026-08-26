@@ -22,6 +22,7 @@ from unittest.mock import Mock, mock_open, patch
 import numpy as np
 import pytest
 import torch
+from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.msc_utils import MultiStorageClientFeature
 
 from megatron.bridge.training.checkpointing import (
@@ -46,6 +47,7 @@ from megatron.bridge.training.checkpointing import (
     _record_dataloader_state_dir,
     _save_hf_adapter_weights,
     _save_hf_weights,
+    _select_dp_rng_state,  # noqa: E402
     checkpoint_exists,
     cleanup_old_non_persistent_checkpoint,
     create_checkpoint_manager,
@@ -62,6 +64,7 @@ from megatron.bridge.training.checkpointing import (
     maybe_load_dataloader_state,
     maybe_save_dataloader_state,
     read_metadata,
+    resolve_state_to_load,
     save_checkpoint,
 )
 from megatron.bridge.training.config import CheckpointConfig, ConfigContainer
@@ -373,6 +376,48 @@ class TestRNGState:
         assert rng_state["random_rng_state"] == "random_state"
         assert rng_state["np_rng_state"] == "np_state"
         assert rng_state["rng_tracker_states"] == "tracker_states"
+
+    @patch("megatron.bridge.training.checkpointing.get_pg_size", return_value=1)
+    @patch("megatron.bridge.training.checkpointing.tensor_parallel")
+    @patch("torch.distributed.all_gather_object")
+    @patch("torch.distributed.is_initialized", return_value=True)
+    @patch("torch.cuda.get_rng_state", return_value="cuda_state")
+    @patch("torch.get_rng_state", return_value="torch_state")
+    @patch("numpy.random.get_state", return_value="np_state")
+    @patch("random.getstate", return_value="random_state")
+    def test_get_rng_state_gathers_over_dp_when_context_parallelism_is_enabled(
+        self,
+        mock_random,
+        mock_np,
+        mock_torch,
+        mock_cuda,
+        mock_dist_init,
+        mock_all_gather,
+        mock_tp,
+        mock_get_pg_size,
+    ):
+        mock_tp.get_cuda_rng_tracker.return_value.get_states.return_value = "tracker_states"
+        mock_pg_collection = Mock()
+        mock_pg_collection.pp.rank.return_value = 0
+        mock_pg_collection.pp.size.return_value = 1
+        mock_pg_collection.tp.rank.return_value = 0
+        mock_pg_collection.tp.size.return_value = 1
+        mock_pg_collection.dp.rank.return_value = 1
+        mock_pg_collection.dp.size.return_value = 2
+        mock_pg_collection.dp_cp.rank.return_value = 3
+        mock_pg_collection.dp_cp.size.return_value = 4
+
+        result = get_rng_state(
+            data_parallel_random_init=True, ckpt_format="torch_dist", pg_collection=mock_pg_collection
+        )
+
+        assert len(result.data) == 2
+        mock_all_gather.assert_called_once()
+        gathered_states, gathered_state = mock_all_gather.call_args.args
+        assert len(gathered_states) == 2
+        assert gathered_state["random_rng_state"] == "random_state"
+        assert mock_all_gather.call_args.kwargs == {"group": mock_pg_collection.dp}
+        assert result.replica_id == 3
 
     @patch("megatron.bridge.training.checkpointing.get_pg_size")
     @patch("megatron.bridge.training.checkpointing.tensor_parallel")
@@ -5485,3 +5530,118 @@ class TestMaybeSaveDataloaderState:
             {"dataloader_state_dict": {"dummy_energon_state": "xyz"}}, expected_path
         )
         mock_torch_save.assert_not_called()
+
+
+class TestResolveStateToLoad:
+    """Tests for resolve_state_to_load.
+
+    Guards resuming at a different replica count. RNG state under expert
+    parallelism is sharded by (PP, TP, DP), so its storage key embeds the
+    data-parallel size; rerun state is sharded by world size. Neither can be
+    read back once that dimension changes.
+    """
+
+    @staticmethod
+    def _rng_state(pp_size: int, tp_size: int, dp_size: int, dp_rank: int = 0) -> ShardedObject:
+        """An RNG ShardedObject shaped the way get_rng_state builds it under EP > 1."""
+        return ShardedObject("rng_state", [None], (pp_size, tp_size, dp_size), (0, 0, dp_rank), replica_id=0)
+
+    def test_loads_when_layout_matches(self):
+        rng_state = self._rng_state(pp_size=1, tp_size=8, dp_size=8)
+        metadata = {"rng_state/shard_0.0.0_1.8.8": object()}
+
+        decision = resolve_state_to_load("RNG", rng_state, metadata)
+
+        assert decision.ignore is False
+        assert decision.state is rng_state
+        assert decision == (False, rng_state)  # still unpacks at the call sites
+
+    def test_ignored_when_data_parallel_size_changed(self):
+        """DP 8 -> 12 with TP/PP unchanged: the exact production failure."""
+        rng_state = self._rng_state(pp_size=1, tp_size=8, dp_size=12)
+        metadata = {f"rng_state/shard_0.{tp}.{dp}_1.8.8": object() for tp in range(8) for dp in range(8)}
+
+        assert rng_state.unique_key == "rng_state/shard_0.0.0_1.8.12"
+        assert resolve_state_to_load("RNG", rng_state, metadata) == (True, None)
+
+    def test_ignored_for_every_rank_not_just_the_new_ones(self):
+        """The global shape lives in the key suffix, so even dp_rank 0 misses."""
+        metadata = {f"rng_state/shard_0.0.{dp}_1.8.8": object() for dp in range(8)}
+
+        for dp_rank in range(12):
+            rng_state = self._rng_state(pp_size=1, tp_size=8, dp_size=12, dp_rank=dp_rank)
+            assert resolve_state_to_load("RNG", rng_state, metadata) == (True, None)
+
+    def test_nested_sharded_object_is_found(self):
+        """Rerun state nests its ShardedObject under a "sharded" key."""
+        rerun_state = {
+            "mode": "disabled",
+            "sharded": ShardedObject("rerun_state_machine_state", {}, (96,), (0,)),
+        }
+        matching = {"rerun_state_machine_state/shard_0_96": object()}
+        stale = {"rerun_state_machine_state/shard_0_64": object()}
+
+        assert resolve_state_to_load("Rerun", rerun_state, matching) == (False, rerun_state)
+        assert resolve_state_to_load("Rerun", rerun_state, stale) == (True, None)
+
+    def test_no_candidate_passes_through(self):
+        """None means the caller already decided not to load."""
+        assert resolve_state_to_load("RNG", None, {"anything": object()}) == (True, None)
+
+    def test_empty_metadata_preserves_existing_behavior(self):
+        """Unreadable or absent metadata must not silently disable loading."""
+        rng_state = self._rng_state(pp_size=1, tp_size=8, dp_size=12)
+
+        assert resolve_state_to_load("RNG", rng_state, {}) == (False, rng_state)
+
+    def test_state_without_sharded_objects_loads(self):
+        """Nothing to verify is not the same as something missing."""
+        metadata = {"rng_state/shard_0.0.0_1.8.8": object()}
+
+        assert resolve_state_to_load("Rerun", {"mode": "disabled"}, metadata) == (False, {"mode": "disabled"})
+
+
+class TestSelectDpRngState:
+    """Tests for _select_dp_rng_state.
+
+    Without expert parallelism the RNG key omits DP entirely (DP is a
+    ShardedObject replica_id), so a key-presence check cannot tell that the
+    payload was gathered at a different DP size. The count has to be checked.
+    """
+
+    @staticmethod
+    def _pg(dp_size: int, dp_rank: int):
+        pg = Mock()
+        pg.dp.size.return_value = dp_size
+        pg.dp.rank.return_value = dp_rank
+        return pg
+
+    def test_shared_state_ignores_dp_size(self):
+        """Without data_parallel_random_init the payload is one shared entry."""
+        payload = [{"tag": "shared"}]
+
+        got = _select_dp_rng_state(payload, self._pg(dp_size=8, dp_rank=5), False)
+
+        assert got == {"tag": "shared"}
+
+    def test_per_rank_state_selects_this_rank(self):
+        payload = [{"tag": i} for i in range(4)]
+
+        got = _select_dp_rng_state(payload, self._pg(dp_size=4, dp_rank=2), True)
+
+        assert got == {"tag": 2}
+
+    def test_per_rank_state_absent_when_dp_size_changed(self):
+        """Saved at DP=2, resumed at DP=4: no correct mapping, so skip."""
+        payload = [{"tag": 0}, {"tag": 1}]
+
+        got = _select_dp_rng_state(payload, self._pg(dp_size=4, dp_rank=3), True)
+
+        assert got is None
+
+    def test_per_rank_state_absent_when_dp_size_shrank(self):
+        payload = [{"tag": i} for i in range(8)]
+
+        got = _select_dp_rng_state(payload, self._pg(dp_size=2, dp_rank=1), True)
+
+        assert got is None

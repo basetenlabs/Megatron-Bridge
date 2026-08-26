@@ -28,12 +28,13 @@ from enum import Enum, auto
 from logging import getLogger
 from pathlib import Path
 from time import time
-from typing import Any, Callable, Literal, Optional, Protocol, Union, runtime_checkable
+from typing import Any, Callable, Literal, Mapping, NamedTuple, Optional, Protocol, Union, runtime_checkable
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from megatron.core import dist_checkpointing, tensor_parallel
+from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, ShardedTensor
 from megatron.core.dist_checkpointing.serialization import StateDict
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
@@ -60,6 +61,7 @@ from modelopt.torch.opt.plugins import (
     save_modelopt_state,
     save_sharded_modelopt_state,
 )
+from torch.distributed.checkpoint.metadata import STORAGE_TYPES
 from torch.distributed.tensor import DTensor
 
 from megatron.bridge.peft.base import PEFT
@@ -509,9 +511,9 @@ def get_rng_state(
     }
 
     rng_state_list = None
-    if torch.distributed.is_initialized() and pg_collection.dp_cp.size() > 1 and data_parallel_random_init:
-        rng_state_list = [None for i in range(pg_collection.dp_cp.size())]
-        torch.distributed.all_gather_object(rng_state_list, rng_state, group=pg_collection.dp_cp)
+    if torch.distributed.is_initialized() and pg_collection.dp.size() > 1 and data_parallel_random_init:
+        rng_state_list = [None for i in range(pg_collection.dp.size())]
+        torch.distributed.all_gather_object(rng_state_list, rng_state, group=pg_collection.dp)
     else:
         rng_state_list = [rng_state]
 
@@ -555,6 +557,91 @@ def get_rng_state(
         rng_state_list = {f"({pp_rank}, {tp_rank})": rng_state_list}
 
     return rng_state_list
+
+
+class StateToLoad(NamedTuple):
+    """One checkpoint section's load decision.
+
+    ``ignore`` suppresses the restore; ``state`` is what to request from the
+    checkpoint, or None when the section is being skipped.
+    """
+
+    ignore: bool
+    state: ShardedStateDict | ShardedObject | None
+
+
+def resolve_state_to_load(
+    kind: str,
+    sharded_state: ShardedStateDict | ShardedObject | None,
+    state_dict_metadata: Mapping[str, STORAGE_TYPES],
+) -> StateToLoad:
+    """Decide whether ``kind`` state can be loaded from this checkpoint.
+
+    Collective: every rank must call this, or the reduce below hangs.
+
+    ``ShardedObject.unique_key`` embeds the global shape, so an object sharded
+    over a dimension that changed since the save is unreadable: every rank asks
+    for a key the checkpoint does not contain. Reduced with MIN so all ranks
+    reach the same decision even if the checkpoint is partially written.
+
+    Args:
+        kind: Name of the section, for the log line ("RNG", "Rerun").
+        sharded_state: The state this run would request -- a bare ShardedObject
+            (what ``get_rng_state`` returns for torch_dist) or a sharded state
+            dict containing some. ``None`` when the caller already decided not
+            to load, which passes straight through.
+        state_dict_metadata: The checkpoint's ``state_dict_metadata``. Only its
+            keys are consulted; empty means "cannot verify", which loads.
+
+    Returns:
+        A :class:`StateToLoad`: the state itself when every shard is present,
+        otherwise ``ignore=True`` with no state.
+    """
+    if sharded_state is None:
+        return StateToLoad(ignore=True, state=None)
+
+    if isinstance(sharded_state, ShardedObject):
+        objects = [sharded_state]
+    else:
+        objects = [v for v in nested_values(sharded_state) if isinstance(v, ShardedObject)]
+
+    present = not state_dict_metadata or all(obj.unique_key in state_dict_metadata for obj in objects)
+
+    if torch.distributed.is_initialized():
+        device = "cuda" if torch.distributed.get_backend() == "nccl" else "cpu"
+        vote = torch.tensor([1 if present else 0], dtype=torch.int, device=device)
+        torch.distributed.all_reduce(vote, op=torch.distributed.ReduceOp.MIN)
+        present = bool(vote.item())
+
+    if present:
+        return StateToLoad(ignore=False, state=sharded_state)
+
+    print_rank_0(f"checkpoint {kind} shards do not match this parallel layout: {kind} state will be ignored")
+    return StateToLoad(ignore=True, state=None)
+
+
+def _select_dp_rng_state(
+    rng_state_list: list, pg_collection: ProcessGroupCollection, data_parallel_random_init: bool
+) -> dict | None:
+    """Pick this rank's entry out of a saved RNG payload, or None if it has none.
+
+    Without ``data_parallel_random_init`` the payload is a single shared entry
+    and any DP size can read it. With it, the payload holds one entry per DP
+    rank at save time, so a run at a different DP size has no correct mapping --
+    and the key alone cannot detect that, because without expert parallelism DP
+    is a ShardedObject ``replica_id`` rather than part of the key.
+    """
+    if not data_parallel_random_init:
+        return rng_state_list[0]
+
+    dp_size = pg_collection.dp.size()
+    if len(rng_state_list) != dp_size:
+        print_rank_0(
+            f"checkpoint holds {len(rng_state_list)} per-DP RNG states but this run has "
+            f"{dp_size} data-parallel ranks: RNG state will be ignored"
+        )
+        return None
+    return rng_state_list[pg_collection.dp.rank()]
 
 
 class CheckpointType(Enum):
@@ -2842,6 +2929,18 @@ def _load_checkpoint_from_path(
             tp_pp_match = ckpt_tp_pp == run_tp_pp
             mismatch_msg = "(TP, PP) mismatch after resume ({} vs {} from checkpoint)".format(run_tp_pp, ckpt_tp_pp)
 
+        # tp_pp_match is not the whole layout: RNG is sharded by (PP, TP, DP)
+        # under EP and rerun state by world size, and run_config.yaml records
+        # neither DP nor world size, so consult the checkpoint's own metadata.
+        if ckpt_type == CheckpointType.LOCAL:
+            state_dict_metadata = {}  # local checkpoints always resume with the same parallelism
+        else:
+            reader = _get_filesystem_reader(checkpoint_name)
+            try:
+                state_dict_metadata = reader.read_metadata().state_dict_metadata
+            except FileNotFoundError:
+                state_dict_metadata = {}
+
         # Determine if RNG state will be loaded
         if (
             tp_pp_match
@@ -2850,17 +2949,20 @@ def _load_checkpoint_from_path(
             and cfg.checkpoint.load_rng
             and run_config["checkpoint"]["save_rng"]
         ):
-            gen_sd_rng_state = get_rng_state(
+            candidate_rng_state = get_rng_state(
                 cfg.rng.data_parallel_random_init,
                 ckpt_format,
                 pg_collection=pg_collection,
                 module_name=module_name,
             )
         else:
-            ignore_rng_state = True
-            gen_sd_rng_state = None
-            if not tp_pp_match:
-                print_rank_0("{}: RNG state will be ignored".format(mismatch_msg))
+            candidate_rng_state = None
+            print_rank_0(
+                "{}: RNG state will be ignored".format(mismatch_msg)
+                if not tp_pp_match
+                else "RNG state will not be loaded"
+            )
+        ignore_rng_state, gen_sd_rng_state = resolve_state_to_load("RNG", candidate_rng_state, state_dict_metadata)
 
         if ckpt_type == CheckpointType.LOCAL:
             # Local checkpoints don't store content metadata in common.pt.
@@ -2907,14 +3009,19 @@ def _load_checkpoint_from_path(
         # Determine if rerun state will be loaded
         if tp_pp_match and not release and not cfg.checkpoint.finetune and "rerun_state_machine" in state_dict:
             rerun_state_machine = get_rerun_state_machine()
-            gen_sd_rerun_state = rerun_state_machine.state_dict(
+            candidate_rerun_state = rerun_state_machine.state_dict(
                 data_iterator=None, ckpt_format=ckpt_format, force=True
             )
-            ignore_rerun_state = False
         else:
-            gen_sd_rerun_state = None
-            if not tp_pp_match:
-                print_rank_0("{}: Rerun state will be ignored".format(mismatch_msg))
+            candidate_rerun_state = None
+            print_rank_0(
+                "{}: Rerun state will be ignored".format(mismatch_msg)
+                if not tp_pp_match
+                else "Rerun state will not be loaded"
+            )
+        ignore_rerun_state, gen_sd_rerun_state = resolve_state_to_load(
+            "Rerun", candidate_rerun_state, state_dict_metadata
+        )
 
         if sharded_sd_metadata is None:
             sharded_sd_metadata = {}
@@ -3213,30 +3320,25 @@ def _load_checkpoint_from_path(
                     else:
                         print_rank_0("WARNING: RNG state not found for current TP/PP rank")
                         rng_state_list = next(iter(state_dict["rng_state"].values()))
-                    rng_state = (
-                        rng_state_list[pg_collection.dp.rank()]
-                        if cfg.rng.data_parallel_random_init
-                        else rng_state_list[0]
-                    )
                 else:
                     # torch_dist format: ShardedObject
-                    rng_state = (
-                        state_dict["rng_state"][pg_collection.dp.rank()]
-                        if cfg.rng.data_parallel_random_init
-                        else state_dict["rng_state"][0]
-                    )
+                    rng_state_list = state_dict["rng_state"]
 
-                random.setstate(rng_state["random_rng_state"])
-                np.random.set_state(rng_state["np_rng_state"])
-                torch.set_rng_state(rng_state["torch_rng_state"])
-                torch.cuda.set_rng_state(rng_state["cuda_rng_state"])
-                if not rng_state["rng_tracker_states"]:
-                    raise KeyError
-                rng_tracker_states = {
-                    k: tensor_parallel.convert_cuda_rng_state(v, to_graphable=graph_safe_rng)
-                    for k, v in rng_state["rng_tracker_states"].items()
-                }
-                cuda_rng_tracker.set_states(rng_tracker_states)
+                rng_state = _select_dp_rng_state(rng_state_list, pg_collection, cfg.rng.data_parallel_random_init)
+                # None means the saved per-DP states cannot be mapped onto this
+                # run; leave the generators as _set_random_seed left them.
+                if rng_state is not None:
+                    random.setstate(rng_state["random_rng_state"])
+                    np.random.set_state(rng_state["np_rng_state"])
+                    torch.set_rng_state(rng_state["torch_rng_state"])
+                    torch.cuda.set_rng_state(rng_state["cuda_rng_state"])
+                    if not rng_state["rng_tracker_states"]:
+                        raise KeyError
+                    rng_tracker_states = {
+                        k: tensor_parallel.convert_cuda_rng_state(v, to_graphable=graph_safe_rng)
+                        for k, v in rng_state["rng_tracker_states"].items()
+                    }
+                    cuda_rng_tracker.set_states(rng_tracker_states)
             else:  # backward compatibility
                 random.setstate(state_dict["random_rng_state"])
                 np.random.set_state(state_dict["np_rng_state"])
