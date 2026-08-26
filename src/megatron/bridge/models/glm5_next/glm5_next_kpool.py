@@ -34,6 +34,16 @@ Two properties keep this contained:
 It is also a deliberate reduction in work: scoring runs over ``ceil(seqlen / kpool)``
 candidates instead of ``seqlen``.
 
+**This is what now caps GLM-5.3's sequence length.** ``forward_before_topk`` refuses
+packed sequences, and context parallelism in this stack *is* THD context parallelism
+(``megatron_config`` routes ``context_parallel_size > 1`` through
+``_validate_thd_context_parallelism``). So even though the KDA layers are now
+Megatron-Core's CP-capable ``KimiDeltaAttention``, the 11 k-pool DSA layers still force
+``cp=1`` for the model as a whole. Lifting it means forming pools per document from
+``cu_seqlens`` rather than over the flat sequence, anchored at each document start, so a
+pool never straddles a document boundary. Until then the ceiling moved, it did not go
+away.
+
 The pooling and expansion are split across ``forward_before_topk`` and ``forward``
 rather than reaching into the attention path, so ``DSAttention`` needs no changes.
 """
@@ -192,20 +202,35 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         return token_indices[..., :width].to(torch.int32)
 
     def _visible_tail(self, batch: int, queries: int, seqlen: int, device, dtype) -> torch.Tensor:
-        """Token ids in the query's own incomplete pool.
+        """The visible tokens that no *complete* pool covers.
 
-        A query at position ``t`` sits inside pool ``t // index_kpool``, whose later
-        members are not yet causally visible and whose pooled key therefore cannot
-        represent ``t`` itself. Those in-pool predecessors are appended directly so the
-        most recent tokens are always reachable regardless of what the pool scores said.
+        Complete pools cover the first ``floor(visible / index_kpool) * index_kpool``
+        visible tokens, so the trailing ``visible % index_kpool`` are unreachable through
+        pool selection and are appended as raw indices. That is what
+        ``index_kpool_always_select_tail`` guarantees, and it mirrors HF's
+        ``append_visible_tail``::
+
+            tail_count = visible % index_kpool
+            tail_start = visible - tail_count
+            tail       = tail_start + [0 .. index_kpool - 2], while offset < tail_count
+
+        With no left padding a query at position ``t`` sees ``t + 1`` tokens.
+
+        The query's own token is included, which is the whole point: it is causally
+        visible, and at ``t % index_kpool == 0`` it belongs to no complete pool. Masking
+        the tail to positions *strictly before* ``t`` instead leaves such a query with no
+        guaranteed index at all -- every slot ``-1`` at ``t = 0`` -- so reaching itself
+        would depend on the top-k happening to select its own partly-future pool.
         """
         positions = torch.arange(queries, device=device, dtype=dtype)
-        pool_start = (positions // self.index_kpool) * self.index_kpool
+        visible = positions + 1
+        tail_count = visible % self.index_kpool
+        tail_start = visible - tail_count
         offsets = torch.arange(self.index_kpool - 1, device=device, dtype=dtype)
 
-        tail = pool_start[:, None] + offsets[None, :]
-        # Keep only causally visible members: strictly before the query, and in range.
-        tail = tail.masked_fill(tail >= positions[:, None], -1)
+        tail = tail_start[:, None] + offsets[None, :]
+        # Drop slots that exist only to pad the fixed width, and anything past the end.
+        tail = tail.masked_fill(offsets[None, :] >= tail_count[:, None], -1)
         tail = tail.masked_fill(tail >= seqlen, -1)
 
         return tail[None].expand(batch, queries, self.index_kpool - 1).contiguous()
