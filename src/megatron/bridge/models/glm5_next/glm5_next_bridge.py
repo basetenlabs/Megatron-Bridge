@@ -153,6 +153,9 @@ class Glm5NextBridge(MegatronModelBridge):
         # KPool derives sequence-local pool boundaries from packed cu_seqlens,
         # including when context parallelism is one.
         provider.requires_packed_sequence = True
+        # Loss-masked EP synchronization rows still traverse KPool and the
+        # fused sparse kernels. Use a kernel-safe row length with no THD tail.
+        provider.packed_sequence_phantom_length = 64
 
         provider.enable_mhc_connections = True
         provider.mhc_num_residual_streams = config.hc_mult
