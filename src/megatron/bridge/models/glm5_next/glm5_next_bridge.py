@@ -2,7 +2,8 @@
 
 """Checkpoint and model configuration bridge for GLM-5.3-Flash."""
 
-from typing import Mapping
+from typing import os
+import Mapping
 
 import torch
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -173,9 +174,16 @@ class Glm5NextBridge(MegatronModelBridge):
         provider.norm_topk_prob = config.norm_topk_prob
         provider.moe_router_topk_scaling_factor = config.routed_scaling_factor
         provider.moe_grouped_gemm = True
-        provider.moe_token_dispatcher_type = "flex"
-        provider.moe_flex_dispatcher_backend = "hybridep"
-        provider.moe_flex_dispatcher_num_sms = 16
+        # Dispatcher override for bring-up: flex/hybridep is the production
+        # choice but is dead on ali-apse7 (name-based GPU check vs the L20D
+        # masquerade) and currently hangs under investigation. alltoall is the
+        # slower-but-safe fallback validated on the DSv4 line.
+        if os.environ.get("BT_GLM5_NEXT_MOE_DISPATCHER") == "alltoall":
+            provider.moe_token_dispatcher_type = "alltoall"
+        else:
+            provider.moe_token_dispatcher_type = "flex"
+            provider.moe_flex_dispatcher_backend = "hybridep"
+            provider.moe_flex_dispatcher_num_sms = 16
         provider.moe_router_load_balancing_type = "noaux_tc"
         provider.moe_router_enable_expert_bias = True
         provider.moe_router_dtype = "fp32"
