@@ -41,7 +41,7 @@ contracts by an unweighted mean and ships no ``hc_head_*`` weights, while DeepSe
 introduced a learned gated sum.
 """
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import nn
@@ -73,6 +73,15 @@ class Glm5NextMhcScaleMapping(MegatronParamMapping[torch.Tensor]):
             raise ValueError(f"mHC scale index must be 0..{len(MHC_SCALE_ORDER) - 1}, got {index}")
         super().__init__(megatron_param, hf_param)
         self.index = index
+
+    def resolve(self, captures: Tuple[str, ...]) -> "MegatronParamMapping":
+        """Return a resolved copy, keeping ``index``.
+
+        The base implementation reconstructs with two positional arguments and would
+        drop it, raising a TypeError as soon as a wildcard is resolved.
+        """
+        resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
+        return type(self)(resolved_megatron_param, resolved_hf_param, self.index)
 
     def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module: nn.Module) -> torch.Tensor:
         """Take this alpha's element out of the packed tensor."""

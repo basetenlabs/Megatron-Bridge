@@ -47,7 +47,7 @@ check MTP numerics against. The split above is justified by algebra and by
 Megatron-Core's concat order, not by a parity test.
 """
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import nn
@@ -77,6 +77,15 @@ class Glm5NextMtpEhProjMapping(MegatronParamMapping[torch.Tensor]):
         super().__init__(megatron_param, hf_param)
         self.half = half
         self._tp_mapping = AutoMapping(megatron_param, megatron_param)
+
+    def resolve(self, captures: Tuple[str, ...]) -> "MegatronParamMapping":
+        """Return a resolved copy, keeping ``half``.
+
+        The base implementation reconstructs with two positional arguments and would
+        drop it, raising a TypeError as soon as a wildcard is resolved.
+        """
+        resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
+        return type(self)(resolved_megatron_param, resolved_hf_param, self.half)
 
     def _hidden_size(self, megatron_module: nn.Module) -> int:
         return self._get_config(megatron_module).hidden_size

@@ -101,6 +101,12 @@ def _layer_mappings(megatron_layer: str, hf_layer: str) -> list:
             f"{hf_layer}.mlp.shared_experts.down_proj.weight",
         ),
         (f"{megatron_layer}.mlp.linear_fc2.weight", f"{hf_layer}.mlp.down_proj.weight"),
+        # The 3 dense layers fuse their pre-MLP norm into linear_fc1 under TE, so the
+        # weight arrives as linear_fc1.layer_norm_weight rather than pre_mlp_layernorm.
+        (
+            f"{megatron_layer}.mlp.linear_fc1.layer_norm_weight",
+            f"{hf_layer}.post_attention_layernorm.weight",
+        ),
     ]
 
     # KDA. Split by parallelism explicitly: these modules are not in AutoMapping's
@@ -117,9 +123,14 @@ def _layer_mappings(megatron_layer: str, hf_layer: str) -> list:
     replicated = [
         (f"{megatron_attention}.f_a_proj.weight", f"{hf_attention}.f_a_proj.weight"),
         (f"{megatron_attention}.g_a_proj.weight", f"{hf_attention}.g_a_proj.weight"),
-        (f"{megatron_attention}.o_norm.weight", f"{hf_attention}.o_norm.weight"),
+        # KDA gated output RMSNorm. MCore names it out_norm (see
+        # KimiDeltaAttentionSubmodules); the checkpoint calls it o_norm.
+        (f"{megatron_attention}.out_norm.weight", f"{hf_attention}.o_norm.weight"),
     ]
-    row_parallel = [(f"{megatron_attention}.o_proj.weight", f"{hf_attention}.o_proj.weight")]
+    # KDA output projection. MCore names it out_proj; the checkpoint calls it o_proj,
+    # which on the MLA+DSA layers instead maps to linear_proj above. Both mappings
+    # coexist because a given Megatron parameter matches only one of them.
+    row_parallel = [(f"{megatron_attention}.out_proj.weight", f"{hf_attention}.o_proj.weight")]
 
     mappings = [
         *(AutoMapping(megatron_param=m, hf_param=h) for m, h in auto),
@@ -438,18 +449,26 @@ class Glm5NextBridge(MegatronModelBridge):
         Per-layer mappings come from ``_layer_mappings``, applied to the decoder stack
         and again to each MTP layer. Still open: quantization, noted at the end.
         """
+        # Every Megatron-side name is prefixed with ``language_model.``: this bridge builds
+        # Glm5NextVLModel, which nests the backbone under that attribute. Without it the
+        # patterns resolve against nothing -- measured on the real 45-layer model, 4336 of
+        # 4683 parameters went unmapped, the whole grouped-MoE expert set among them, and
+        # a load would have silently left them at their initialised values.
+        lm = "language_model"
         mappings = [
             AutoMapping(
-                megatron_param="embedding.word_embeddings.weight",
+                megatron_param=f"{lm}.embedding.word_embeddings.weight",
                 hf_param="model.language_model.embed_tokens.weight",
             ),
-            AutoMapping(megatron_param="output_layer.weight", hf_param="lm_head.weight"),
+            AutoMapping(megatron_param=f"{lm}.output_layer.weight", hf_param="lm_head.weight"),
             AutoMapping(
-                megatron_param="decoder.final_layernorm.weight",
+                megatron_param=f"{lm}.decoder.final_layernorm.weight",
                 hf_param="model.language_model.norm.weight",
             ),
         ]
-        mappings += _layer_mappings("decoder.layers.*", "model.language_model.layers.*")
+        mappings += _layer_mappings(
+            f"{lm}.decoder.layers.*", "model.language_model.layers.*"
+        )
 
         # MTP. GLM-5.3 appends its predict layers after the main stack, so MTP layer i
         # is checkpoint layer num_hidden_layers + i -- 45, for the single shipped layer.
@@ -457,7 +476,7 @@ class Glm5NextBridge(MegatronModelBridge):
         num_mtp_layers = getattr(text_config, "num_nextn_predict_layers", 0) or 0
         num_transformer_layers = text_config.num_hidden_layers
         for mtp_layer in range(num_mtp_layers):
-            megatron_mtp = f"mtp.layers.{mtp_layer}"
+            megatron_mtp = f"{lm}.mtp.layers.{mtp_layer}"
             hf_mtp = f"model.language_model.layers.{mtp_layer + num_transformer_layers}"
             mappings += [
                 AutoMapping(

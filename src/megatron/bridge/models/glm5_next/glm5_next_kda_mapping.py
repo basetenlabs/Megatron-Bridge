@@ -80,6 +80,22 @@ class Glm5NextKdaFusedMapping(MegatronParamMapping[Dict[str, torch.Tensor]]):
         super().__init__(megatron_param, {"q": q, "k": k, "v": v})
         self._tp_mapping = AutoMapping(megatron_param, megatron_param)
 
+    def resolve(self, captures: Tuple[str, ...]) -> "MegatronParamMapping":
+        """Return a resolved copy, keeping the component keyword arguments.
+
+        Required: the base implementation reconstructs with
+        ``type(self)(megatron_param, hf_param)``, which drops q/k/v and raises a
+        TypeError the moment a wildcard is resolved. Every multi-argument mapping in
+        ``param_mapping`` overrides this for the same reason.
+        """
+        resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
+        return type(self)(
+            resolved_megatron_param,
+            resolved_hf_param["q"],
+            resolved_hf_param["k"],
+            resolved_hf_param["v"],
+        )
+
     def _component_sizes(self, megatron_module: nn.Module) -> List[int]:
         """Per-component dim-0 sizes of the *unsharded* fused tensor."""
         config = self._get_config(megatron_module)
