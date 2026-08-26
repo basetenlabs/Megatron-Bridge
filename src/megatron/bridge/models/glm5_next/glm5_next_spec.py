@@ -64,7 +64,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
 from megatron.bridge.models.glm5_next.glm5_next_kpool import Glm5NextKPoolIndexer
-from megatron.bridge.models.glm5_next.glm5_next_layers import Glm5NextLinearAttention
+from megatron.bridge.models.glm5_next.glm5_next_layers import Glm5NextLinearAttention, Glm5NextTransformerLayer
 
 
 def _install_kpool_indexer(attention_spec) -> None:
@@ -150,6 +150,11 @@ def build_glm5_next_spec(config, vp_stage=None, pp_rank=None):
         # get_transformer_layer_offset gives this PP rank's 0-indexed global offset;
         # layer_number is 1-indexed, matching Megatron-Core and glm5_next_kda_layers.
         layer_number = layer_offset + local_idx + 1
+
+        # mHC wraps both sublayers of every layer, KDA and DSA alike. Megatron-Core's
+        # own HyperConnectionTransformerLayer cannot be used here because it refuses MoE
+        # layers, which is 42 of GLM-5.3's 45 -- see Glm5NextTransformerLayer.
+        layer_spec.module = Glm5NextTransformerLayer
 
         if config.is_kda_layer(layer_number):
             dsa_spec = layer_spec.submodules.self_attention

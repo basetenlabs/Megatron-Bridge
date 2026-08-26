@@ -129,6 +129,19 @@ class Glm5NextModelProvider(MLAModelProvider):
     costs nothing beyond the wider tensor.
     """
 
+    # ------------------------------------------------------------------- mHC
+    enable_mhc_connections: bool = True
+    """GLM-5.3's residual stream is manifold-constrained hyper-connections.
+
+    Overrides the base default of False. Like ``qk_pos_emb_head_dim`` this is an
+    architectural invariant: without it the model is a different architecture, not a
+    slower one. ``Glm5NextTransformerLayer`` refuses to build with it off.
+
+    ref: modular:364 ``Glm5NextTextHyperConnection(DeepseekV4HyperConnection)`` -- the
+    mHC here is DeepSeek-V4's, which is why Megatron-Core's HyperConnectionModule
+    matches it parameter for parameter.
+    """
+
     # -------------------------------------------------------------- markers
     glm5_next_requires_fp32_lm_head: bool = True
     """Whether the output projection must run in fp32.
@@ -160,6 +173,7 @@ class Glm5NextModelProvider(MLAModelProvider):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.validate_layout()
+        self.validate_mhc()
         self.validate_kpool()
         self.validate_attention()
 
@@ -187,6 +201,16 @@ class Glm5NextModelProvider(MLAModelProvider):
 
         if len(set(self.glm5_next_kda_layers)) != len(self.glm5_next_kda_layers):
             raise ValueError(f"glm5_next_kda_layers contains duplicates: {self.glm5_next_kda_layers}")
+
+    def validate_mhc(self) -> None:
+        """mHC must be on, and its stream count must match the checkpoint."""
+        if not self.enable_mhc_connections:
+            raise ValueError(
+                "GLM-5.3 requires enable_mhc_connections=True; its residual stream is "
+                "manifold-constrained hyper-connections, not a plain residual."
+            )
+        if self.mhc_num_residual_streams < 2:
+            raise ValueError(f"mhc_num_residual_streams must be at least 2, got {self.mhc_num_residual_streams}")
 
     def validate_kpool(self) -> None:
         """Enforce the k-pool divisibility invariant."""

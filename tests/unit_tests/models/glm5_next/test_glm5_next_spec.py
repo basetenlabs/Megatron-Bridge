@@ -29,7 +29,7 @@ from types import SimpleNamespace
 import pytest
 
 from megatron.bridge.models.glm5_next import glm5_next_spec
-from megatron.bridge.models.glm5_next.glm5_next_layers import Glm5NextLinearAttention
+from megatron.bridge.models.glm5_next.glm5_next_layers import Glm5NextLinearAttention, Glm5NextTransformerLayer
 from megatron.bridge.models.glm5_next.glm5_next_spec import build_glm5_next_spec
 
 
@@ -114,6 +114,15 @@ class TestLayerAssignment:
         assert len(dsa_at) == 11
         # The 3:1 schedule puts DSA on every fourth layer starting at 4.
         assert dsa_at == [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44]
+
+    def test_every_layer_uses_the_mhc_layer(self, stub_megatron):
+        """Both KDA and DSA layers carry mHC.
+
+        Megatron-Core's own HyperConnectionTransformerLayer cannot be used: it refuses
+        MoE layers, which is 42 of GLM-5.3's 45.
+        """
+        block = build_glm5_next_spec(make_config())
+        assert all(s.module is Glm5NextTransformerLayer for s in block.layer_specs)
 
     def test_the_builders_input_layernorm_is_preserved(self, stub_megatron):
         """The variant builder already chose a norm valid for both attention kinds.

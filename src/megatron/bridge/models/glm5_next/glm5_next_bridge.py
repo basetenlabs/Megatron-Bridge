@@ -176,27 +176,26 @@ class Glm5NextBridge(MegatronModelBridge):
         """Manifold-constrained hyper-connections.
 
         GLM-5.3's parameterization matches Megatron-Core's ``HyperConnectionModule``
-        exactly -- ``fn`` is ``mapping_proj.weight`` (both ``[(2+n)*n, n*hidden]``),
-        ``base`` is ``bias``, and ``scale`` holds the three alphas.
+        exactly: ``fn`` is ``mapping_proj.weight`` (both ``[(2+n)*n, n*hidden]``),
+        ``base`` is ``bias``, and ``scale`` holds the three alphas. That is not a
+        coincidence -- modular:364 defines the HF class as
+        ``Glm5NextTextHyperConnection(DeepseekV4HyperConnection)``.
 
-        NOT WIRED YET, deliberately. Two Megatron-Core versions disagree about how this
-        is spelled and whether it works at all with MoE:
+        The residual streams are applied by ``Glm5NextTransformerLayer`` rather than by
+        Megatron-Core's ``HyperConnectionTransformerLayer``, which refuses MoE layers.
 
-        * The production trainer image exposes ``enable_hyper_connections`` /
-          ``num_residual_streams`` / ``use_fused_mhc``, and mHC over sparse MoE is
-          qualified there.
-        * The Megatron-Core pinned by this repository exposes
-          ``enable_mhc_connections`` / ``mhc_num_residual_streams``, and its
-          ``HyperConnectionTransformerLayer`` raises ``NotImplementedError`` on any MoE
-          layer. GLM-5.3 is 42 MoE layers of 45, and the ``HyperConnectionHybridLayer``
-          that error points to does not exist in this pin or upstream.
-
-        Setting the production spelling against this pin would assign undeclared
-        attributes: a non-frozen dataclass accepts them, nothing reads them, and mHC
-        would silently never turn on. Leaving it unset is the honest state until the
-        target Megatron-Core is settled.
+        NOTE the field names here are the ones this Megatron-Core pin declares
+        (``enable_mhc_connections`` / ``mhc_num_residual_streams``). DeepSeek-V4's bridge
+        sets ``enable_hyper_connections`` / ``num_residual_streams`` instead, which this
+        pin does not declare -- a non-frozen dataclass accepts them, nothing reads them,
+        and mHC would silently never turn on. Do not copy that block verbatim.
         """
-        del provider, cfg
+        provider.enable_mhc_connections = True
+        provider.mhc_num_residual_streams = cfg.hc_mult
+        provider.mhc_sinkhorn_iterations = cfg.hc_sinkhorn_iters
+        # ``hc_eps`` has no Megatron-Core counterpart: HF adds it to ``pre`` and to the
+        # comb softmax, while SinkhornKnopp is fed h_res raw. Left unmapped pending a
+        # numerical check -- it is a stabilizer, not a learned quantity.
 
     # ----------------------------------------------------------------- weights
 

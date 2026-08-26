@@ -147,6 +147,24 @@ class TestAttentionInvariants:
             make_provider(multi_latent_attention=False)
 
 
+class TestMHC:
+    """Manifold-constrained hyper-connections."""
+
+    def test_mhc_is_on_by_default(self):
+        # Without it GLM-5.3 is a different architecture, not a slower one.
+        provider = make_provider()
+        assert provider.enable_mhc_connections is True
+        assert provider.mhc_num_residual_streams == 4
+
+    def test_mhc_cannot_be_disabled(self):
+        with pytest.raises(ValueError, match="enable_mhc_connections=True"):
+            make_provider(enable_mhc_connections=False)
+
+    def test_degenerate_stream_count_is_rejected(self):
+        with pytest.raises(ValueError, match="at least 2"):
+            make_provider(mhc_num_residual_streams=1)
+
+
 class TestMarkers:
     def test_fp32_lm_head_is_requested_by_default(self):
         """Explicit signal for a property that is currently also inferable.
