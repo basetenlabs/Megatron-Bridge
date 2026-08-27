@@ -11,6 +11,7 @@ from megatron.bridge.models.conversion.param_mapping import RowParallelMapping
 from megatron.bridge.models.glm5_next.glm5_next_bridge import Glm5NextBridge
 from megatron.bridge.models.glm5_next.modeling_glm5_next.kda import Glm5NextKDA
 from megatron.bridge.models.glm5_next.modeling_glm5_next.kpool_indexer import Glm5NextKPoolIndexer
+from megatron.bridge.models.glm5_next.modeling_glm5_next.mhc import Glm5NextHyperConnection
 from megatron.bridge.models.glm5_next.modeling_glm5_next.spec import get_glm5_next_layer_spec
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 
@@ -126,9 +127,49 @@ def test_layer_spec_keeps_full_block_and_selects_kpool_only_for_dsa(pretrained):
 
     assert len(block.layer_specs) == 5
     assert all(spec.module is HyperConnectionTransformerLayer for spec in block.layer_specs)
+    assert all(
+        spec.submodules.self_attention_hyper_connection is Glm5NextHyperConnection
+        and spec.submodules.mlp_hyper_connection is Glm5NextHyperConnection
+        for spec in block.layer_specs
+    )
     assert block.layer_specs[0].submodules.self_attention.module is Glm5NextKDA
     dsa_attention = block.layer_specs[3].submodules.self_attention
     assert dsa_attention.submodules.core_attention.submodules.indexer.module is Glm5NextKPoolIndexer
+
+
+def test_glm53_mhc_applies_transposed_residual_mixing():
+    module = Glm5NextHyperConnection.__new__(Glm5NextHyperConnection)
+    torch.nn.Module.__init__(module)
+    module.n = 2
+    module.hidden_size = 1
+    residual = torch.tensor([[[2.0, 3.0]]])
+    h_res = torch.tensor([[[[1.0, 4.0], [2.0, 5.0]]]])
+
+    result = module.apply_h_res(h_res, residual)
+
+    assert torch.equal(result, torch.tensor([[[8.0, 23.0]]]))
+
+
+def test_glm53_mhc_places_rms_epsilon_inside_rsqrt():
+    module = Glm5NextHyperConnection.__new__(Glm5NextHyperConnection)
+    torch.nn.Module.__init__(module)
+    module.n = 1
+    module.hidden_size = 1
+    module.sinkhorn_iterations = 1
+    module.config = SimpleNamespace(layernorm_epsilon=1e-5)
+    module.mapping_proj = torch.nn.Linear(1, 3, bias=False)
+    module.mapping_proj.weight.data.fill_(1.0)
+    module.bias = torch.nn.Parameter(torch.zeros(3))
+    module.alpha_pre = torch.nn.Parameter(torch.ones(1))
+    module.alpha_post = torch.nn.Parameter(torch.ones(1))
+    module.alpha_res = torch.nn.Parameter(torch.ones(1))
+    value = torch.tensor([[[1e-3]]])
+
+    pre, _, _ = module.compute_mappings(value)
+
+    normalized = value.float() * torch.rsqrt(value.float().square() + 1e-5)
+    expected = torch.sigmoid(normalized) + 1e-6
+    assert torch.allclose(pre, expected)
 
 
 def test_kpool_expansion_appends_only_incomplete_tail():
