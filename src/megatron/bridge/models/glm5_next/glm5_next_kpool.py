@@ -44,8 +44,16 @@ Megatron-Core's CP-capable ``KimiDeltaAttention``, the 11 k-pool DSA layers stil
 pool never straddles a document boundary. Until then the ceiling moved, it did not go
 away.
 
-The pooling and expansion are split across ``forward_before_topk`` and ``forward``
-rather than reaching into the attention path, so ``DSAttention`` needs no changes.
+Integration point. ``DSAttention`` owns the top-k -- it calls ``forward_before_topk``
+and selects itself, and never calls ``DSAIndexer.forward`` -- so pooling cannot live in
+a ``forward`` override. It would be dead code, and the base class would top-k the pooled
+keys and then treat the resulting *pool* indices as *token* indices.
+
+Pooling is therefore expressed through three defaulted hooks on ``DSAIndexer``:
+``topk_budget`` (select ``index_topk // index_kpool`` pools), ``indexer_key_positions``
+(judge causality by each pool's last token) and ``postprocess_topk`` (expand pools back
+to token indices, plus the visible tail). Only the top-k sees pool space; the attention
+below is unchanged and still works in token space.
 """
 
 import torch
@@ -135,8 +143,8 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         self.config.init_method(self.index_kpool_compress_gate)
 
     @property
-    def pool_topk(self) -> int:
-        """Number of pools selected per query."""
+    def topk_budget(self) -> int:
+        """Select pools, not tokens: ``index_topk`` tokens is this many pools."""
         return self.index_topk // self.index_kpool
 
     @property
@@ -144,6 +152,24 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         """Width of the index tensor this indexer emits."""
         tail = self.index_kpool - 1 if self.index_kpool_always_select_tail else 0
         return self.index_topk + tail
+
+    def indexer_key_positions(self, seqlen: int, key_positions):
+        """Judge causality in pool space, by each pool's last token.
+
+        A candidate here is a pool of ``index_kpool`` consecutive tokens, so a query may
+        select it only once the pool's final token is visible -- which is HF's rule. The
+        base class compares query positions against per-token positions, and handing it
+        pool indices unchanged would let a query select a pool whose members are all in
+        its future.
+        """
+        pools = seqlen // self.index_kpool
+        device = key_positions.device if key_positions is not None else None
+        base = torch.arange(pools, device=device, dtype=torch.int32)
+        return base * self.index_kpool + (self.index_kpool - 1)
+
+    def postprocess_topk(self, topk_indices, seqlen: int):
+        """Expand selected pools into token indices, then append the visible tail."""
+        return self._expand_pools(topk_indices, seqlen=seqlen)
 
     def forward_before_topk(
         self,
@@ -204,33 +230,6 @@ class Glm5NextKPoolIndexer(DSAIndexer):
 
         pooled_k = (k.reshape(pools, self.index_kpool, batch, head_dim) * probabilities).sum(dim=1)
         return q, pooled_k, weights
-
-    @torch.no_grad()
-    def forward(
-        self,
-        x: torch.Tensor,
-        qr: torch.Tensor,
-        mask: torch.Tensor | None = None,
-        packed_seq_params: PackedSeqParams | None = None,
-    ) -> torch.Tensor:
-        """Select pools, then expand them into token indices.
-
-        Returns:
-            ``int32 [batch, seqlen, output_width]`` token indices, ``-1`` for unused
-            slots -- the same contract as the base indexer, only wider.
-        """
-        q, pooled_k, weights = self.forward_before_topk(x, qr, packed_seq_params)
-
-        _, pool_indices = fused_qk_topk_naive(
-            q,
-            pooled_k,
-            weights,
-            min(self.pool_topk, pooled_k.size(0)),
-            mask,
-            use_relu=self.config.dsa_indexer_scoring_relu,
-        )
-
-        return self._expand_pools(pool_indices, seqlen=x.size(0))
 
     def _expand_pools(self, pool_indices: torch.Tensor, *, seqlen: int) -> torch.Tensor:
         """Turn selected pool ids into the token ids they cover.

@@ -372,11 +372,28 @@ class Glm5NextBridge(MegatronModelBridge):
         # attention afterwards. See glm5_next_spec for why this matters beyond dispatch.
         provider.experimental_attention_variant = "dsa"
 
+        # GLM-5.3 is NoPE, and MLA gates that on no_rope_freq -- not on
+        # qk_pos_emb_head_dim. Left unset, use_rope stays True and both the MLA and the
+        # DSA indexer build a rotary embedding of width 0. That is a numeric no-op at
+        # cp=1 but it is what breaks CP: DSAIndexer.__init__ raises
+        # "cannot reshape tensor of 0 elements into shape [16, -1, 1, 1, 0]".
+        provider.no_rope_freq = [1] * cfg.num_hidden_layers
+
+        # HF's Glm5NextTextIndexer applies no Hadamard rotation. It is neutral for the
+        # score -- (Hq/sqrt(d)).(Hk/sqrt(d)) = q.k, and pooling is linear so it commutes
+        # -- but it forces bf16 and pulls in fast_hadamard_transform, so match HF.
+        provider.dsa_indexer_rotate_activation = False
+
+        # The fused DSA kernels assume one indexer candidate per token; GLM-5.3's
+        # indexer scores pools. Megatron-Core now refuses that combination outright
+        # rather than silently attending to the wrong positions, so stay on the
+        # unfused path until the hooks are plumbed through both fused kernels.
+        provider.dsa_kernel_backend = "none"
+
         provider.dsa_indexer_head_dim = cfg.index_head_dim
         provider.dsa_indexer_n_heads = cfg.index_n_heads
         provider.dsa_indexer_topk = cfg.index_topk
         provider.dsa_indexer_k_norm_epsilon = 1e-6
-        provider.dsa_kernel_backend = "cudnn"
         provider.dsa_indexer_scoring_relu = True
 
         # The indexer is frozen -- HF marks its forward @torch.no_grad and GLM-5.2
