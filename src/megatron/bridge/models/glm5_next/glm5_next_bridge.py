@@ -31,6 +31,7 @@ A checkpoint that stores its text fields at the top level has them promoted into
 either way.
 """
 
+import torch
 import torch.nn.functional as F
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
@@ -263,6 +264,12 @@ class Glm5NextBridge(MegatronModelBridge):
                 for index, kind in enumerate(cfg.layer_types)
                 if kind == "linear_attention"
             ),
+            # Without these the provider stays fp32, so get_model() skips the
+            # Float16Module wrapper -- and callers that pass its `fp32_output`
+            # kwarg (the trainer's loss forward step does) hit this model's
+            # forward() instead, which has no such parameter.
+            bf16=(self.dtype_from_hf(cfg, default=torch.float32) == torch.bfloat16),
+            params_dtype=self.dtype_from_hf(cfg, default=torch.float32),
         )
         provider.transformer_layer_spec = build_glm5_next_spec
 
