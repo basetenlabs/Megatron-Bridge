@@ -135,12 +135,16 @@ def test_kpool_expansion_appends_only_incomplete_tail():
     indexer = Glm5NextKPoolIndexer.__new__(Glm5NextKPoolIndexer)
     torch.nn.Module.__init__(indexer)
     indexer._pool_to_raw = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]])
-    indexer._raw_cu_seqlens = torch.tensor([0, 8])
+    indexer._tail_start = torch.tensor([0, 0, 0, 4, 4, 4, 4, 8])
+    indexer._tail_size = torch.tensor([1, 2, 3, 0, 1, 2, 3, 0])
 
     selected = torch.tensor([[[-1], [-1], [-1], [0], [0], [0], [0], [1]]])
     lengths = torch.tensor([[0, 0, 0, 1, 1, 1, 1, 1]])
     expanded, expanded_lengths = indexer.finalize_topk_indices(selected, lengths)
 
-    assert expanded[0, 2].tolist() == [-1, -1, -1, -1, 0, 1, 2]
+    assert expanded[0, 2].tolist() == [0, 1, 2, -1, -1, -1, -1]
     assert expanded_lengths[0].tolist() == [1, 2, 3, 4, 5, 6, 7, 4]
     assert expanded[0, 7].tolist() == [4, 5, 6, 7, -1, -1, -1]
+    for row, length in zip(expanded[0], expanded_lengths[0]):
+        assert torch.all(row[:length] >= 0)
+        assert torch.all(row[length:] == -1)
