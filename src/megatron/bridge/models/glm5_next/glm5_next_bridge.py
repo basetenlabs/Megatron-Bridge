@@ -446,6 +446,15 @@ class Glm5NextBridge(MegatronModelBridge):
         # TransformerConfig.
         provider.mhc_learned_output_contract = False
 
+        # GLM-5.3's mHC input norm is Glm5NextTextUnweightedRMSNorm(eps=rms_norm_eps),
+        # i.e. the standard rsqrt(mean + eps). Megatron-Core's historical form divides by
+        # (RMS + 1e-6) instead, which only agrees while eps is negligible against the
+        # RMS -- and GLM-5.3's layer-0 streams have RMS about 0.0079, so it is not.
+        # Measured on the real checkpoint: the historical form leaves the mHC collapse
+        # 3.46% too large (cos 0.996616 vs HF) and layer 0 at cos 0.9336; setting this
+        # brings the collapse to cos 0.999999 and layers 0-2 to exact.
+        provider.mhc_rms_norm_eps = cfg.rms_norm_eps
+
     # ----------------------------------------------------------------- weights
 
     def mapping_registry(self) -> MegatronMappingRegistry:
