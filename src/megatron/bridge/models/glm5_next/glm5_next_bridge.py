@@ -20,6 +20,7 @@ from megatron.bridge.models.conversion.param_mapping import (
 )
 from megatron.bridge.models.conversion.quantization_utils import maybe_dequantize_fp8_blockwise
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+from megatron.bridge.models.glm5_next.glm5_next_vl_provider import Glm5NextVLModelProvider
 from megatron.bridge.models.mla_provider import MLAModelProvider
 
 
@@ -82,22 +83,30 @@ class _HCAlphaSecondaryMapping(MegatronParamMapping):
 @MegatronModelBridge.register_bridge(
     source="Glm5NextForConditionalGeneration",
     target=GPTModel,
-    provider=MLAModelProvider,
+    provider=Glm5NextVLModelProvider,
     model_type="glm5_next",
 )
 class Glm5NextBridge(MegatronModelBridge):
-    """Exact text-backbone bridge for ``zai-org/GLM-5.3-Flash``."""
+    """Bridge for ``zai-org/GLM-5.3-Flash``, vision tower included.
+
+    Every text-side setting below is the validated text configuration; vision adds
+    only the tower config, the placeholder token ids and one weight mapping. Dropping
+    vision means building ``MLAModelProvider`` here instead and deleting those three.
+    """
 
     MODEL_CONFIG_CLASS = None
+    _vision_config = None
 
-    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> MLAModelProvider:
+    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> Glm5NextVLModelProvider:
         from megatron.bridge.models.glm5_next.modeling_glm5_next.spec import get_glm5_next_layer_spec
 
         outer_config = hf_pretrained.config
         config = getattr(outer_config, "text_config", outer_config)
         kwargs = self.hf_config_to_provider_kwargs(config)
-        valid_fields = MLAModelProvider.__dataclass_fields__
-        provider = MLAModelProvider(**{key: value for key, value in kwargs.items() if key in valid_fields})
+        valid_fields = Glm5NextVLModelProvider.__dataclass_fields__
+        provider = Glm5NextVLModelProvider(
+            **{key: value for key, value in kwargs.items() if key in valid_fields}
+        )
 
         provider.transformer_layer_spec = get_glm5_next_layer_spec
         provider.normalization = "RMSNorm"
@@ -190,8 +199,57 @@ class Glm5NextBridge(MegatronModelBridge):
         provider.moe_shared_expert_overlap = True
         provider.activation_func_clamp_value = config.swiglu_limit
         provider.make_vocab_size_divisible_by = 1280
+
+        # The tower is HF's own module built from this config object, so it is handed
+        # over whole rather than copied field by field.
+        #
+        # Left as None for a config that declares no tower. Every released GLM-5.3
+        # checkpoint has one -- Glm5NextForConditionalGeneration is the architecture --
+        # so in practice that means a text-only config assembled by hand, and this
+        # provider then behaves exactly like the text one. Building the model is where
+        # a missing tower is refused, because that is where its weights would go
+        # missing; see Glm5NextVLModelProvider.provide.
+        provider.vision_config = getattr(outer_config, "vision_config", None)
+
+        # These live on the top-level config, not text_config, and HF's
+        # get_placeholder_mask reads them off the Megatron config at forward time.
+        # Only meaningful alongside a tower, so they follow the same condition.
+        if provider.vision_config is not None:
+            for field in (
+                "image_token_id",
+                "video_token_id",
+                "image_start_token_id",
+                "image_end_token_id",
+                "video_start_token_id",
+                "video_end_token_id",
+            ):
+                value = getattr(outer_config, field, None)
+                if value is None:
+                    raise ValueError(
+                        f"GLM-5.3 checkpoint config is missing {field}; the vision path "
+                        "needs it to locate image placeholders in the token stream."
+                    )
+                setattr(provider, field, value)
+
         self._text_config = config
+        self._vision_config = provider.vision_config
         return provider
+
+    def _has_vision_tower(self) -> bool:
+        """Whether the checkpoint being converted carries a vision tower.
+
+        Read off ``self.hf_config`` -- which the conversion machinery sets right
+        before it calls ``mapping_registry`` -- rather than off state left by
+        ``provider_bridge``. The weight-loading hook resolves its own bridge
+        instance, so anything recorded during provider construction may simply not
+        be there, and the whole registry then comes back with un-prefixed names
+        that match nothing on the wrapper. That failure is silent apart from one
+        warning per parameter, so it has to be impossible by construction.
+        """
+        config = getattr(self, "hf_config", None)
+        if config is not None and getattr(config, "vision_config", None) is not None:
+            return True
+        return self._vision_config is not None
 
     def maybe_modify_loaded_hf_weight(self, hf_param, hf_state_dict: Mapping[str, torch.Tensor]):
         hf_weights = super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
@@ -341,4 +399,32 @@ class Glm5NextBridge(MegatronModelBridge):
             )
             mappings.append(_HCAlphaSecondaryMapping(f"decoder.layers.*.{base}_hyper_connection.alpha_post", scale, 1))
             mappings.append(_HCAlphaSecondaryMapping(f"decoder.layers.*.{base}_hyper_connection.alpha_res", scale, 2))
+        # Everything above is the text bridge's own mapping list, naming Megatron
+        # params as they sit on a bare GPTModel. The VL wrapper holds that backbone
+        # as a submodule, so each of those names lives one level down. Rewriting
+        # them here rather than at each construction site keeps the list itself
+        # exactly as the text bridge wrote it: dropping vision means dropping this
+        # block and nothing else.
+        if not self._has_vision_tower():
+            return MegatronMappingRegistry(*mappings)
+
+        for mapping in mappings:
+            mapping.megatron_param = f"language_model.{mapping.megatron_param}"
+            # _HCAlphaMapping also carries the two sibling scalar names it rebuilds
+            # itself from when a wildcard resolves.
+            for attr in ("_megatron_post", "_megatron_res"):
+                sibling = getattr(mapping, attr, None)
+                if sibling is not None:
+                    setattr(mapping, attr, f"language_model.{sibling}")
+
+        # The tower is HuggingFace's own Glm5NextVisionModel, so its submodule names
+        # match the checkpoint one for one and a single wildcard covers the whole tower --
+        # patch_embed, the 24 blocks, downsample, post_layernorm and the merger.
+        #
+        # ReplicatedMapping, not AutoMapping: the tower is plain torch modules held
+        # identically on every rank, and AutoMapping infers sharding from the Megatron
+        # module class, so it raises on the first nn.Linear it meets
+        # ("Cannot determine parallelism type for module 'Linear' at weight
+        # visual.blocks.0.attn.proj.bias"). Same choice GLM-4.5V makes.
+        mappings.append(ReplicatedMapping(megatron_param="visual.**", hf_param="model.visual.**"))
         return MegatronMappingRegistry(*mappings)
