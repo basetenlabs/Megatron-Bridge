@@ -28,6 +28,7 @@ from megatron.bridge.peft.module_matcher import ModuleMatcher
 from megatron.bridge.peft.utils import (
     GroupedExpertLinearAdapter,
     ParallelLinearAdapter,
+    SharedOuterGroupedExpertAdapter,
     align_expert_dim_for_tp,
     get_adapter_attributes_from_linear,
     get_effective_lora_dim,
@@ -40,10 +41,18 @@ from megatron.bridge.peft.utils import (
 logger = logging.getLogger(__name__)
 
 
-def _should_treat_linear_fc1_as_unfused(full_name: str) -> bool:
-    """Return True when CanonicalLoRA should keep linear_fc1 as a single adapter."""
+def _should_treat_linear_fc1_as_unfused(full_name: str, *, split_routed_experts: bool = False) -> bool:
+    """Return True when CanonicalLoRA should keep linear_fc1 as a single adapter.
 
-    return full_name.startswith("vision_model.") or full_name.endswith(".mlp.experts.linear_fc1")
+    Grouped routed experts are normally kept fused because the per-expert and
+    shared adapters index the packed fc1 output directly. ``split_routed_experts``
+    lifts that for the shared-outer layout, whose gate / up factors are built
+    per logical projection.
+    """
+
+    if full_name.startswith("vision_model."):
+        return True
+    return full_name.endswith(".mlp.experts.linear_fc1") and not split_routed_experts
 
 
 class ModuleDict(nn.ModuleDict):
@@ -176,6 +185,46 @@ class LoRALinearSplitFC1UpGate(AdapterWrapper):
         return linear_output + adapter_output, bias
 
 
+class LoRALinearSplitGDN(AdapterWrapper):
+    """Add independent Q/K/V/Z LoRA outputs to a fused Gated DeltaNet input projection.
+
+    Section sizes come from the mixer's own ``in_proj_split_sections`` -- the
+    same table ``GatedDeltaNet.forward`` splits on and the sharded checkpoint
+    uses -- so the rank-local (TP-divided) layout cannot drift from the base.
+    Only q/k/v/z are adaptable; ``beta`` and ``alpha`` are per-head gate scalars
+    the recipe leaves untouched, so their slices carry an explicit zero delta.
+    """
+
+    def _component_output(
+        self,
+        component: str,
+        x: torch.Tensor,
+        out_features: int,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        adapter = self.adapter[component]
+        if adapter is None:
+            return x.new_zeros((*x.shape[:-1], out_features))
+        return self.adapter_forward(adapter, x, *args, **kwargs)
+
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # pylint: disable=C0115,C0116
+        linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
+        if not self._adapter_enabled:
+            return linear_output, bias
+
+        q_dim, k_dim, v_dim, z_dim, beta_dim, alpha_dim = self.to_wrap.in_proj_split_sections
+        outputs = [
+            self._component_output("adapter_q", layernorm_output, q_dim, *args, **kwargs),
+            self._component_output("adapter_k", layernorm_output, k_dim, *args, **kwargs),
+            self._component_output("adapter_v", layernorm_output, v_dim, *args, **kwargs),
+            self._component_output("adapter_z", layernorm_output, z_dim, *args, **kwargs),
+            layernorm_output.new_zeros((*layernorm_output.shape[:-1], beta_dim + alpha_dim)),
+        ]
+        return linear_output + torch.cat(outputs, dim=-1), bias
+
+
 @dataclass
 class CanonicalLoRA(PEFT, ModuleMatcher):
     """
@@ -212,6 +261,10 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             so it is comparable to a dense model. Defaults to False.
         share_expert_adapters (bool): When True, grouped MoE expert linears share one adapter across all local
             experts on the EP rank. Set to False to create one adapter per local expert instead. Defaults to True.
+        experts_shared_outer_loras (bool): When True, grouped expert linears use the shared-outer layout --
+            fc1 shares each logical projection's lora_A across experts with per-expert lora_B, and fc2 keeps
+            lora_A per expert while sharing lora_B. Takes precedence over ``share_expert_adapters``.
+            Defaults to False.
     """
 
     target_modules: List[str] = field(
@@ -233,6 +286,7 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
     lora_B_init_method: str = "zero"
     normalize_moe_lora: bool = False
     share_expert_adapters: bool = True
+    experts_shared_outer_loras: bool = False
 
     def __post_init__(self) -> None:
         """Eagerly build ``canonical_mapping`` from the initial ``target_modules``.
@@ -301,6 +355,9 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             elif target.endswith("linear_fc1_gate"):
                 canonical_target = target.replace("linear_fc1_gate", "linear_fc1")
                 canonical_component = "linear_fc1_gate"
+            elif target.endswith(("in_proj_q", "in_proj_k", "in_proj_v", "in_proj_z")):
+                canonical_component = target.rsplit(".", 1)[-1]
+                canonical_target = target.removesuffix(canonical_component) + "in_proj"
 
             self.register_target_alias(target, canonical_target)
             self.canonical_mapping[canonical_target].add(canonical_component)
@@ -318,8 +375,17 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             nn.Module: The modified module with LoRA applied, or the original module if not a target.
         """
 
+        # The GDN mixer publishes the rank-local section sizes of its fused
+        # in_proj output. The walk reaches a parent before its children, so pass
+        # the table to the projection the adapters wrap rather than re-deriving it.
+        in_proj_sections = getattr(m, "in_proj_split_sections", None)
+        if in_proj_sections is not None and hasattr(m, "in_proj"):
+            m.in_proj.in_proj_split_sections = in_proj_sections
+
         # Skip already transformed modules
-        if isinstance(m, (LoRALinear, LoRALinearSplitQKV, LoRALinearSplitFC1UpGate, LoRATopKRouter)):
+        if isinstance(
+            m, (LoRALinear, LoRALinearSplitQKV, LoRALinearSplitFC1UpGate, LoRALinearSplitGDN, LoRATopKRouter)
+        ):
             return m
 
         if (ans := self.match(m, name, prefix)) is not None:
@@ -343,8 +409,20 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                 is_expert=is_expert,
                 input_is_parallel=attrs.input_is_parallel,
             )
-            use_per_expert_adapter = is_grouped_expert_linear(full_name) and not self.share_expert_adapters
-            adapter_cls = GroupedExpertLinearAdapter if use_per_expert_adapter else ParallelLinearAdapter
+            # Mirrors LoRA.transform: megatron-bridge encodes three layouts in two
+            # booleans, and the shared-outer flag wins where both are set.
+            is_grouped_expert_name = is_grouped_expert_linear(full_name)
+            use_shared_outer_adapter = self.experts_shared_outer_loras and is_grouped_expert_name
+            use_per_expert_adapter = (
+                is_grouped_expert_name and not self.share_expert_adapters and not use_shared_outer_adapter
+            )
+            use_grouped_expert_adapter = use_shared_outer_adapter or use_per_expert_adapter
+            if use_shared_outer_adapter:
+                adapter_cls = SharedOuterGroupedExpertAdapter
+            elif use_per_expert_adapter:
+                adapter_cls = GroupedExpertLinearAdapter
+            else:
+                adapter_cls = ParallelLinearAdapter
 
             adapter_kwargs = dict(
                 dim=dim,
@@ -359,7 +437,7 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                 alpha=self.alpha,
                 base_linear_is_parallel=attrs.base_linear_is_parallel,
             )
-            if use_per_expert_adapter:
+            if use_grouped_expert_adapter:
                 first_param = next(m.parameters())
                 adapter_kwargs.update(
                     num_local_experts=m.num_gemms,
@@ -373,7 +451,9 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                     disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
                 )
 
-            if name == "linear_fc1" and _should_treat_linear_fc1_as_unfused(full_name):
+            if name == "linear_fc1" and _should_treat_linear_fc1_as_unfused(
+                full_name, split_routed_experts=use_shared_outer_adapter
+            ):
                 logger.info(f"Adding lora to: {full_name} (treating unsupported canonical linear_fc1 as unfused)")
                 adapter = adapter_cls(attrs.in_features, attrs.out_features, **adapter_kwargs)
                 return LoRALinear(m, adapter)
@@ -383,7 +463,13 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             if name == "linear_qkv":
                 adapter_q, adapter_k, adapter_v = None, None, None
                 kv_out_features = m.config.kv_channels * m.config.num_query_groups
-                q_out_features = m.config.kv_channels * m.config.num_attention_heads
+                # An attention output gate (Qwen3.5/3.6) doubles the q slice: the
+                # projection emits the gate alongside the query.
+                q_out_features = (
+                    m.config.kv_channels
+                    * m.config.num_attention_heads
+                    * (2 if getattr(m.config, "attention_output_gate", False) else 1)
+                )
                 if "linear_q" in canonical_submodules:
                     adapter_q = adapter_cls(attrs.in_features, q_out_features, **adapter_kwargs)
                 if "linear_k" in canonical_submodules:
@@ -395,12 +481,38 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
 
             if name == "linear_fc1":
                 adapter_up, adapter_gate = None, None
+                component_kwargs = dict(adapter_kwargs)
+                if use_shared_outer_adapter:
+                    component_kwargs["split_fc1_component"] = True
                 if "linear_fc1_up" in canonical_submodules:
-                    adapter_up = adapter_cls(attrs.in_features, attrs.out_features // 2, **adapter_kwargs)
+                    adapter_up = adapter_cls(attrs.in_features, attrs.out_features // 2, **component_kwargs)
                 if "linear_fc1_gate" in canonical_submodules:
-                    adapter_gate = adapter_cls(attrs.in_features, attrs.out_features // 2, **adapter_kwargs)
+                    adapter_gate = adapter_cls(attrs.in_features, attrs.out_features // 2, **component_kwargs)
                 adapters = ModuleDict({"adapter_up": adapter_up, "adapter_gate": adapter_gate})
                 return LoRALinearSplitFC1UpGate(m, adapters)
+
+            if name == "in_proj":
+                # attrs.out_features is the global width, so scale the local
+                # sections by the same factor rather than re-deriving them.
+                sections = m.in_proj_split_sections
+                tp_scale = attrs.out_features // sum(sections)
+                component_specs = {
+                    "adapter_q": ("in_proj_q", sections[0] * tp_scale),
+                    "adapter_k": ("in_proj_k", sections[1] * tp_scale),
+                    "adapter_v": ("in_proj_v", sections[2] * tp_scale),
+                    "adapter_z": ("in_proj_z", sections[3] * tp_scale),
+                }
+                adapters = ModuleDict(
+                    {
+                        adapter_name: (
+                            adapter_cls(attrs.in_features, out_features, **adapter_kwargs)
+                            if canonical_name in canonical_submodules
+                            else None
+                        )
+                        for adapter_name, (canonical_name, out_features) in component_specs.items()
+                    }
+                )
+                return LoRALinearSplitGDN(m, adapters)
 
             adapter = adapter_cls(attrs.in_features, attrs.out_features, **adapter_kwargs)
             logger.info(f"Adding lora to: {full_name}")

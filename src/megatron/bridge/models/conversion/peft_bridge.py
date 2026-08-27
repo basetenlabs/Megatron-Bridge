@@ -97,6 +97,19 @@ MEGATRON_TO_HF_LORA_SUFFIX = {
 
 GDN_IN_PROJ_KEYS = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
 
+# CanonicalLoRA adapter key -> the GDN projection its tensors are named for.
+# q/k/v have no HF base weight of their own (the checkpoint fuses them into
+# in_proj_qkv), but vLLM's Qwen3.5 in_proj_qkvz layer is built with four
+# independent output slices, so four separately-named adapters land one per
+# slice and each keeps its own lora_A. A single fused in_proj_qkv adapter is
+# instead expanded by replicating lora_A across q/k/v.
+GDN_CANONICAL_ADAPTER_PROJECTIONS = {
+    "adapter_q": "in_proj_q",
+    "adapter_k": "in_proj_k",
+    "adapter_v": "in_proj_v",
+    "adapter_z": "in_proj_z",
+}
+
 
 @dataclass(frozen=True)
 class AdapterWeightConversionTask:
@@ -235,7 +248,30 @@ class MegatronPeftBridge:
                 filtered = [value for value in values if value.endswith(adapter_suffix)]
                 if filtered:
                     return filtered
+            gdn_names = self._gdn_canonical_hf_names(values, adapter_key)
+            if gdn_names:
+                return gdn_names
         return values
+
+    def _gdn_canonical_hf_names(self, values: List[str], adapter_key: str) -> List[str]:
+        """Return the per-projection adapter name for a canonical GDN adapter.
+
+        Renames the fused ``in_proj_qkv`` entry to the projection this adapter
+        owns, so each of q/k/v/z is emitted under its own name instead of all
+        four falling through to every fused HF tensor.
+        """
+
+        projection = GDN_CANONICAL_ADAPTER_PROJECTIONS.get(adapter_key)
+        if projection is None:
+            return []
+        if projection == "in_proj_z":
+            # z already has its own HF tensor; take it as-is.
+            return [value for value in values if "in_proj_z" in value]
+        return [
+            value.replace("in_proj_qkv", projection)
+            for value in values
+            if "in_proj_qkv" in value
+        ]
 
     def _make_lora_param_name(self, base_name: str, megatron_adapter_suffix: str) -> Optional[str]:
         """Translate a base HF weight name into its LoRA-specific counterpart."""

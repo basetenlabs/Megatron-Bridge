@@ -25,9 +25,19 @@ import torch.nn as nn
 from megatron.core.transformer.module import MegatronModule
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
-from megatron.bridge.peft.canonical_lora import CanonicalLoRA, LoRALinearSplitFC1UpGate, LoRALinearSplitQKV, ModuleDict
+from megatron.bridge.peft.canonical_lora import (
+    CanonicalLoRA,
+    LoRALinearSplitFC1UpGate,
+    LoRALinearSplitGDN,
+    LoRALinearSplitQKV,
+    ModuleDict,
+)
 from megatron.bridge.peft.lora_layers import LoRALinear
-from megatron.bridge.peft.utils import AdapterAttributes, GroupedExpertLinearAdapter
+from megatron.bridge.peft.utils import (
+    AdapterAttributes,
+    GroupedExpertLinearAdapter,
+    SharedOuterGroupedExpertAdapter,
+)
 
 
 class SimpleModel(nn.Module):
@@ -138,6 +148,23 @@ class GroupedExpertMegatronStyleModel(nn.Module):
         grouped_linear = MockMegatronLinear(2048, 512)
         grouped_linear.num_gemms = 2
         layer.mlp.experts.linear_fc2 = grouped_linear
+
+
+class GatedDeltaNetMegatronStyleModel(nn.Module):
+    """Model with a fused Gated DeltaNet ``in_proj`` for split-GDN tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.language_model = nn.Module()
+        self.language_model.decoder = nn.Module()
+        self.language_model.decoder.layers = nn.ModuleList([nn.Module()])
+
+        layer = self.language_model.decoder.layers[0]
+        mixer = nn.Module()
+        # q, k, v, z, beta, alpha -- the table GatedDeltaNet publishes.
+        mixer.in_proj_split_sections = (128, 128, 128, 128, 2, 2)
+        mixer.in_proj = MockMegatronLinear(2048, sum(mixer.in_proj_split_sections))
+        layer.self_attention = mixer
 
 
 class NestedModel(nn.Module):
@@ -576,6 +603,103 @@ class TestCanonicalLoRA:
         assert isinstance(adapted.adapter, GroupedExpertLinearAdapter)
         assert adapted.adapter.linear_in.weight.shape == torch.Size([2, 32, 2048])
         assert adapted.adapter.linear_out.weight.shape == torch.Size([2, 512, 32])
+
+    def test_canonical_lora_defaults_to_no_shared_outer_experts(self):
+        """The shared-outer layout is opt-in, matching LoRA()."""
+        assert CanonicalLoRA().experts_shared_outer_loras is False
+
+    def test_canonical_lora_grouped_expert_transform_can_use_shared_outer_adapters(self):
+        """experts_shared_outer_loras selects the shared-outer adapter and outranks share_expert_adapters."""
+        model = GroupedExpertMegatronStyleModel()
+        lora = CanonicalLoRA(
+            target_modules=["linear_fc2"],
+            share_expert_adapters=False,
+            experts_shared_outer_loras=True,
+        )
+
+        def mock_get_attrs(module, is_expert=False):
+            return AdapterAttributes(
+                input_is_parallel=True,
+                in_features=module.in_features,
+                out_features=module.out_features,
+                disable_tensor_parallel_comm=False,
+                disable_sequence_parallel_comm=True,
+                base_linear_is_parallel=True,
+            )
+
+        with patch(
+            "megatron.bridge.peft.canonical_lora.get_adapter_attributes_from_linear",
+            side_effect=mock_get_attrs,
+        ):
+            transformed_model = lora(model, training=True)
+
+        adapted = transformed_model.language_model.decoder.layers[0].mlp.experts.linear_fc2
+        assert isinstance(adapted, LoRALinear)
+        assert isinstance(adapted.adapter, SharedOuterGroupedExpertAdapter)
+
+    def test_canonical_lora_splits_routed_expert_fc1_only_under_shared_outer(self):
+        """Routed-expert fc1 stays fused by default and splits for the shared-outer layout."""
+        targets = ["linear_fc1_gate", "linear_fc1_up"]
+
+        def mock_get_attrs(module, is_expert=False):
+            return AdapterAttributes(
+                input_is_parallel=False,
+                in_features=module.in_features,
+                out_features=module.out_features,
+                disable_tensor_parallel_comm=False,
+                disable_sequence_parallel_comm=True,
+                base_linear_is_parallel=True,
+            )
+
+        def transform(**kwargs):
+            model = MoEMegatronStyleModel()
+            # The grouped adapters size themselves from the local expert count.
+            model.language_model.decoder.layers[0].mlp.experts.linear_fc1.num_gemms = 2
+            with patch(
+                "megatron.bridge.peft.canonical_lora.get_adapter_attributes_from_linear",
+                side_effect=mock_get_attrs,
+            ):
+                transformed = CanonicalLoRA(target_modules=targets, **kwargs)(model, training=True)
+            return transformed.language_model.decoder.layers[0].mlp.experts.linear_fc1
+
+        assert isinstance(transform(), LoRALinear)
+        assert isinstance(transform(experts_shared_outer_loras=True), LoRALinearSplitFC1UpGate)
+
+    def test_canonical_lora_splits_gated_deltanet_in_proj(self):
+        """in_proj_q/k/v/z become four adapters sized from the GDN head dims."""
+        model = GatedDeltaNetMegatronStyleModel()
+        lora = CanonicalLoRA(target_modules=["in_proj_q", "in_proj_k", "in_proj_v", "in_proj_z"])
+
+        def mock_get_attrs(module, is_expert=False):
+            return AdapterAttributes(
+                input_is_parallel=False,
+                in_features=module.in_features,
+                out_features=module.out_features,
+                disable_tensor_parallel_comm=False,
+                disable_sequence_parallel_comm=True,
+                base_linear_is_parallel=True,
+            )
+
+        with patch(
+            "megatron.bridge.peft.canonical_lora.get_adapter_attributes_from_linear",
+            side_effect=mock_get_attrs,
+        ):
+            transformed_model = lora(model, training=True)
+
+        adapted = transformed_model.language_model.decoder.layers[0].self_attention.in_proj
+        assert isinstance(adapted, LoRALinearSplitGDN)
+        # Sized from the mixer's own split table, not re-derived from config.
+        for component in ("adapter_q", "adapter_k", "adapter_v", "adapter_z"):
+            assert adapted.adapter[component].linear_out.weight.shape[0] == 128
+        # beta/alpha are not adaptable, so no adapter is built for them.
+        assert set(adapted.adapter.keys()) == {"adapter_q", "adapter_k", "adapter_v", "adapter_z"}
+        # The table reaches the wrapped projection during the walk.
+        assert adapted.to_wrap.in_proj_split_sections == (128, 128, 128, 128, 2, 2)
+
+    def test_canonical_lora_gdn_target_maps_onto_the_fused_parent(self):
+        """Each in_proj_* target registers against the fused in_proj module."""
+        lora = CanonicalLoRA(target_modules=["*.self_attention.in_proj_q", "*.self_attention.in_proj_z"])
+        assert lora.canonical_mapping["*.self_attention.in_proj"] == {"in_proj_q", "in_proj_z"}
 
     def test_canonical_lora_wildcard_matching(self):
         """Test CanonicalLoRA transformation with wildcard patterns."""

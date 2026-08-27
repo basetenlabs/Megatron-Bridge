@@ -2563,6 +2563,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         base_linear_is_parallel: bool = True,
         params_device: Optional[torch.device] = None,
         params_dtype: Optional[torch.dtype] = None,
+        split_fc1_component: bool = False,
     ) -> None:
         """Initialize shared-outer LoRA weights with one shared and one per-expert side."""
 
@@ -2574,6 +2575,14 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         self.dropout_position = dropout_position
         self.num_local_experts = num_local_experts
         self.base_linear_is_parallel = base_linear_is_parallel
+        # True when this factor is one half of a gate/up pair rather than both,
+        # which only the caller can know: the factor is ETP-sharded, so its width
+        # does not reveal it. Suppresses the gate/up split in sharded_state_dict.
+        #
+        # Transitional: once every model is on canonical targets no caller builds
+        # a fused (2*ffn-wide) fc1 factor, and this flag, the branch it guards,
+        # and _apply_grouped_expert_swiglu_sharded_factory can all be deleted.
+        self.split_fc1_component = split_fc1_component
         # ``is_expert=True`` is observed by param_mapping.py and by inherited
         # checkpoint helpers; the per-expert side's grad routing is set on its
         # 3D weight directly inside :class:`PackedPerExpertLinear`.
@@ -2677,7 +2686,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         linear_in_sd = self.linear_in.sharded_state_dict(f"{prefix}linear_in.", sharded_offsets, metadata)
         linear_out_sd = self.linear_out.sharded_state_dict(f"{prefix}linear_out.", sharded_offsets, metadata)
 
-        if self._is_fc1:
+        if self._is_fc1 and not self.split_fc1_component:
             singleton_local_shards = (metadata or {}).get("singleton_local_shards", False)
             linear_out_key = f"{prefix}linear_out.weight"
             linear_out_sd[linear_out_key] = _apply_grouped_expert_swiglu_sharded_factory(
