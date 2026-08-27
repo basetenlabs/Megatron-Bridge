@@ -153,7 +153,7 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         tail = self.index_kpool - 1 if self.index_kpool_always_select_tail else 0
         return self.index_topk + tail
 
-    def indexer_key_positions(self, seqlen: int, key_positions):
+    def indexer_key_positions(self, num_candidates: int, key_positions):
         """Judge causality in pool space, by each pool's last token.
 
         A candidate here is a pool of ``index_kpool`` consecutive tokens, so a query may
@@ -162,7 +162,11 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         pool indices unchanged would let a query select a pool whose members are all in
         its future.
         """
-        pools = seqlen // self.index_kpool
+        # num_candidates is already the pool count -- forward_before_topk returned one
+        # key per pool -- so it must not be divided by index_kpool again. Dividing twice
+        # silently produced too few positions, which broadcast harmlessly on a 16-token
+        # probe and raised "size of tensor a (11) must match tensor b (45)" at 180.
+        pools = num_candidates
         device = key_positions.device if key_positions is not None else None
         base = torch.arange(pools, device=device, dtype=torch.int32)
         return base * self.index_kpool + (self.index_kpool - 1)
