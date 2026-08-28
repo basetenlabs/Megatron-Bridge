@@ -17,6 +17,7 @@ import logging
 import os
 from typing import Any
 
+import torch
 from huggingface_hub import hf_hub_download
 from megatron.core.models.gpt.gpt_model import GPTModel
 from transformers import GlmMoeDsaForCausalLM
@@ -352,4 +353,7 @@ class GLM5Bridge(MegatronModelBridge):
     @staticmethod
     def _maybe_dequant_fp8(weight, param_name, hf_state_dict):
         scale_inv = hf_state_dict.get(param_name + "_scale_inv")
-        return maybe_dequantize_fp8_blockwise(weight, scale_inv)
+        # Keep the native blockwise checkpoint out of BF16 before TE stores it
+        # in its selected parameter format. The bridge streams one weight at a
+        # time, so the temporary FP32 logical tensor does not accumulate.
+        return maybe_dequantize_fp8_blockwise(weight, scale_inv, dtype=torch.float32)

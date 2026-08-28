@@ -17,6 +17,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 from transformers import GlmMoeDsaConfig
 
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
@@ -283,3 +284,19 @@ def test_mapping_registry_omits_mtp_mappings_without_nextn_layers(
     )
 
     assert all(not mapping.megatron_param.startswith("mtp.") for mapping in bridge.mapping_registry())
+
+
+def test_native_blockwise_fp8_dequantizes_to_fp32_before_target_quantization() -> None:
+    """Native GLM FP8 weights never pass through a BF16 loading intermediate."""
+    weight = torch.tensor([[1.0, -2.0], [3.0, -4.0]], dtype=torch.float32).to(torch.float8_e4m3fn)
+    scale_inv = torch.tensor([[0.125]], dtype=torch.float32)
+    param_name = "model.layers.0.mlp.gate_proj.weight"
+
+    result = GLM5Bridge._maybe_dequant_fp8(
+        weight,
+        param_name,
+        {f"{param_name}_scale_inv": scale_inv},
+    )
+
+    assert result.dtype is torch.float32
+    torch.testing.assert_close(result, weight.float() * scale_inv)
