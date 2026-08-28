@@ -1013,6 +1013,21 @@ class MegatronModelBridge(
             hf_weights = {k: hf_state_dict[v] for k, v in hf_param.items()}
         return hf_weights
 
+    def maybe_load_native_hf_weight(
+        self,
+        task: WeightConversionTask[Any],
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> bool:
+        """Optionally load a checkpoint tensor directly into native storage.
+
+        Subclasses can override this hook when the destination representation
+        must bypass ordinary tensor transformation and ``copy_``.
+
+        Returns:
+            Whether the destination was loaded and normal conversion should be skipped.
+        """
+        return False
+
     def maybe_modify_converted_hf_weight(
         self,
         task: WeightConversionTask,
@@ -1301,6 +1316,8 @@ class MegatronModelBridge(
         for task in self._with_progress_tracking(hf_to_megatron_tasks, description):
             # None means megatron module not on current rank, skip if this task is not going to happen
             if task.megatron_module is None:
+                continue
+            if self.maybe_load_native_hf_weight(task, hf_state_dict):
                 continue
             # 1) Fetch source tensor(s) from HF state dict, with caching for grouped mappings
             hf_param_key = str(task.mapping.hf_param)
