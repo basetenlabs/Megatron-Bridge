@@ -16,6 +16,35 @@ from megatron.bridge.models.kimi.kimi_k3_layers import KimiK3Attention, _linear
 from megatron.bridge.models.kimi.kimi_k3_ops import kda
 
 
+def _is_single_document(cu_seqlens: torch.Tensor | None) -> bool:
+    return (
+        cu_seqlens is not None and cu_seqlens.numel() == 2 and int(cu_seqlens[0]) == 0
+    )
+
+
+def _prepare_kda_inputs(
+    tensors: tuple[torch.Tensor, ...],
+    cu_seqlens: torch.Tensor | None,
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor | None, int]:
+    """Use dense KDA for one document and remove any trailing sequence padding."""
+    sequence_length = tensors[0].shape[1]
+    if not _is_single_document(cu_seqlens):
+        return tensors, cu_seqlens, sequence_length
+
+    valid_length = int(cu_seqlens[-1])
+    if not 0 < valid_length <= sequence_length:
+        raise ValueError(
+            f"single-document cu_seqlens ends at {valid_length}, expected 1..{sequence_length}"
+        )
+    # A batch dimension of one can hide a padded stride while still reporting
+    # contiguous, including when valid_length == sequence_length. TileLang's
+    # backward kernels require canonical input strides.
+    valid_tensors = tuple(
+        tensor[:, :valid_length].clone(memory_format=torch.contiguous_format) for tensor in tensors
+    )
+    return valid_tensors, None, valid_length
+
+
 def _doc_aware_causal_conv(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -103,17 +132,36 @@ class Glm5NextKDA(KimiK3Attention):
             h=self.local_num_heads,
         )
         beta = _linear(self.b_proj, x).float().sigmoid()
+        kda_cu_seqlens = cu_seqlens
+        kda_valid_length = q.shape[1]
+        if _is_single_document(cu_seqlens):
+            kda_valid_length = int(cu_seqlens[-1])
+            if not 0 < kda_valid_length <= q.shape[1]:
+                raise ValueError(
+                    f"single-document cu_seqlens ends at {kda_valid_length}, "
+                    f"expected 1..{q.shape[1]}"
+                )
+            # FLA's varlen KDA path mishandles a partial final chunk even for a
+            # single packed document. Dense causal KDA is equivalent on the
+            # valid prefix for [0, valid_length <= T] with trailing padding.
+            kda_cu_seqlens = None
         output = kda(
-            q,
-            k,
-            v,
-            forget_gate,
-            beta,
+            q[:, :kda_valid_length].clone(memory_format=torch.contiguous_format),
+            k[:, :kda_valid_length].clone(memory_format=torch.contiguous_format),
+            v[:, :kda_valid_length].clone(memory_format=torch.contiguous_format),
+            forget_gate[:, :kda_valid_length].clone(memory_format=torch.contiguous_format),
+            beta[:, :kda_valid_length].clone(memory_format=torch.contiguous_format),
             self.A_log,
             self.dt_bias,
             self.gate_lower_bound,
-            cu_seqlens=cu_seqlens,
+            cu_seqlens=kda_cu_seqlens,
         )
+        if kda_valid_length < q.shape[1]:
+            if output.requires_grad:
+                output.register_hook(
+                    lambda grad: grad.clone(memory_format=torch.contiguous_format)
+                )
+            output = F.pad(output, (0, 0, 0, 0, 0, q.shape[1] - kda_valid_length))
         gate = rearrange(
             _linear(self.g_b_proj, _linear(self.g_a_proj, x)),
             "b s (h d) -> b s h d",
@@ -192,6 +240,9 @@ class Glm5NextKDA(KimiK3Attention):
         v = rearrange(conv_inputs["v"].transpose(0, 1), "b s (h d) -> b s h d", h=heads_cp)
         forget_gate = rearrange(forget_gate.transpose(0, 1), "b s (h d) -> b s h d", h=heads_cp)
         beta = beta_logits.transpose(0, 1).float().sigmoid()
+        (q, k, v, forget_gate, beta), kda_cu_seqlens, _ = _prepare_kda_inputs(
+            (q, k, v, forget_gate, beta), cu_seqlens
+        )
 
         output = kda(
             q,
@@ -202,7 +253,9 @@ class Glm5NextKDA(KimiK3Attention):
             get_parameter_local_cp(self.A_log, dim=0, cp_group=self.cp_group),
             get_parameter_local_cp(self.dt_bias, dim=0, cp_group=self.cp_group),
             self.gate_lower_bound,
-            cu_seqlens=cu_seqlens,
+            # The original metadata remains in use by the CP all-to-all and
+            # document-aware convolution above.
+            cu_seqlens=kda_cu_seqlens,
         )
         gate = rearrange(gate.transpose(0, 1), "b s (h d) -> b s h d", h=heads_cp)
         output = self.o_norm(output.reshape(-1, self.head_dim), gate.reshape(-1, self.head_dim))
