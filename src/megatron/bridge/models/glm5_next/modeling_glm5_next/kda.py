@@ -118,8 +118,16 @@ class Glm5NextKDA(KimiK3Attention):
         cu_seqlens = packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
         if packed_seq_params is not None and cu_seqlens is None:
             raise ValueError("Packed GLM-5 Next KDA input requires cu_seqlens_q")
+        cu_seqlens_padded = (
+            packed_seq_params.cu_seqlens_q_padded if packed_seq_params is not None else None
+        )
+        if cu_seqlens_padded is None:
+            cu_seqlens_padded = cu_seqlens
 
-        conv_kwargs = {"output_final_state": False, "cu_seqlens": cu_seqlens}
+        # Convs must see the PHYSICAL (padded) boundaries: the THD packer pads
+        # each document in place, so unpadded boundaries are misaligned with
+        # the layout.
+        conv_kwargs = {"output_final_state": False, "cu_seqlens": cu_seqlens_padded}
         q, _ = self.q_conv1d(x=_linear(self.q_proj, x), **conv_kwargs)
         k, _ = self.k_conv1d(x=_linear(self.k_proj, x), **conv_kwargs)
         v, _ = self.v_conv1d(x=_linear(self.v_proj, x), **conv_kwargs)
@@ -145,6 +153,16 @@ class Glm5NextKDA(KimiK3Attention):
             # single packed document. Dense causal KDA is equivalent on the
             # valid prefix for [0, valid_length <= T] with trailing padding.
             kda_cu_seqlens = None
+        elif cu_seqlens is not None:
+            # Multi-document boundaries must also be the padded ones: a dangling
+            # tail (cu_seqlens[-1] < T) is never written by FLA's varlen backward,
+            # which corrupts valid-region gradients (uninitialized memory).
+            kda_cu_seqlens = cu_seqlens_padded
+            kda_valid_length = int(cu_seqlens_padded[-1])
+            if not 0 < kda_valid_length <= q.shape[1]:
+                raise ValueError(
+                    f"padded cu_seqlens ends at {kda_valid_length}, expected 1..{q.shape[1]}"
+                )
         output = kda(
             q[:, :kda_valid_length].clone(memory_format=torch.contiguous_format),
             k[:, :kda_valid_length].clone(memory_format=torch.contiguous_format),
