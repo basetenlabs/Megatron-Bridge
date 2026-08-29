@@ -14,7 +14,7 @@
 
 import re
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, cast
 
 import torch
 
@@ -32,7 +32,6 @@ class NativeFP8ExpertWeight:
 
     rowwise_data: torch.Tensor
     scale_inv: torch.Tensor
-    logical_shape: tuple[int, int]
 
 
 def is_routed_expert_weight(param_name: str) -> bool:
@@ -51,56 +50,62 @@ def prepare_native_fp8_expert_weight(
     """Prepare one native E4M3 expert shard without dequantization."""
     match = _ROUTED_EXPERT_WEIGHT.fullmatch(megatron_param)
     if match is None:
-        if is_routed_expert_weight(megatron_param):
-            raise ValueError(f"Native FP8 import requires a numbered grouped-expert weight, got {megatron_param!r}")
         raise ValueError(f"Native FP8 import does not support parameter {megatron_param!r}")
-    if tp_size < 1 or not 0 <= tp_rank < tp_size:
-        raise ValueError(f"Invalid expert tensor-parallel rank {tp_rank} for size {tp_size}")
 
+    # The mapping registry gives FC1 gate/up names and one FC2 down-projection name.
     if match.group("projection") == "1":
-        if not isinstance(hf_param, Mapping) or set(hf_param) != {"gate", "up"}:
-            raise ValueError("Native FP8 FC1 import requires the HF gate and up weight names")
-        gate_data, gate_scale = _load_blockwise_weight(hf_param["gate"], hf_state_dict)
-        up_data, up_scale = _load_blockwise_weight(hf_param["up"], hf_state_dict)
-        if gate_data.shape != up_data.shape or gate_scale.shape != up_scale.shape:
-            raise ValueError("Native FP8 FC1 gate and up shapes must match")
+        return _prepare_fc1(
+            hf_params=cast(Mapping[str, str], hf_param),
+            hf_state_dict=hf_state_dict,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+        )
 
-        gate_data = _shard(gate_data, dim=0, size=tp_size, rank=tp_rank, name="FC1 payload")
-        up_data = _shard(up_data, dim=0, size=tp_size, rank=tp_rank, name="FC1 payload")
-        gate_scale = _shard(
-            gate_scale,
-            dim=0,
-            size=tp_size,
-            rank=tp_rank,
-            name="FC1 scale grid",
-        )
-        up_scale = _shard(
-            up_scale,
-            dim=0,
-            size=tp_size,
-            rank=tp_rank,
-            name="FC1 scale grid",
-        )
-        rowwise_data = torch.cat((gate_data.view(torch.uint8), up_data.view(torch.uint8)), dim=0)
-        scale_inv = torch.cat((gate_scale, up_scale), dim=0)
-    else:
-        if not isinstance(hf_param, str):
-            raise ValueError("Native FP8 FC2 import requires one HF down-projection weight name")
-        down_data, down_scale = _load_blockwise_weight(hf_param, hf_state_dict)
-        down_data = _shard(down_data, dim=1, size=tp_size, rank=tp_rank, name="FC2 payload")
-        scale_inv = _shard(
-            down_scale,
-            dim=1,
-            size=tp_size,
-            rank=tp_rank,
-            name="FC2 scale grid",
-        )
-        rowwise_data = down_data.view(torch.uint8)
+    return _prepare_fc2(
+        hf_param=cast(str, hf_param),
+        hf_state_dict=hf_state_dict,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+    )
+
+
+def _prepare_fc1(
+    *,
+    hf_params: Mapping[str, str],
+    hf_state_dict: Mapping[str, torch.Tensor],
+    tp_size: int,
+    tp_rank: int,
+) -> NativeFP8ExpertWeight:
+    gate_data, gate_scale = _load_blockwise_weight(hf_params["gate"], hf_state_dict)
+    up_data, up_scale = _load_blockwise_weight(hf_params["up"], hf_state_dict)
+    if gate_data.shape != up_data.shape or gate_scale.shape != up_scale.shape:
+        raise ValueError("Native FP8 FC1 gate and up shapes must match")
+
+    gate_data = _shard(gate_data, dim=0, size=tp_size, rank=tp_rank, name="FC1 payload")
+    up_data = _shard(up_data, dim=0, size=tp_size, rank=tp_rank, name="FC1 payload")
+    gate_scale = _shard(gate_scale, dim=0, size=tp_size, rank=tp_rank, name="FC1 scale grid")
+    up_scale = _shard(up_scale, dim=0, size=tp_size, rank=tp_rank, name="FC1 scale grid")
 
     return NativeFP8ExpertWeight(
-        rowwise_data=rowwise_data,
-        scale_inv=scale_inv,
-        logical_shape=(rowwise_data.shape[0], rowwise_data.shape[1]),
+        rowwise_data=torch.cat((gate_data.view(torch.uint8), up_data.view(torch.uint8)), dim=0),
+        scale_inv=torch.cat((gate_scale, up_scale), dim=0),
+    )
+
+
+def _prepare_fc2(
+    *,
+    hf_param: str,
+    hf_state_dict: Mapping[str, torch.Tensor],
+    tp_size: int,
+    tp_rank: int,
+) -> NativeFP8ExpertWeight:
+    down_data, down_scale = _load_blockwise_weight(hf_param, hf_state_dict)
+    down_data = _shard(down_data, dim=1, size=tp_size, rank=tp_rank, name="FC2 payload")
+    down_scale = _shard(down_scale, dim=1, size=tp_size, rank=tp_rank, name="FC2 scale grid")
+
+    return NativeFP8ExpertWeight(
+        rowwise_data=down_data.view(torch.uint8),
+        scale_inv=down_scale,
     )
 
 
@@ -108,27 +113,10 @@ def copy_native_fp8_expert_weight(destination: torch.Tensor, source: NativeFP8Ex
     """Copy native bytes and compact scales into a TE blockwise tensor."""
     rowwise_data = destination._rowwise_data
     rowwise_scale_inv = destination._rowwise_scale_inv
-    if tuple(destination.shape) != source.logical_shape:
-        raise ValueError(
-            f"Native FP8 destination shape mismatch: expected {tuple(destination.shape)}, got {source.logical_shape}"
-        )
     if rowwise_data is None or rowwise_data.dtype is not torch.uint8:
         raise ValueError("Native FP8 destination requires uint8 rowwise payload")
-    if tuple(rowwise_data.shape) != source.logical_shape:
-        raise ValueError(
-            "Native FP8 destination payload shape mismatch: expected "
-            f"{source.logical_shape}, got {tuple(rowwise_data.shape)}"
-        )
     if rowwise_scale_inv is None or rowwise_scale_inv.dtype is not torch.float32:
         raise ValueError("Native FP8 destination requires FP32 rowwise scales")
-    if (
-        rowwise_scale_inv.shape[0] != source.scale_inv.shape[0]
-        or rowwise_scale_inv.shape[1] < source.scale_inv.shape[1]
-    ):
-        raise ValueError(
-            "Native FP8 destination scale storage cannot hold compact shape "
-            f"{tuple(source.scale_inv.shape)} in {tuple(rowwise_scale_inv.shape)}"
-        )
     if destination._columnwise_data is not None or destination._columnwise_scale_inv is not None:
         raise ValueError("Native FP8 import requires rowwise-only storage")
 

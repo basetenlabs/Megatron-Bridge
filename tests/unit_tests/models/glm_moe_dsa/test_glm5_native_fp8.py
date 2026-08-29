@@ -41,7 +41,6 @@ def test_prepare_fc1_preserves_payload_scales_and_etp_order() -> None:
         tp_rank=1,
     )
 
-    assert result.logical_shape == (256, 256)
     assert torch.equal(
         result.rowwise_data,
         torch.cat((gate[128:].view(torch.uint8), up[128:].view(torch.uint8))),
@@ -68,7 +67,6 @@ def test_prepare_fc2_shards_payload_and_scales_on_columns() -> None:
         tp_rank=1,
     )
 
-    assert result.logical_shape == (256, 128)
     assert torch.equal(result.rowwise_data, down[:, 128:].view(torch.uint8))
     assert torch.equal(result.scale_inv, scale[:, 1:])
 
