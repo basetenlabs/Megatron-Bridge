@@ -15,20 +15,27 @@
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, Mapping
 
+import torch
 from huggingface_hub import hf_hub_download
 from megatron.core.models.gpt.gpt_model import GPTModel
+from torch.distributed._tensor import DTensor
 from transformers import GlmMoeDsaForCausalLM
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     GatedMLPMapping,
     QKVMapping,
 )
 from megatron.bridge.models.conversion.quantization_utils import maybe_dequantize_fp8_blockwise
+from megatron.bridge.models.glm_moe_dsa.native_fp8_import import (
+    copy_native_fp8_expert_weight,
+    is_routed_expert_weight,
+    prepare_native_fp8_expert_weight,
+)
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.mla_provider import MLAModelProvider
 
@@ -339,6 +346,39 @@ class GLM5Bridge(MegatronModelBridge):
 
         return MegatronMappingRegistry(*mapping_list)
 
+    def maybe_load_native_hf_weight(
+        self,
+        task: WeightConversionTask,
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> bool:
+        """Load routed experts directly into TE blockwise FP8 storage."""
+        destination = task.param_weight
+        if destination is None or not is_routed_expert_weight(task.param_name):
+            return False
+
+        local_destination = destination._local_tensor if isinstance(destination, DTensor) else destination
+        is_quantized, is_blockwise = _classify_te_quantized_tensor(local_destination)
+        if not is_quantized:
+            return False
+        if isinstance(destination, DTensor):
+            raise ValueError("Native FP8 GLM expert import does not support Megatron-FSDP DTensor destinations")
+        if not is_blockwise:
+            raise ValueError(
+                "Native FP8 GLM expert import requires individual TE "
+                f"Float8BlockwiseQTensor parameters; got {type(destination).__name__} "
+                f"for {task.param_name!r}"
+            )
+
+        source = prepare_native_fp8_expert_weight(
+            megatron_param=task.param_name,
+            hf_param=task.mapping.hf_param,
+            hf_state_dict=hf_state_dict,
+            tp_size=task.mapping.tp_size,
+            tp_rank=task.mapping.tp_rank,
+        )
+        copy_native_fp8_expert_weight(destination, source)
+        return True
+
     def maybe_modify_loaded_hf_weight(self, hf_param, hf_state_dict):
         """Dequantize block-wise FP8 GLM-5.2 HF weights on load."""
         hf_weights = super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
@@ -353,3 +393,24 @@ class GLM5Bridge(MegatronModelBridge):
     def _maybe_dequant_fp8(weight, param_name, hf_state_dict):
         scale_inv = hf_state_dict.get(param_name + "_scale_inv")
         return maybe_dequantize_fp8_blockwise(weight, scale_inv)
+
+
+def _classify_te_quantized_tensor(tensor: torch.Tensor) -> tuple[bool, bool]:
+    """Classify a tensor without requiring Transformer Engine at import time."""
+    try:
+        from transformer_engine.pytorch.tensor import QuantizedTensor
+        from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
+            Float8BlockwiseQTensor,
+        )
+    except (ImportError, ModuleNotFoundError):
+        return False, False
+    try:
+        from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
+    except (ImportError, ModuleNotFoundError):
+        is_grouped = False
+    else:
+        is_grouped = isinstance(tensor, GroupedTensor)
+    return (
+        isinstance(tensor, QuantizedTensor) or is_grouped,
+        isinstance(tensor, Float8BlockwiseQTensor),
+    )
