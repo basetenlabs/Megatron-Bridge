@@ -40,7 +40,7 @@ def _prepare_kda_inputs(
     return valid_tensors, None, valid_length
 
 
-def _doc_aware_causal_conv(
+def _short_conv(
     x: torch.Tensor,
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
@@ -224,7 +224,7 @@ class Glm5NextKDA(KimiK3Attention):
         conv_inputs = {"q": q, "k": k, "v": v}
         for name in conv_inputs:
             conv_weight = get_parameter_local_cp(getattr(self, f"{name}_conv1d").weight, dim=0, cp_group=self.cp_group)
-            conv_inputs[name] = _doc_aware_causal_conv(conv_inputs[name], conv_weight, cu_seqlens)
+            conv_inputs[name] = _short_conv(conv_inputs[name], conv_weight, cu_seqlens)
 
         heads_cp = self.local_num_heads // cp
         q = rearrange(conv_inputs["q"].transpose(0, 1), "b s (h d) -> b s h d", h=heads_cp)
