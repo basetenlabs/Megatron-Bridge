@@ -9,6 +9,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net.common import (
     a2a_cp_to_hp,
     a2a_hp_to_cp,
+    causal_conv1d,
     get_parameter_local_cp,
 )
 
@@ -17,9 +18,7 @@ from megatron.bridge.models.kimi.kimi_k3_ops import kda
 
 
 def _is_single_document(cu_seqlens: torch.Tensor | None) -> bool:
-    return (
-        cu_seqlens is not None and cu_seqlens.numel() == 2 and int(cu_seqlens[0]) == 0
-    )
+    return cu_seqlens is not None and cu_seqlens.numel() == 2 and int(cu_seqlens[0]) == 0
 
 
 def _prepare_kda_inputs(
@@ -33,15 +32,11 @@ def _prepare_kda_inputs(
 
     valid_length = int(cu_seqlens[-1])
     if not 0 < valid_length <= sequence_length:
-        raise ValueError(
-            f"single-document cu_seqlens ends at {valid_length}, expected 1..{sequence_length}"
-        )
+        raise ValueError(f"single-document cu_seqlens ends at {valid_length}, expected 1..{sequence_length}")
     # A batch dimension of one can hide a padded stride while still reporting
     # contiguous, including when valid_length == sequence_length. TileLang's
     # backward kernels require canonical input strides.
-    valid_tensors = tuple(
-        tensor[:, :valid_length].clone(memory_format=torch.contiguous_format) for tensor in tensors
-    )
+    valid_tensors = tuple(tensor[:, :valid_length].clone(memory_format=torch.contiguous_format) for tensor in tensors)
     return valid_tensors, None, valid_length
 
 
@@ -54,32 +49,80 @@ def _doc_aware_causal_conv(
 
     Equivalent to ``ShortConvolution(activation="silu", bias=False)`` on each
     document independently. Used on the CP head-parallel path, where the conv
-    weight is a per-CP-rank channel slice and FLA's module (sized for the full
-    local channel count) cannot be called directly.
+    weight is a per-CP-rank channel slice: FLA's module is sized for the full
+    local channel count, but its functional kernel takes explicit weights —
+    the same Triton kernel the cp=1 ``ShortConvolution`` path runs, so cp>1
+    conv numerics match cp=1 exactly. Pure-torch fallback for CPU/FLA-less
+    environments.
 
     Args:
         x: ``[s, b, C]`` full-sequence activations for this rank's head shard.
         weight: ``[C, 1, K]`` depthwise conv weight slice (fp32 per K3 policy).
         cu_seqlens: global cumulative document lengths; ``None`` = one document.
     """
-    w = weight.squeeze(1).to(torch.float32)  # [C, K]
-    ksize = w.shape[-1]
-    seq_len = x.shape[0]
-    xf = x.float()
-    pos = torch.arange(seq_len, device=x.device)
-    doc = None
-    if cu_seqlens is not None:
-        doc = torch.bucketize(pos, cu_seqlens.to(device=x.device)[1:], right=True)
-    y = xf * w[:, ksize - 1]
-    for offset in range(1, ksize):
-        shifted = torch.zeros_like(xf)
-        shifted[offset:] = xf[:-offset]
-        keep = pos >= offset
-        if doc is not None:
-            same_doc = torch.zeros_like(keep)
-            same_doc[offset:] = doc[offset:] == doc[:-offset]
-            keep = keep & same_doc
-        y = y + shifted * w[:, ksize - 1 - offset] * keep.view(-1, 1, 1)
+    if causal_conv1d is not None and x.is_cuda:
+        if cu_seqlens is not None:
+            if x.shape[1] != 1:
+                raise ValueError(
+                    f"FLA varlen conv requires batch == 1, got batch={x.shape[1]}; "
+                    "it silently reads only the first batch otherwise"
+                )
+            if int(cu_seqlens[-1]) != x.shape[0]:
+                raise ValueError(
+                    f"cu_seqlens must span the full sequence (got {int(cu_seqlens[-1])} "
+                    f"!= {x.shape[0]}): FLA leaves rows past cu_seqlens[-1] uninitialized"
+                )
+        y, _ = causal_conv1d(
+            x=x.transpose(0, 1),  # [b, s, C]
+            weight=weight.squeeze(1),  # [C, K]
+            bias=None,
+            activation="silu",
+            initial_state=None,
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+        )
+        return y.transpose(0, 1)
+    return _doc_aware_causal_conv_torch(x, weight, cu_seqlens)
+
+
+def _doc_aware_causal_conv_torch(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+) -> torch.Tensor:
+    """Pure-torch fallback for ``_doc_aware_causal_conv``.
+
+    One fused depthwise conv over the packed sequence, then only the first
+    ``K - 1`` rows of each document are recomputed from same-document taps.
+    Unlike the FLA path this supports batch > 1 with packed documents and
+    computes a trailing padding region (``pos >= cu_seqlens[-1]``) as its own
+    implicit document.
+    """
+    wf = weight.to(torch.float32)  # [C, 1, K]
+    ksize = wf.shape[-1]
+    seq_len, _, channels = x.shape
+    xc = x.to(torch.float32).permute(1, 2, 0).contiguous()  # [b, C, s]
+    y = F.conv1d(xc, wf, padding=ksize - 1, groups=channels)[..., :seq_len]
+    y = y.permute(2, 0, 1)  # [s, b, C]
+    if cu_seqlens is not None and ksize > 1:
+        cu = cu_seqlens.to(device=x.device, dtype=torch.long)
+        # Rows within K-1 of a document start read the previous document
+        # through the global conv (and past cu[-1] the padding tail reads the
+        # last document). Recompute exactly those rows from same-document taps.
+        starts = cu[1:]
+        ends = torch.cat([cu[2:], cu.new_full((1,), seq_len)]).clamp(max=seq_len)
+        offsets = torch.arange(ksize - 1, device=x.device)
+        rows = starts[:, None] + offsets[None, :]  # [docs, K-1]
+        valid = rows < ends[:, None]
+        rows_v = rows[valid]
+        if rows_v.numel():
+            depth = offsets.expand_as(rows)[valid]  # row's distance from its doc start
+            taps = offsets[None, :] <= depth[:, None]  # [rows, K-1]
+            gather = (rows_v[:, None] - offsets[None, :]).clamp(min=0)
+            xg = x[gather].to(torch.float32)  # [rows, K-1, b, C]
+            wg = wf.squeeze(1)[:, ksize - 1 - offsets]  # [C, K-1]
+            fixed = torch.einsum("rjbc,cj,rj->rbc", xg, wg, taps.to(torch.float32))
+            y = y.index_put((rows_v,), fixed)
     return F.silu(y).to(x.dtype)
 
 
@@ -137,10 +180,7 @@ class Glm5NextKDA(KimiK3Attention):
         if _is_single_document(cu_seqlens):
             kda_valid_length = int(cu_seqlens[-1])
             if not 0 < kda_valid_length <= q.shape[1]:
-                raise ValueError(
-                    f"single-document cu_seqlens ends at {kda_valid_length}, "
-                    f"expected 1..{q.shape[1]}"
-                )
+                raise ValueError(f"single-document cu_seqlens ends at {kda_valid_length}, expected 1..{q.shape[1]}")
             # FLA's varlen KDA path mishandles a partial final chunk even for a
             # single packed document. Dense causal KDA is equivalent on the
             # valid prefix for [0, valid_length <= T] with trailing padding.
@@ -158,9 +198,7 @@ class Glm5NextKDA(KimiK3Attention):
         )
         if kda_valid_length < q.shape[1]:
             if output.requires_grad:
-                output.register_hook(
-                    lambda grad: grad.clone(memory_format=torch.contiguous_format)
-                )
+                output.register_hook(lambda grad: grad.clone(memory_format=torch.contiguous_format))
             output = F.pad(output, (0, 0, 0, 0, 0, q.shape[1] - kda_valid_length))
         gate = rearrange(
             _linear(self.g_b_proj, _linear(self.g_a_proj, x)),
@@ -223,15 +261,11 @@ class Glm5NextKDA(KimiK3Attention):
             seq_len_global,
             packed_seq_params,
         )
-        q, k, v, forget_gate, gate, beta_logits = torch.split(
-            packed, [section // cp for section in sections], dim=-1
-        )
+        q, k, v, forget_gate, gate, beta_logits = torch.split(packed, [section // cp for section in sections], dim=-1)
 
         conv_inputs = {"q": q, "k": k, "v": v}
         for name in conv_inputs:
-            conv_weight = get_parameter_local_cp(
-                getattr(self, f"{name}_conv1d").weight, dim=0, cp_group=self.cp_group
-            )
+            conv_weight = get_parameter_local_cp(getattr(self, f"{name}_conv1d").weight, dim=0, cp_group=self.cp_group)
             conv_inputs[name] = _doc_aware_causal_conv(conv_inputs[name], conv_weight, cu_seqlens)
 
         heads_cp = self.local_num_heads // cp
@@ -240,9 +274,7 @@ class Glm5NextKDA(KimiK3Attention):
         v = rearrange(conv_inputs["v"].transpose(0, 1), "b s (h d) -> b s h d", h=heads_cp)
         forget_gate = rearrange(forget_gate.transpose(0, 1), "b s (h d) -> b s h d", h=heads_cp)
         beta = beta_logits.transpose(0, 1).float().sigmoid()
-        (q, k, v, forget_gate, beta), kda_cu_seqlens, _ = _prepare_kda_inputs(
-            (q, k, v, forget_gate, beta), cu_seqlens
-        )
+        (q, k, v, forget_gate, beta), kda_cu_seqlens, _ = _prepare_kda_inputs((q, k, v, forget_gate, beta), cu_seqlens)
 
         output = kda(
             q,
