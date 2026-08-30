@@ -120,6 +120,44 @@ def _run_replicated_base_lora(rank: int, world_size: int, port: int) -> None:
     )
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
 
+    grad_local = (
+        torch.arange(
+            rank * actual.numel() + 1,
+            (rank + 1) * actual.numel() + 1,
+            device="cuda",
+            dtype=torch.float32,
+        ).reshape_as(actual)
+        / 100
+    )
+    (actual * grad_local).sum().backward()
+    assert adapter.linear_in.weight.grad is not None
+    assert adapter.linear_out.weight.grad is not None
+
+    # Megatron's sequence-parallel parameter reduction sums these local-token
+    # gradients across TP. Reproduce that reduction and compare with one dense
+    # autograd graph over the full sequence.
+    actual_a_grad = adapter.linear_in.weight.grad.detach().clone()
+    actual_b_grad = adapter.linear_out.weight.grad.detach().clone()
+    dist.all_reduce(actual_a_grad)
+    dist.all_reduce(actual_b_grad)
+
+    x_parts = [torch.empty_like(x_local) for _ in range(world_size)]
+    grad_parts = [torch.empty_like(grad_local) for _ in range(world_size)]
+    dist.all_gather(x_parts, x_local)
+    dist.all_gather(grad_parts, grad_local)
+    x_full = torch.cat(x_parts, dim=0)
+    grad_full = torch.cat(grad_parts, dim=0)
+
+    a_reference = adapter.linear_in.weight.detach().clone().requires_grad_()
+    b_reference = adapter.linear_out.weight.detach().clone().requires_grad_()
+    reference = torch.matmul(torch.matmul(x_full, a_reference.T), b_reference.T)
+    reference_a_grad, reference_b_grad = torch.autograd.grad(
+        (reference * grad_full).sum(),
+        (a_reference, b_reference),
+    )
+    torch.testing.assert_close(actual_a_grad, reference_a_grad, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(actual_b_grad, reference_b_grad, rtol=1e-6, atol=1e-6)
+
     parallel_state.destroy_model_parallel()
     dist.destroy_process_group()
 
