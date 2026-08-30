@@ -166,7 +166,9 @@ requires-dist = []
 [tool.uv.sources]
 megatron-core = { path = "3rdparty/Megatron-LM/", editable = true }
 nvidia-modelopt = { index = "nvidia" }
-flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "nv_dev" }
+# Exact commit (was branch "nv_dev"): a moving rev defeats the dependency-metadata
+# pin above — the tip's version no longer matches, so uv rebuilds it at lock time.
+flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" }
 
 [project.optional-dependencies]
 recipes = [
