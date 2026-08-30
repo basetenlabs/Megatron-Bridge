@@ -28,9 +28,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-requires_gpu = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="needs 1 CUDA device"
-)
+
+requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 1 CUDA device")
 
 SEQ_DOCS = (128, 64, 64)
 SEQ_LEN = sum(SEQ_DOCS)
@@ -135,9 +134,7 @@ def _packed_inputs(device):
     )
     torch.manual_seed(7)
     input_ids = torch.randint(0, VOCAB, (1, SEQ_LEN), device=device)
-    position_ids = torch.cat(
-        [torch.arange(n, device=device) for n in SEQ_DOCS]
-    ).unsqueeze(0)
+    position_ids = torch.cat([torch.arange(n, device=device) for n in SEQ_DOCS]).unsqueeze(0)
     return input_ids, position_ids, psp
 
 
@@ -151,16 +148,11 @@ def _forward_backward(model, input_ids, position_ids, psp):
     )
     loss = (logits.float() ** 2).mean()
     loss.backward()
-    grads = {
-        name: p.grad.detach().float().clone()
-        for name, p in model.named_parameters()
-        if p.grad is not None
-    }
+    grads = {name: p.grad.detach().float().clone() for name, p in model.named_parameters() if p.grad is not None}
     return logits.detach().float().clone(), loss.item(), grads
 
 
 def _run():
-    os.environ.setdefault("BT_GLM5_NEXT_MOE_DISPATCHER", "alltoall")
     torch.cuda.set_device(0)
     torch.distributed.init_process_group(
         "nccl",
@@ -181,14 +173,11 @@ def _run():
     # The noaux_tc router mutates its expert-bias buffer during a training
     # forward; both passes must start from identical state.
     initial_state = {
-        k: v.detach().clone() if isinstance(v, torch.Tensor) else v
-        for k, v in model.state_dict().items()
+        k: v.detach().clone() if isinstance(v, torch.Tensor) else v for k, v in model.state_dict().items()
     }
 
     assert model.config.recompute_granularity is None
-    logits_ref, loss_ref, grads_ref = _forward_backward(
-        model, input_ids, position_ids, psp
-    )
+    logits_ref, loss_ref, grads_ref = _forward_backward(model, input_ids, position_ids, psp)
 
     # Rerun the reference from the same state: the stack's intra-process
     # noise floor (incl. MoE routing flips), against which the recompute
@@ -200,16 +189,13 @@ def _run():
     model.config.recompute_granularity = "full"
     model.config.recompute_method = "uniform"
     model.config.recompute_num_layers = 1
-    logits_full, loss_full, grads_full = _forward_backward(
-        model, input_ids, position_ids, psp
-    )
+    logits_full, loss_full, grads_full = _forward_backward(model, input_ids, position_ids, psp)
 
     model.load_state_dict(initial_state)
     logits_full2, _, grads_full2 = _forward_backward(model, input_ids, position_ids, psp)
 
     assert grads_ref.keys() == grads_full.keys(), (
-        "parameter coverage differs between recompute modes: "
-        f"{sorted(set(grads_ref) ^ set(grads_full))}"
+        f"parameter coverage differs between recompute modes: {sorted(set(grads_ref) ^ set(grads_full))}"
     )
 
     def _compare(grads_a, grads_b, min_numel=1):
@@ -229,21 +215,12 @@ def _run():
     def _report(tag, logits_a, logits_b, grads_a, grads_b):
         fwd = (logits_b - logits_a).abs().max().item()
         mat, worst = _compare(grads_a, grads_b, min_numel=16)
-        print(
-            f"{tag} fwd={fwd} gradmat={mat} worst={worst} "
-            f"flips={_flips(logits_a, logits_b)}"
-        )
+        print(f"{tag} fwd={fwd} gradmat={mat} worst={worst} flips={_flips(logits_a, logits_b)}")
         return fwd, mat
 
-    noise_fwd_a, noise_mat_a = _report(
-        "NOISE ref-vs-ref", logits_ref, logits_ref2, grads_ref, grads_ref2
-    )
-    noise_fwd_b, noise_mat_b = _report(
-        "DET full-vs-full", logits_full, logits_full2, grads_full, grads_full2
-    )
-    fwd_err, grad_mat_err = _report(
-        "RESULT full-vs-ref", logits_ref, logits_full, grads_ref, grads_full
-    )
+    noise_fwd_a, noise_mat_a = _report("NOISE ref-vs-ref", logits_ref, logits_ref2, grads_ref, grads_ref2)
+    noise_fwd_b, noise_mat_b = _report("DET full-vs-full", logits_full, logits_full2, grads_full, grads_full2)
+    fwd_err, grad_mat_err = _report("RESULT full-vs-ref", logits_ref, logits_full, grads_ref, grads_full)
     print(
         f"SUMMARY fwd={fwd_err} gradmat={grad_mat_err} "
         f"noise_fwd={max(noise_fwd_a, noise_fwd_b)} "
@@ -283,9 +260,7 @@ def test_glm5_next_mhc_full_recompute_grad_parity():
         output,
     )
     assert match, f"no SUMMARY line in output:\n{output[-4000:]}"
-    fwd_err, grad_mat_err, noise_fwd, noise_gradmat, loss_rel = map(
-        float, match.groups()
-    )
+    fwd_err, grad_mat_err, noise_fwd, noise_gradmat, loss_rel = map(float, match.groups())
     # The recompute delta is judged against the stack's own same-path rerun
     # noise (dense-MoE backward atomics dominate small-param grads); the
     # discrete top-k ops are configured non-discarding so selection flips
@@ -294,8 +269,7 @@ def test_glm5_next_mhc_full_recompute_grad_parity():
         f"full-recompute logits diverge beyond noise: {fwd_err} vs noise {noise_fwd}"
     )
     assert grad_mat_err < max(0.5, 3 * noise_gradmat), (
-        f"full-recompute grads diverge beyond noise: {grad_mat_err} "
-        f"vs noise {noise_gradmat}"
+        f"full-recompute grads diverge beyond noise: {grad_mat_err} vs noise {noise_gradmat}"
     )
     assert loss_rel < 1e-3, f"full-recompute loss diverges: rel {loss_rel}"
 
