@@ -73,6 +73,7 @@ from megatron.bridge.models.glm import (
     GLM45Bridge,
     GLM47FlashBridge,
 )
+from megatron.bridge.models.glm5_next import Glm5NextBridge
 from megatron.bridge.models.glm_moe_dsa import (
     GLM5Bridge,
 )
@@ -315,6 +316,7 @@ __all__ = [
     "Step37Bridge",
     "Step37Model",
     "Step37ModelProvider",
+    "Glm5NextBridge",
     # EXAONE
     "Exaone4Bridge",
     "Exaone45Bridge",
