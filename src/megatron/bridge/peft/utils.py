@@ -97,16 +97,6 @@ HAVE_TE = all(
 )
 
 
-class _ReplicatedLinear(TELinear):
-    """Duplicated TELinear metadata with a lightweight native linear forward."""
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
-        return nn.functional.linear(x, self.weight), None
-
-    def backward_dw(self) -> None:
-        """Weight gradients are computed by the native autograd graph."""
-
-
 @cache
 def _te_grouped_linear_uses_explicit_m_splits(
     autograd_function: type[torch.autograd.Function],
@@ -1052,7 +1042,7 @@ class ParallelLinearAdapter(nn.Module):
                 raise ValueError("Replicated adapters are only supported for non-expert linears")
             if not HAVE_TE:
                 raise RuntimeError("Replicated adapters require Transformer Engine")
-            self.linear_in = _ReplicatedLinear(
+            self.linear_in = TELinear(
                 in_features,
                 dim,
                 parallel_mode="duplicated",
@@ -1063,7 +1053,7 @@ class ParallelLinearAdapter(nn.Module):
                 skip_weight_param_allocation=False,
                 tp_group=None,
             )
-            self.linear_out = _ReplicatedLinear(
+            self.linear_out = TELinear(
                 dim,
                 out_features,
                 parallel_mode="duplicated",

@@ -515,7 +515,7 @@ class TestParallelLinearAdapter:
     @patch("megatron.bridge.peft.utils.HAVE_TE", True)
     @patch("megatron.bridge.peft.utils.ColumnParallelLinear")
     @patch("megatron.bridge.peft.utils.RowParallelLinear")
-    @patch("megatron.bridge.peft.utils._ReplicatedLinear")
+    @patch("megatron.bridge.peft.utils.TELinear")
     def test_parallel_linear_adapter_replicates_both_factors(
         self, mock_te_linear, mock_row_linear, mock_col_linear, mock_config
     ):
