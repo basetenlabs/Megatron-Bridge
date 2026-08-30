@@ -71,7 +71,10 @@ classifiers = [
     "Topic :: Utilities",
 ]
 dependencies = [
-    "transformers>=5.8,<=5.12.1",
+    # Floor: transformers.models.glm5_next (glm5_next_vl_model.py's lazy import)
+    # first ships in 5.15. Ceiling: the VL wrapper monkey-binds Glm5NextModel
+    # methods (get_image_features, get_placeholder_mask), so hold back major bumps.
+    "transformers>=5.15.1,<6",
     "mistral-common>=1.10.0",
     "peft>=0.18.1",
     "datasets>=2.20.0",
