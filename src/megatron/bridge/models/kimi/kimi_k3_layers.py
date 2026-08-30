@@ -95,6 +95,10 @@ class KimiK3ShortConvolution(ShortConvolution):
 class KimiK3Attention(MegatronModule):
     """Select KDA or Kimi's no-RoPE MLA according to the global layer number."""
 
+    # KDA context parallelism is opt-in per subclass: the a2a head-parallel path
+    # must slice per-head state and conv weights, which this base class does not do.
+    supports_kda_cp = False
+
     def __init__(
         self,
         config,
@@ -123,7 +127,7 @@ class KimiK3Attention(MegatronModule):
 
         self.layer_idx = layer_number - 1
         self.is_kda = layer_number in config.kimi_kda_layers
-        if self.is_kda and self.cp_size > 1:
+        if self.is_kda and self.cp_size > 1 and not self.supports_kda_cp:
             raise ValueError("Kimi K3 KDA context parallelism is not supported yet")
         if self.is_kda:
             self._init_kda(config)
