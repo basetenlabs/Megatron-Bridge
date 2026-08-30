@@ -52,78 +52,36 @@ def _doc_aware_causal_conv(
     weight is a per-CP-rank channel slice: FLA's module is sized for the full
     local channel count, but its functional kernel takes explicit weights —
     the same Triton kernel the cp=1 ``ShortConvolution`` path runs, so cp>1
-    conv numerics match cp=1 exactly. Pure-torch fallback for CPU/FLA-less
-    environments.
+    conv numerics match cp=1 exactly.
 
     Args:
         x: ``[s, b, C]`` full-sequence activations for this rank's head shard.
         weight: ``[C, 1, K]`` depthwise conv weight slice (fp32 per K3 policy).
         cu_seqlens: global cumulative document lengths; ``None`` = one document.
     """
-    if causal_conv1d is not None and x.is_cuda:
-        if cu_seqlens is not None:
-            if x.shape[1] != 1:
-                raise ValueError(
-                    f"FLA varlen conv requires batch == 1, got batch={x.shape[1]}; "
-                    "it silently reads only the first batch otherwise"
-                )
-            if int(cu_seqlens[-1]) != x.shape[0]:
-                raise ValueError(
-                    f"cu_seqlens must span the full sequence (got {int(cu_seqlens[-1])} "
-                    f"!= {x.shape[0]}): FLA leaves rows past cu_seqlens[-1] uninitialized"
-                )
-        y, _ = causal_conv1d(
-            x=x.transpose(0, 1),  # [b, s, C]
-            weight=weight.squeeze(1),  # [C, K]
-            bias=None,
-            activation="silu",
-            initial_state=None,
-            output_final_state=False,
-            cu_seqlens=cu_seqlens,
-        )
-        return y.transpose(0, 1)
-    return _doc_aware_causal_conv_torch(x, weight, cu_seqlens)
-
-
-def _doc_aware_causal_conv_torch(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    cu_seqlens: torch.Tensor | None,
-) -> torch.Tensor:
-    """Pure-torch fallback for ``_doc_aware_causal_conv``.
-
-    One fused depthwise conv over the packed sequence, then only the first
-    ``K - 1`` rows of each document are recomputed from same-document taps.
-    Unlike the FLA path this supports batch > 1 with packed documents and
-    computes a trailing padding region (``pos >= cu_seqlens[-1]``) as its own
-    implicit document.
-    """
-    wf = weight.to(torch.float32)  # [C, 1, K]
-    ksize = wf.shape[-1]
-    seq_len, _, channels = x.shape
-    xc = x.to(torch.float32).permute(1, 2, 0).contiguous()  # [b, C, s]
-    y = F.conv1d(xc, wf, padding=ksize - 1, groups=channels)[..., :seq_len]
-    y = y.permute(2, 0, 1)  # [s, b, C]
-    if cu_seqlens is not None and ksize > 1:
-        cu = cu_seqlens.to(device=x.device, dtype=torch.long)
-        # Rows within K-1 of a document start read the previous document
-        # through the global conv (and past cu[-1] the padding tail reads the
-        # last document). Recompute exactly those rows from same-document taps.
-        starts = cu[1:]
-        ends = torch.cat([cu[2:], cu.new_full((1,), seq_len)]).clamp(max=seq_len)
-        offsets = torch.arange(ksize - 1, device=x.device)
-        rows = starts[:, None] + offsets[None, :]  # [docs, K-1]
-        valid = rows < ends[:, None]
-        rows_v = rows[valid]
-        if rows_v.numel():
-            depth = offsets.expand_as(rows)[valid]  # row's distance from its doc start
-            taps = offsets[None, :] <= depth[:, None]  # [rows, K-1]
-            gather = (rows_v[:, None] - offsets[None, :]).clamp(min=0)
-            xg = x[gather].to(torch.float32)  # [rows, K-1, b, C]
-            wg = wf.squeeze(1)[:, ksize - 1 - offsets]  # [C, K-1]
-            fixed = torch.einsum("rjbc,cj,rj->rbc", xg, wg, taps.to(torch.float32))
-            y = y.index_put((rows_v,), fixed)
-    return F.silu(y).to(x.dtype)
+    if causal_conv1d is None:
+        raise RuntimeError("GLM-5 Next KDA requires flash-linear-attention's causal_conv1d")
+    if cu_seqlens is not None:
+        if x.shape[1] != 1:
+            raise ValueError(
+                f"FLA varlen conv requires batch == 1, got batch={x.shape[1]}; "
+                "it silently reads only the first batch otherwise"
+            )
+        if int(cu_seqlens[-1]) != x.shape[0]:
+            raise ValueError(
+                f"cu_seqlens must span the full sequence (got {int(cu_seqlens[-1])} "
+                f"!= {x.shape[0]}): FLA leaves rows past cu_seqlens[-1] uninitialized"
+            )
+    y, _ = causal_conv1d(
+        x=x.transpose(0, 1),  # [b, s, C]
+        weight=weight.squeeze(1),  # [C, K]
+        bias=None,
+        activation="silu",
+        initial_state=None,
+        output_final_state=False,
+        cu_seqlens=cu_seqlens,
+    )
+    return y.transpose(0, 1)
 
 
 class Glm5NextKDA(KimiK3Attention):
