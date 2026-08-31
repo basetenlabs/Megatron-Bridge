@@ -37,6 +37,11 @@ from megatron.bridge.models.conversion.param_mapping import (
 )
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.kimi.kimi_k3_provider import KimiK3ModelProvider
+from megatron.bridge.models.kimi.native_nvfp4_import import (
+    copy_native_nvfp4_expert_weight,
+    is_routed_expert_weight,
+    prepare_native_nvfp4_expert_weight,
+)
 
 
 @MegatronModelBridge.register_bridge(
@@ -277,6 +282,40 @@ class KimiK3Bridge(MegatronModelBridge):
             )
         return hf_state_dict[name]
 
+    def maybe_load_native_hf_weight(
+        self,
+        task: WeightConversionTask,
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> bool:
+        """Load routed experts directly into TE NVFP4 storage.
+
+        Returning False leaves the parameter to the normal path, which dequantizes
+        MXFP4 to BF16. That is still the default; only a model built under the
+        NVFP4 expert policy presents a quantized destination here.
+        """
+        destination = task.param_weight
+        if destination is None or not is_routed_expert_weight(task.param_name):
+            return False
+
+        is_quantized, is_nvfp4 = _classify_te_quantized_tensor(destination)
+        if not is_quantized:
+            return False
+        if not is_nvfp4:
+            raise ValueError(
+                "Native NVFP4 K3 expert import requires individual TE NVFP4Tensor "
+                f"parameters; got {type(destination).__name__} for {task.param_name!r}"
+            )
+
+        source = prepare_native_nvfp4_expert_weight(
+            megatron_param=task.param_name,
+            hf_param=task.mapping.hf_param,
+            hf_state_dict=hf_state_dict,
+            tp_size=task.mapping.tp_size,
+            tp_rank=task.mapping.tp_rank,
+        )
+        copy_native_nvfp4_expert_weight(destination, source)
+        return True
+
     def maybe_modify_loaded_hf_weight(
         self,
         hf_param: str | dict[str, str],
@@ -390,3 +429,13 @@ class KimiK3Bridge(MegatronModelBridge):
         for name in source.get_all_keys():
             if name.startswith(self._HF_PASSTHROUGH_PREFIXES):
                 yield from HFWeightTuple(name, state[name]).iter_finalized(cpu=cpu)
+
+
+def _classify_te_quantized_tensor(tensor: torch.Tensor) -> tuple[bool, bool]:
+    """Classify a tensor without requiring Transformer Engine at import time."""
+    try:
+        from transformer_engine.pytorch.tensor import QuantizedTensor
+        from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Tensor
+    except (ImportError, ModuleNotFoundError):
+        return False, False
+    return isinstance(tensor, QuantizedTensor), isinstance(tensor, NVFP4Tensor)
