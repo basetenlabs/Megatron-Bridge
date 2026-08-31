@@ -148,9 +148,7 @@ def _prepare_fc2(
     return _build_expert_weight(rowwise_data=down_data, exponents=down_exponent)
 
 
-def _build_expert_weight(
-    *, rowwise_data: torch.Tensor, exponents: torch.Tensor
-) -> NativeNVFP4ExpertWeight:
+def _build_expert_weight(*, rowwise_data: torch.Tensor, exponents: torch.Tensor) -> NativeNVFP4ExpertWeight:
     """Regroup MXFP4 scales into NVFP4's two scaling levels, exactly.
 
     ``exponents`` holds the raw E8M0 bytes, so the source scale of a block is
@@ -185,9 +183,7 @@ def _build_expert_weight(
     # Each source scale covers 32 elements, which is two NVFP4 blocks of 16.
     block_scale = block_scale.repeat_interleave(_MXFP4_GROUP_SIZE // _NVFP4_BLOCK_SIZE, dim=1)
 
-    amax = torch.tensor(
-        [2.0**global_exponent * _NVFP4_E2M1_MAX * _NVFP4_E4M3_MAX], dtype=torch.float32
-    )
+    amax = torch.tensor([2.0**global_exponent * _NVFP4_E2M1_MAX * _NVFP4_E4M3_MAX], dtype=torch.float32)
     return NativeNVFP4ExpertWeight(
         rowwise_data=rowwise_data,
         scale_inv=block_scale.to(torch.float8_e4m3fn).view(torch.uint8),
@@ -195,9 +191,7 @@ def _build_expert_weight(
     )
 
 
-def copy_native_nvfp4_expert_weight(
-    destination: torch.Tensor, source: NativeNVFP4ExpertWeight
-) -> None:
+def copy_native_nvfp4_expert_weight(destination: torch.Tensor, source: NativeNVFP4ExpertWeight) -> None:
     """Copy native nibbles, regrouped scales, and the per-tensor amax into a TE tensor."""
     rowwise_data = destination._rowwise_data
     rowwise_scale_inv = destination._rowwise_scale_inv
@@ -217,13 +211,25 @@ def copy_native_nvfp4_expert_weight(
             f"Native NVFP4 payload shape {tuple(source.rowwise_data.shape)} does not match "
             f"destination {tuple(rowwise_data.shape)}"
         )
+    source_scale_shape = tuple(source.scale_inv.shape)
+    destination_scale_shape = tuple(rowwise_scale_inv.shape)
+    if (
+        len(destination_scale_shape) != 2
+        or destination_scale_shape[0] != source_scale_shape[0]
+        or destination_scale_shape[1] < source_scale_shape[1]
+    ):
+        raise ValueError(
+            f"Native NVFP4 scale grid shape {source_scale_shape} does not fit destination {destination_scale_shape}"
+        )
+    if amax.shape != source.amax.shape:
+        raise ValueError(
+            f"Native NVFP4 amax shape {tuple(source.amax.shape)} does not match destination {tuple(amax.shape)}"
+        )
 
     with torch.no_grad():
         rowwise_data.copy_(source.rowwise_data.to(device=rowwise_data.device))
         rowwise_scale_inv.zero_()
-        rowwise_scale_inv[:, : source.scale_inv.shape[1]].copy_(
-            source.scale_inv.to(device=rowwise_scale_inv.device)
-        )
+        rowwise_scale_inv[:, : source.scale_inv.shape[1]].copy_(source.scale_inv.to(device=rowwise_scale_inv.device))
         amax.copy_(source.amax.to(device=amax.device))
 
 
@@ -249,15 +255,11 @@ def _load_mxfp4_weight(
     columns = packed.shape[1] * 2
     if columns % _MXFP4_GROUP_SIZE != 0:
         raise ValueError(
-            f"MXFP4 weight {weight_name!r} needs whole {_MXFP4_GROUP_SIZE}-element groups, "
-            f"got {columns} columns"
+            f"MXFP4 weight {weight_name!r} needs whole {_MXFP4_GROUP_SIZE}-element groups, got {columns} columns"
         )
     expected_scale_shape = (packed.shape[0], columns // _MXFP4_GROUP_SIZE)
     if tuple(scale.shape) != expected_scale_shape:
-        raise ValueError(
-            f"MXFP4 scale for {weight_name!r} must be {expected_scale_shape}, "
-            f"got {tuple(scale.shape)}"
-        )
+        raise ValueError(f"MXFP4 scale for {weight_name!r} must be {expected_scale_shape}, got {tuple(scale.shape)}")
     return packed, scale
 
 

@@ -39,9 +39,7 @@ _MXFP4_GROUP_SIZE = 32
 def _random_mxfp4(rows: int, columns: int, *, exponent_span: int = 10, seed: int = 0):
     """Build a packed MXFP4 tensor and its E8M0 scales."""
     generator = torch.Generator().manual_seed(seed)
-    packed = torch.randint(
-        0, 256, (rows, columns // 2), dtype=torch.uint8, generator=generator
-    )
+    packed = torch.randint(0, 256, (rows, columns // 2), dtype=torch.uint8, generator=generator)
     # Biased E8M0 exponents around 2^-10, spanning the requested range.
     scale = torch.randint(
         127 - 10,
@@ -172,9 +170,7 @@ def test_copy_writes_payload_scales_and_amax_and_zeroes_scale_padding():
     copy_native_nvfp4_expert_weight(destination, prepared)
 
     torch.testing.assert_close(destination._rowwise_data, packed, rtol=0, atol=0)
-    torch.testing.assert_close(
-        destination._rowwise_scale_inv[:, :8], prepared.scale_inv, rtol=0, atol=0
-    )
+    torch.testing.assert_close(destination._rowwise_scale_inv[:, :8], prepared.scale_inv, rtol=0, atol=0)
     assert bool((destination._rowwise_scale_inv[:, 8:] == 0).all())
     torch.testing.assert_close(destination._amax_rowwise, prepared.amax, rtol=0, atol=0)
 
@@ -196,4 +192,25 @@ def test_copy_refuses_a_swizzled_scale_layout():
     destination._with_gemm_swizzled_scales = True
 
     with pytest.raises(ValueError, match="unswizzled scale layout"):
+        copy_native_nvfp4_expert_weight(destination, prepared)
+
+
+@pytest.mark.parametrize("scale_shape", [(15, 8), (16, 7)])
+def test_copy_refuses_an_incompatible_destination_scale_grid(scale_shape):
+    packed, scale = _random_mxfp4(16, 128, seed=7)
+    prepared = _build_expert_weight(rowwise_data=packed, exponents=scale)
+    destination = _FakeNVFP4Destination(16, 128, scale_columns=8)
+    destination._rowwise_scale_inv = torch.zeros(scale_shape, dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="scale grid shape"):
+        copy_native_nvfp4_expert_weight(destination, prepared)
+
+
+def test_copy_refuses_an_incompatible_destination_amax_shape():
+    packed, scale = _random_mxfp4(16, 128, seed=8)
+    prepared = _build_expert_weight(rowwise_data=packed, exponents=scale)
+    destination = _FakeNVFP4Destination(16, 128, scale_columns=8)
+    destination._amax_rowwise = torch.zeros(2, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="amax shape"):
         copy_native_nvfp4_expert_weight(destination, prepared)
