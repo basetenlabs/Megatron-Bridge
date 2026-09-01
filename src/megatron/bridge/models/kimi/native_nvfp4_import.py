@@ -156,7 +156,10 @@ def _build_expert_weight(*, rowwise_data: torch.Tensor, exponents: torch.Tensor)
     exponent puts every block scale at or below 2^8, and the span check below is
     what guarantees none falls under 2^-9.
     """
-    present = exponents[exponents > 0]
+    bytes_per_group = _MXFP4_GROUP_SIZE // 2
+    payload_groups = rowwise_data.reshape(*exponents.shape, bytes_per_group)
+    empty_groups = torch.all(payload_groups == 0, dim=-1)
+    present = exponents[~empty_groups]
     if present.numel() == 0:
         raise ValueError("Native NVFP4 import found an expert weight with no non-zero scales")
 
@@ -172,10 +175,10 @@ def _build_expert_weight(*, rowwise_data: torch.Tensor, exponents: torch.Tensor)
 
     global_exponent = max_exponent - _E4M3_MAX_EXACT_EXPONENT
     block_exponents = exponents.int() - _E8M0_BIAS - global_exponent
-    # A zero E8M0 byte means the block is empty; keep it at zero rather than
-    # turning it into a very small but non-zero scale.
+    # Empty payload groups need no scale. E8M0 byte zero is otherwise the valid
+    # exponent -127 and must not be confused with a zero scale.
     block_scale = torch.where(
-        exponents > 0,
+        ~empty_groups,
         torch.pow(2.0, block_exponents.float()),
         torch.zeros_like(block_exponents, dtype=torch.float32),
     )

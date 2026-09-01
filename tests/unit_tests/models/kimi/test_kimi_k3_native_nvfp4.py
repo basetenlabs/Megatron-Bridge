@@ -86,6 +86,23 @@ def test_scale_regroup_covers_two_blocks_per_source_scale():
     torch.testing.assert_close(block_scale[:, ::2], block_scale[:, 1::2], rtol=0, atol=0)
 
 
+def test_zero_e8m0_exponent_preserves_nonzero_payload():
+    """E8M0 byte zero means 2^-127, not a zero scale."""
+    packed = torch.zeros((1, _MXFP4_GROUP_SIZE // 2), dtype=torch.uint8)
+    packed[0, 0] = 1
+    scale = torch.zeros((1, 1), dtype=torch.uint8)
+
+    prepared = _build_expert_weight(rowwise_data=packed, exponents=scale)
+
+    block_scale = prepared.scale_inv.view(torch.float8_e4m3fn).float()
+    global_scale = prepared.amax.float() / (6.0 * 448.0)
+    equivalent_scale = block_scale[:, ::2] * global_scale
+    expected = dequantize_mxfp4_e2m1_packed(packed, scale)
+    actual = dequantize_mxfp4_e2m1_packed(packed, equivalent_scale)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_exponent_span_wider_than_e4m3_is_rejected():
     """Silently rounding a scale would corrupt an expert, so this must raise."""
     packed, scale = _random_mxfp4(8, 128, exponent_span=20)
