@@ -21,6 +21,7 @@ https://github.com/radixark/miles/tree/dc62a0bd4b7af1c59ee2084852eb18b5585ec082/
 import copy
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 from fla.modules import FusedRMSNormGated, ShortConvolution
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -33,6 +34,12 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.gated_delta_net.common import (
+    a2a_cp_to_hp,
+    a2a_hp_to_cp,
+    causal_conv1d,
+    get_parameter_local_cp,
+)
 from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
 from megatron.core.tensor_parallel.mappings import (
     copy_to_tensor_model_parallel_region,
@@ -64,6 +71,97 @@ def _linear(module: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
     return output
 
 
+def _is_single_document(cu_seqlens: torch.Tensor | None) -> bool:
+    return cu_seqlens is not None and cu_seqlens.numel() == 2 and int(cu_seqlens[0]) == 0
+
+
+def _prepare_kda_inputs(
+    tensors: tuple[torch.Tensor, ...],
+    cu_seqlens: torch.Tensor | None,
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor | None, int]:
+    """Use dense KDA for one document and remove any trailing sequence padding.
+
+    FLA's varlen KDA path mishandles a partial final chunk even when the pack
+    holds a single document. Dense causal KDA is equivalent on the valid prefix
+    ``[0, valid_length]``, so trim to it and drop ``cu_seqlens``.
+
+    Args:
+        tensors: ``[b, s, ...]`` KDA inputs that share the sequence dimension.
+        cu_seqlens: cumulative document lengths, or ``None`` for a dense stream.
+
+    Returns:
+        The (possibly trimmed) tensors, the cu_seqlens to hand to ``kda``, and
+        the valid sequence length the outputs cover.
+    """
+    sequence_length = tensors[0].shape[1]
+    if not _is_single_document(cu_seqlens):
+        return tensors, cu_seqlens, sequence_length
+
+    valid_length = int(cu_seqlens[-1])
+    if not 0 < valid_length <= sequence_length:
+        raise ValueError(f"single-document cu_seqlens ends at {valid_length}, expected 1..{sequence_length}")
+    # A batch dimension of one can hide a padded stride while still reporting
+    # contiguous, including when valid_length == sequence_length. TileLang's
+    # backward kernels require canonical input strides.
+    valid_tensors = tuple(tensor[:, :valid_length].clone(memory_format=torch.contiguous_format) for tensor in tensors)
+    return valid_tensors, None, valid_length
+
+
+def _short_conv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+) -> torch.Tensor:
+    """Depthwise causal conv + silu that resets at packed-document boundaries.
+
+    Equivalent to ``ShortConvolution(activation="silu", bias=False)`` on each
+    document independently. Used on the CP head-parallel path, where the conv
+    weight is a per-CP-rank channel slice: FLA's module is sized for the full
+    local channel count, but its functional kernel takes explicit weights —
+    the same Triton kernel the cp=1 ``ShortConvolution`` path runs, so cp>1
+    conv numerics match cp=1 exactly.
+
+    Args:
+        x: ``[s, b, C]`` full-sequence activations for this rank's head shard.
+        weight: ``[C, 1, K]`` depthwise conv weight slice (fp32 per K3 policy).
+        cu_seqlens: global cumulative document lengths; ``None`` = one document.
+    """
+    if causal_conv1d is None:
+        raise RuntimeError("KDA context parallelism requires flash-linear-attention's causal_conv1d")
+    if cu_seqlens is not None:
+        if x.shape[1] != 1:
+            raise ValueError(
+                f"FLA varlen conv requires batch == 1, got batch={x.shape[1]}; "
+                "it silently reads only the first batch otherwise"
+            )
+        if int(cu_seqlens[-1]) != x.shape[0]:
+            raise ValueError(
+                f"cu_seqlens must span the full sequence (got {int(cu_seqlens[-1])} "
+                f"!= {x.shape[0]}): FLA leaves rows past cu_seqlens[-1] uninitialized"
+            )
+    y, _ = causal_conv1d(
+        x=x.transpose(0, 1),  # [b, s, C]
+        weight=weight.squeeze(1),  # [C, K]
+        bias=None,
+        activation="silu",
+        initial_state=None,
+        output_final_state=False,
+        cu_seqlens=cu_seqlens,
+    )
+    return y.transpose(0, 1)
+
+
+def kda_cp_split_sections(local_projection_size: int, local_num_heads: int) -> tuple[int, ...]:
+    """Per-section widths of the fused KDA projection, local to this TP rank.
+
+    The head-parallel all-to-all splits every section evenly across CP ranks,
+    so the widths must be the ones this rank actually holds: the q/k/v/forget/
+    gate projections are column-parallel (``local_projection_size`` wide) and
+    ``b_proj`` emits one channel per local head.
+    """
+    return (local_projection_size,) * 5 + (local_num_heads,)
+
+
 class KimiK3ShortConvolution(ShortConvolution):
     """TP-sharded KDA short convolution with FP32 state."""
 
@@ -93,11 +191,16 @@ class KimiK3ShortConvolution(ShortConvolution):
 
 
 class KimiK3Attention(MegatronModule):
-    """Select KDA or Kimi's no-RoPE MLA according to the global layer number."""
+    """Select KDA or Kimi's no-RoPE MLA according to the global layer number.
 
-    # KDA context parallelism is opt-in per subclass: the a2a head-parallel path
-    # must slice per-head state and conv weights, which this base class does not do.
-    supports_kda_cp = False
+    Context parallel (cp>1) runs the KDA layers GDN-style head-parallel: an
+    all-to-all converts the sequence-sharded activations into full-sequence
+    shards over a head subset, the recurrence runs unchanged, and a second
+    all-to-all restores sequence sharding. Per-head state (``A_log``/``dt_bias``)
+    and the depthwise conv weights are sliced per CP rank; gradients flow into
+    the full parameters through the slice views. The MLA layers get CP from
+    ``TEDotProductAttention`` as usual.
+    """
 
     def __init__(
         self,
@@ -127,8 +230,6 @@ class KimiK3Attention(MegatronModule):
 
         self.layer_idx = layer_number - 1
         self.is_kda = layer_number in config.kimi_kda_layers
-        if self.is_kda and self.cp_size > 1 and not self.supports_kda_cp:
-            raise ValueError("Kimi K3 KDA context parallelism is not supported yet")
         if self.is_kda:
             self._init_kda(config)
         else:
@@ -220,6 +321,11 @@ class KimiK3Attention(MegatronModule):
         _mark_tp_replicated(self.o_norm, reduction="sum")
         self.o_proj = self._row_linear(self.projection_size, hidden_size)
         self.gate_lower_bound = config.kimi_kda_gate_lower_bound
+        if self.cp_size > 1 and self.local_num_heads % self.cp_size:
+            raise ValueError(
+                f"KDA heads per TP rank ({self.local_num_heads}) must be divisible by "
+                f"context parallel size ({self.cp_size})"
+            )
 
     def _init_mla(self, config) -> None:
         hidden_size = config.hidden_size
@@ -284,11 +390,22 @@ class KimiK3Attention(MegatronModule):
         )
         return sharded_state_dict
 
+    def _gate_projection(self, x: torch.Tensor) -> torch.Tensor:
+        """Project the KDA output gate to ``[..., local_projection_size]``.
+
+        Kimi K3 gates from a single column-parallel projection. Variants with a
+        different gate (GLM-5 Next's two-stage low-rank gate, for one) override
+        this and inherit both the dense and the context-parallel forward.
+        """
+        return _linear(self.g_proj, x)
+
     def _forward_kda(
         self,
         hidden_states: torch.Tensor,
         packed_seq_params: PackedSeqParams | None,
     ) -> torch.Tensor:
+        if self.cp_size > 1:
+            return self._forward_kda_cp(hidden_states, packed_seq_params)
         x = hidden_states.transpose(0, 1)
         cu_seqlens = packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
         if packed_seq_params is not None and cu_seqlens is None:
@@ -307,6 +424,10 @@ class KimiK3Attention(MegatronModule):
             h=self.local_num_heads,
         )
         beta = _linear(self.b_proj, x).float().sigmoid()
+        sequence_length = q.shape[1]
+        (q, k, v, forget_gate, beta), kda_cu_seqlens, valid_length = _prepare_kda_inputs(
+            (q, k, v, forget_gate, beta), cu_seqlens
+        )
         output = kda(
             q,
             k,
@@ -316,12 +437,102 @@ class KimiK3Attention(MegatronModule):
             self.A_log,
             self.dt_bias,
             self.gate_lower_bound,
-            cu_seqlens=cu_seqlens,
+            cu_seqlens=kda_cu_seqlens,
         )
-        gate = rearrange(_linear(self.g_proj, x), "b s (h d) -> b s h d", h=self.local_num_heads)
+        if valid_length < sequence_length:
+            if output.requires_grad:
+                output.register_hook(lambda grad: grad.clone(memory_format=torch.contiguous_format))
+            output = F.pad(output, (0, 0, 0, 0, 0, sequence_length - valid_length))
+        gate = rearrange(self._gate_projection(x), "b s (h d) -> b s h d", h=self.local_num_heads)
         output = self.o_norm(output.reshape(-1, self.head_dim), gate.reshape(-1, self.head_dim))
         output = output.view(*gate.shape).flatten(-2)
         return _linear(self.o_proj, output.to(hidden_states.dtype)).transpose(0, 1)
+
+    def _resolve_global_cu_seqlens(
+        self, packed_seq_params: PackedSeqParams | None, seq_len_global: int
+    ) -> torch.Tensor | None:
+        if packed_seq_params is None:
+            return None
+        cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+        if cu_seqlens is None:
+            cu_seqlens = packed_seq_params.cu_seqlens_q
+        if cu_seqlens is None:
+            raise ValueError("Packed KDA input requires cu_seqlens_q")
+        if int(cu_seqlens[-1]) != seq_len_global:
+            raise ValueError(
+                f"cu_seqlens must be global under context parallelism: got total "
+                f"{int(cu_seqlens[-1])} for global sequence length {seq_len_global}"
+            )
+        return cu_seqlens
+
+    def _forward_kda_cp(
+        self,
+        hidden_states: torch.Tensor,
+        packed_seq_params: PackedSeqParams | None,
+    ) -> torch.Tensor:
+        # hidden_states: [s_local, b, hidden], sequence-sharded over CP in the
+        # attention load-balanced (zigzag) layout the THD packer emits.
+        cp = self.cp_size
+        seq_len_global = hidden_states.shape[0] * cp
+        cu_seqlens = self._resolve_global_cu_seqlens(packed_seq_params, seq_len_global)
+
+        sections = kda_cp_split_sections(self.local_projection_size, self.local_num_heads)
+        packed = torch.cat(
+            [
+                _linear(self.q_proj, hidden_states),
+                _linear(self.k_proj, hidden_states),
+                _linear(self.v_proj, hidden_states),
+                _linear(self.f_b_proj, _linear(self.f_a_proj, hidden_states)),
+                self._gate_projection(hidden_states),
+                _linear(self.b_proj, hidden_states),
+            ],
+            dim=-1,
+        )
+        # [s_local, b, sum(sections)] -> [s_global, b, sum(sections)/cp] in
+        # natural token order (the THD perm folds the un-zigzag).
+        packed, thd_cp_a2a_inv = a2a_cp_to_hp(
+            packed,
+            sections,
+            cp,
+            self.cp_group,
+            cu_seqlens,
+            seq_len_global,
+            packed_seq_params,
+        )
+        q, k, v, forget_gate, gate, beta_logits = torch.split(packed, [section // cp for section in sections], dim=-1)
+
+        conv_inputs = {"q": q, "k": k, "v": v}
+        for name in conv_inputs:
+            conv_weight = get_parameter_local_cp(getattr(self, f"{name}_conv1d").weight, dim=0, cp_group=self.cp_group)
+            conv_inputs[name] = _short_conv(conv_inputs[name], conv_weight, cu_seqlens)
+
+        heads_cp = self.local_num_heads // cp
+        q = rearrange(conv_inputs["q"].transpose(0, 1), "b s (h d) -> b s h d", h=heads_cp)
+        k = rearrange(conv_inputs["k"].transpose(0, 1), "b s (h d) -> b s h d", h=heads_cp)
+        v = rearrange(conv_inputs["v"].transpose(0, 1), "b s (h d) -> b s h d", h=heads_cp)
+        forget_gate = rearrange(forget_gate.transpose(0, 1), "b s (h d) -> b s h d", h=heads_cp)
+        beta = beta_logits.transpose(0, 1).float().sigmoid()
+        (q, k, v, forget_gate, beta), kda_cu_seqlens, _ = _prepare_kda_inputs((q, k, v, forget_gate, beta), cu_seqlens)
+
+        output = kda(
+            q,
+            k,
+            v,
+            forget_gate,
+            beta,
+            get_parameter_local_cp(self.A_log, dim=0, cp_group=self.cp_group),
+            get_parameter_local_cp(self.dt_bias, dim=0, cp_group=self.cp_group),
+            self.gate_lower_bound,
+            # The original metadata remains in use by the CP all-to-all and
+            # document-aware convolution above.
+            cu_seqlens=kda_cu_seqlens,
+        )
+        gate = rearrange(gate.transpose(0, 1), "b s (h d) -> b s h d", h=heads_cp)
+        output = self.o_norm(output.reshape(-1, self.head_dim), gate.reshape(-1, self.head_dim))
+        output = output.view(*gate.shape).flatten(-2).transpose(0, 1)
+        # [s_global, b, proj/cp] -> [s_local, b, proj], back in zigzag layout.
+        output = a2a_hp_to_cp(output, cp, self.cp_group, packed_seq_params, thd_cp_a2a_inv)
+        return _linear(self.o_proj, output.to(hidden_states.dtype))
 
     def _forward_mla(
         self,

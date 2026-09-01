@@ -1,15 +1,16 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for preparing single-document inputs for FLA KDA."""
+"""Unit tests for the shared KDA input helpers in the Kimi K3 layer stack."""
 
 import pytest
 import torch
 
 
 try:
-    from megatron.bridge.models.glm5_next.modeling_glm5_next.kda import (
+    from megatron.bridge.models.kimi.kimi_k3_layers import (
         _is_single_document,
         _prepare_kda_inputs,
+        kda_cp_split_sections,
     )
 
     HAVE_BRIDGE = True
@@ -77,3 +78,32 @@ def test_multi_document_preserves_varlen_metadata():
 def test_invalid_single_document_length_is_rejected(end):
     with pytest.raises(ValueError, match="single-document cu_seqlens"):
         _prepare_kda_inputs(_inputs(), torch.tensor([0, end], dtype=torch.int32))
+
+
+@requires_bridge
+def test_cp_split_sections_are_tp_local():
+    """The a2a sections must be this rank's widths, not the global ones.
+
+    Every section is split evenly across CP ranks by the head permutation, so
+    feeding global widths silently mis-slices the fused projection at tp>1 —
+    the case Kimi K3 runs (tp=16/32) and GLM-5.3 Flash does not (tp=1).
+    """
+    num_heads, head_dim, tp = 96, 128, 16
+    local_num_heads = num_heads // tp
+    local_projection_size = local_num_heads * head_dim
+
+    sections = kda_cp_split_sections(local_projection_size, local_num_heads)
+
+    assert sections == (local_projection_size,) * 5 + (local_num_heads,)
+    # The width the fused projection actually produces on this rank.
+    assert sum(sections) == 5 * local_projection_size + local_num_heads
+    assert sum(sections) != 5 * num_heads * head_dim + local_num_heads
+
+
+@requires_bridge
+@pytest.mark.parametrize("cp", [2, 3, 6])
+def test_cp_split_sections_divide_evenly_for_k3_b300_mesh(cp):
+    """K3's B300 mesh (96 KDA heads, tp=16) leaves 6 heads per rank."""
+    local_num_heads = 96 // 16
+    sections = kda_cp_split_sections(local_num_heads * 128, local_num_heads)
+    assert all(section % cp == 0 for section in sections)
