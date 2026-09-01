@@ -881,12 +881,23 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
 
         self.is_gemma4_sliding_layer = is_sliding
         if is_sliding:
-            # Latched, not re-tried per step: the flash kernel's rejection is a property
-            # of (arch, geometry), so retrying would pay an exception and a wasted kernel
-            # compile on every microbatch to reach the same answer. Gemma4DenseProvider
-            # can set force_flex_attention to skip the doomed attempt altogether on
-            # hardware where the failure is known in advance.
-            self._flex_sliding_active = bool(getattr(config, "force_flex_attention", False))
+            # Latched on the provider config, not re-tried per step: the flash kernel's
+            # rejection is a property of (arch, geometry), so retrying would pay an
+            # exception and a wasted kernel compile on every microbatch to reach the same
+            # answer. Setting force_flex_attention on Gemma4DenseProvider skips the doomed
+            # attempt from the start where the failure is known in advance.
+            #
+            # Read once, not defaulted at the call site: a config without the field is a
+            # wiring bug, and silently reading False would turn it into a crash 50 layers
+            # later on the hardware that needs the fallback most.
+            if not hasattr(config, "force_flex_attention"):
+                raise AttributeError(
+                    "Gemma 4 sliding attention needs 'force_flex_attention' on the "
+                    f"config; {type(config).__name__} does not declare it. "
+                    "Gemma4DenseProvider defines it -- a config that reaches here "
+                    "without it is mis-wired."
+                )
+            self.force_flex_attention = bool(config.force_flex_attention)
             self._gemma4_window = config.window_size
             self._sliding_softmax_scale = (
                 softmax_scale if softmax_scale is not None else config.softmax_scale
@@ -926,7 +937,7 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
     ) -> Tensor:
         """Route sliding layers to Transformer Engine and global layers to torch SDPA."""
         if self.is_gemma4_sliding_layer:
-            if not self._flex_sliding_active:
+            if not self.force_flex_attention:
                 try:
                     return super().forward(
                         query,
@@ -944,17 +955,23 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
                     # original traceback intact.
                     if not _is_unsupported_shape_error(exc):
                         raise
+                    # Latches this layer only. Gemma4DenseSelfAttention hands each layer
+                    # its own copy.copy() of the config, so there is no shared object to
+                    # flip: all 50 sliding layers each pay one caught exception and log
+                    # once (measured 200 lines across 4 ranks, under a second in total).
+                    # Setting force_flex_attention on the provider avoids it entirely,
+                    # which is why the Blackwell golden rows set it.
                     logger.warning(
                         "Gemma 4 sliding attention: Transformer Engine cannot serve "
                         "head_dim %d with window %s on this device (%s). Falling back to "
-                        "FlexAttention for the remainder of the process. Set "
-                        "Gemma4DenseProvider.force_flex_attention=True to skip this "
-                        "attempt on future runs.",
+                        "FlexAttention for every sliding layer for the rest of this "
+                        "process. Set Gemma4DenseProvider.force_flex_attention=True to "
+                        "skip this attempt from the start.",
                         query.size(-1),
                         self._gemma4_window,
                         exc,
                     )
-                    self._flex_sliding_active = True
+                    self.force_flex_attention = True
 
             return self._flex_sliding_attention(
                 query,
