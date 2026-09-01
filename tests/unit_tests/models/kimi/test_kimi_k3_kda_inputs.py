@@ -109,3 +109,44 @@ def test_cp_split_sections_divide_evenly_for_k3_b300_mesh(cp):
     local_num_heads = 96 // 16
     sections = kda_cp_split_sections(local_num_heads * 128, local_num_heads)
     assert all(section % cp == 0 for section in sections)
+
+
+@pytest.mark.skipif(not HAVE_BRIDGE, reason="megatron.bridge not importable")
+def test_head_perm_and_parameter_slice_agree_at_tp_gt_1():
+    """The a2a permutation and the per-rank parameter slices must pick the same heads.
+
+    The CP path permutes the fused projection with
+    ``_build_head_perm_for_split_sections(sections, cp)`` and then slices
+    ``A_log``/``dt_bias``/conv weights with ``get_parameter_local_cp``. If those
+    two disagree about which heads rank r owns, every rank computes a correct
+    recurrence on mismatched state and the output is silently wrong -- no shape
+    error anywhere.
+
+    Runs on CPU: this is index arithmetic, not a collective, so it covers the
+    tp>1 case that the 2-GPU cp2-vs-cp1 parity test (tp=1 only) cannot reach.
+    """
+    torch = pytest.importorskip("torch")
+    from megatron.core.ssm.gated_delta_net.common import _build_head_perm_for_split_sections
+
+    tp, cp, num_heads, head_dim = 16, 2, 96, 128
+    local_num_heads = num_heads // tp
+    local_projection_size = local_num_heads * head_dim
+    sections = kda_cp_split_sections(local_projection_size, local_num_heads)
+
+    width = sum(sections)
+    perm = _build_head_perm_for_split_sections(sections, cp, torch.device("cpu"))
+    assert perm.numel() == width, "permutation must cover the fused projection exactly"
+    assert sorted(perm.tolist()) == list(range(width)), "permutation must be a bijection"
+
+    # After the permutation, the a2a hands rank r the r-th contiguous block.
+    per_rank = width // cp
+    for rank in range(cp):
+        block = perm[rank * per_rank : (rank + 1) * per_rank].tolist()
+        # Rebuild what that block should be: from each section in order, the
+        # r-th even chunk -- exactly what get_parameter_local_cp slices out.
+        expected, offset = [], 0
+        for size in sections:
+            chunk = size // cp
+            expected.extend(range(offset + rank * chunk, offset + (rank + 1) * chunk))
+            offset += size
+        assert block == expected, f"rank {rank} a2a block does not match its parameter slice"
