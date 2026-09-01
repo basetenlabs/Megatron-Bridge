@@ -75,6 +75,26 @@ def _is_single_document(cu_seqlens: torch.Tensor | None) -> bool:
     return cu_seqlens is not None and cu_seqlens.numel() == 2 and int(cu_seqlens[0]) == 0
 
 
+def _physical_cu_seqlens(packed_seq_params: PackedSeqParams | None) -> torch.Tensor | None:
+    """The document boundaries as laid out in memory.
+
+    The packer advances by the *padded* length per document but reports
+    ``cu_seqlens_q`` as the unpadded cumulative lengths, emitting
+    ``cu_seqlens_q_padded`` only when the two differ. The conv and KDA kernels
+    segment the physical buffer, so they need the padded boundaries: fed the
+    unpadded ones they reset state early and leave the real tail tokens
+    uninitialized, with no error.
+    """
+    if packed_seq_params is None:
+        return None
+    cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+    if cu_seqlens is None:
+        cu_seqlens = packed_seq_params.cu_seqlens_q
+    if cu_seqlens is None:
+        raise ValueError("Packed KDA input requires cu_seqlens_q")
+    return cu_seqlens
+
+
 def _prepare_kda_inputs(
     tensors: tuple[torch.Tensor, ...],
     cu_seqlens: torch.Tensor | None,
@@ -95,7 +115,10 @@ def _prepare_kda_inputs(
     """
     sequence_length = tensors[0].shape[1]
     if not _is_single_document(cu_seqlens):
-        return tensors, cu_seqlens, sequence_length
+        # A [b, s, h, d] view of a transposed [s, b, C] tensor is non-contiguous
+        # whenever b > 1. contiguous() is a no-op on the b == 1 shapes the packed
+        # path produces, so this costs nothing in the common case.
+        return tuple(tensor.contiguous() for tensor in tensors), cu_seqlens, sequence_length
 
     valid_length = int(cu_seqlens[-1])
     if not 0 < valid_length <= sequence_length:
@@ -407,9 +430,7 @@ class KimiK3Attention(MegatronModule):
         if self.cp_size > 1:
             return self._forward_kda_cp(hidden_states, packed_seq_params)
         x = hidden_states.transpose(0, 1)
-        cu_seqlens = packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
-        if packed_seq_params is not None and cu_seqlens is None:
-            raise ValueError("Packed KDA input requires cu_seqlens_q")
+        cu_seqlens = _physical_cu_seqlens(packed_seq_params)
 
         conv_kwargs = {"output_final_state": False, "cu_seqlens": cu_seqlens}
         q, _ = self.q_conv1d(x=_linear(self.q_proj, x), **conv_kwargs)
@@ -451,17 +472,24 @@ class KimiK3Attention(MegatronModule):
     def _resolve_global_cu_seqlens(
         self, packed_seq_params: PackedSeqParams | None, seq_len_global: int
     ) -> torch.Tensor | None:
-        if packed_seq_params is None:
+        cu_seqlens = _physical_cu_seqlens(packed_seq_params)
+        if cu_seqlens is None:
             return None
-        cu_seqlens = packed_seq_params.cu_seqlens_q_padded
-        if cu_seqlens is None:
-            cu_seqlens = packed_seq_params.cu_seqlens_q
-        if cu_seqlens is None:
-            raise ValueError("Packed KDA input requires cu_seqlens_q")
         if int(cu_seqlens[-1]) != seq_len_global:
             raise ValueError(
                 f"cu_seqlens must be global under context parallelism: got total "
                 f"{int(cu_seqlens[-1])} for global sequence length {seq_len_global}"
+            )
+        # _build_thd_cp_a2a_perm floor-divides each document length by 2*cp and
+        # each start offset by cp. A remainder there does not raise; it produces
+        # an out-of-range chunk index that either scrambles tokens across
+        # documents or dies later in index_select with a device-side assert.
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        if bool((lengths % (2 * self.cp_size) != 0).any()):
+            raise ValueError(
+                f"every packed document length must be a multiple of 2*cp "
+                f"({2 * self.cp_size}) for the zigzag CP partition, got "
+                f"{lengths.tolist()}"
             )
         return cu_seqlens
 

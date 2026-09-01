@@ -84,9 +84,11 @@ def test_invalid_single_document_length_is_rejected(end):
 def test_cp_split_sections_are_tp_local():
     """The a2a sections must be this rank's widths, not the global ones.
 
-    Every section is split evenly across CP ranks by the head permutation, so
-    feeding global widths silently mis-slices the fused projection at tp>1 —
-    the case Kimi K3 runs (tp=16/32) and GLM-5.3 Flash does not (tp=1).
+    Global widths sum past the fused projection's actual last dimension at
+    tp>1, so the head permutation runs off the end of the tensor and
+    index_select dies with a device-side assert. It does not silently produce
+    wrong numbers. tp>1 is the case Kimi K3 runs (tp=16/32) and GLM-5.3 Flash
+    does not (tp=1), which is why this went unnoticed.
     """
     num_heads, head_dim, tp = 96, 128, 16
     local_num_heads = num_heads // tp

@@ -155,6 +155,12 @@ def _run_rank(rank: int, world: int, rdv_file: str, result_file: str, layer_name
     torch.manual_seed(1234)
     layer_cp = layer_class(config, layer_number=1, pg_collection=_PGs(tp=self_group, cp=cp_group)).to(device)
     layer_ref = layer_class(config, layer_number=1, pg_collection=_PGs(tp=self_group, cp=self_group)).to(device)
+    # _init_kda allocates A_log/dt_bias with torch.empty. Uninitialized memory
+    # that happens to hold a NaN or a huge value makes chunk_kda return NaN and
+    # the parity assertion fail at random, so pin them before the forward.
+    with torch.no_grad():
+        layer_cp.A_log.normal_(mean=0.0, std=0.5)
+        layer_cp.dt_bias.normal_(mean=0.0, std=0.5)
     layer_ref.load_state_dict(layer_cp.state_dict())
 
     torch.manual_seed(7)  # identical stream on both ranks
