@@ -158,7 +158,7 @@ def _build_expert_weight(*, rowwise_data: torch.Tensor, exponents: torch.Tensor)
     """
     bytes_per_group = _MXFP4_GROUP_SIZE // 2
     payload_groups = rowwise_data.reshape(*exponents.shape, bytes_per_group)
-    empty_groups = torch.all(payload_groups == 0, dim=-1)
+    empty_groups = torch.all(payload_groups & 0x77 == 0, dim=-1)
     present = exponents[~empty_groups]
     if present.numel() == 0:
         raise ValueError("Native NVFP4 import found an expert weight with no non-zero scales")
@@ -209,6 +209,8 @@ def copy_native_nvfp4_expert_weight(destination: torch.Tensor, source: NativeNVF
         raise ValueError("Native NVFP4 import requires rowwise-only storage")
     if destination._with_gemm_swizzled_scales:
         raise ValueError("Native NVFP4 import requires an unswizzled scale layout")
+    if float(getattr(destination, "_nvfp4_e4m3_max", _NVFP4_E4M3_MAX)) != _NVFP4_E4M3_MAX:
+        raise ValueError("Native NVFP4 import requires the standard E4M3 maximum of 448")
     if rowwise_data.shape != source.rowwise_data.shape:
         raise ValueError(
             f"Native NVFP4 payload shape {tuple(source.rowwise_data.shape)} does not match "

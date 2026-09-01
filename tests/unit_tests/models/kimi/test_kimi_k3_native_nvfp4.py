@@ -103,6 +103,18 @@ def test_zero_e8m0_exponent_preserves_nonzero_payload():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_signed_zero_payload_does_not_expand_exponent_span():
+    packed = torch.zeros((1, _MXFP4_GROUP_SIZE), dtype=torch.uint8)
+    packed[:, : _MXFP4_GROUP_SIZE // 2] = 0x88
+    packed[0, _MXFP4_GROUP_SIZE // 2] = 1
+    scale = torch.tensor([[0, 127]], dtype=torch.uint8)
+
+    prepared = _build_expert_weight(rowwise_data=packed, exponents=scale)
+
+    block_scale = prepared.scale_inv.view(torch.float8_e4m3fn).float()
+    assert bool((block_scale[:, :2] == 0).all())
+
+
 def test_exponent_span_wider_than_e4m3_is_rejected():
     """Silently rounding a scale would corrupt an expert, so this must raise."""
     packed, scale = _random_mxfp4(8, 128, exponent_span=20)
@@ -209,6 +221,16 @@ def test_copy_refuses_a_swizzled_scale_layout():
     destination._with_gemm_swizzled_scales = True
 
     with pytest.raises(ValueError, match="unswizzled scale layout"):
+        copy_native_nvfp4_expert_weight(destination, prepared)
+
+
+def test_copy_refuses_a_nonstandard_e4m3_maximum():
+    packed, scale = _random_mxfp4(16, 128, seed=6)
+    prepared = _build_expert_weight(rowwise_data=packed, exponents=scale)
+    destination = _FakeNVFP4Destination(16, 128, scale_columns=8)
+    destination._nvfp4_e4m3_max = 256.0
+
+    with pytest.raises(ValueError, match="standard E4M3 maximum of 448"):
         copy_native_nvfp4_expert_weight(destination, prepared)
 
 
