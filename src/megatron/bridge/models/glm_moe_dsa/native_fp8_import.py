@@ -20,10 +20,12 @@ import torch
 
 
 _FP8_BLOCK_SIZE = 128
+# Wrapped backbones (e.g. the glm5_next VL model) expose the GPTModel as a
+# submodule, so param names may carry a dotted module-path prefix.
 _ROUTED_EXPERT_WEIGHT = re.compile(
-    r"^decoder\.layers\.\d+\.mlp\.experts\.linear_fc(?P<projection>[12])\.weight(?P<expert>\d+)$"
+    r"^(?:\w+\.)*decoder\.layers\.\d+\.mlp\.experts\.linear_fc(?P<projection>[12])\.weight(?P<expert>\d+)$"
 )
-_ROUTED_EXPERT_PREFIX = re.compile(r"^decoder\.layers\.\d+\.mlp\.experts\.linear_fc[12]\.weight")
+_ROUTED_EXPERT_PREFIX = re.compile(r"^(?:\w+\.)*decoder\.layers\.\d+\.mlp\.experts\.linear_fc[12]\.weight")
 
 
 @dataclass(frozen=True)
