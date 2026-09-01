@@ -17,10 +17,16 @@ def _fp8(shape: tuple[int, int], offset: int = 0) -> torch.Tensor:
     return ((values.remainder(31) - 15) / 8).reshape(shape).to(torch.float8_e4m3fn)
 
 
-def _expert_task(destination: object) -> SimpleNamespace:
+# The VL wrapper holds the backbone as a `language_model` submodule, so real
+# conversion tasks carry the prefixed form.
+_PREFIXED_EXPERT_PARAM = "language_model.decoder.layers.0.mlp.experts.linear_fc2.weight0"
+_BARE_EXPERT_PARAM = "decoder.layers.0.mlp.experts.linear_fc2.weight0"
+
+
+def _expert_task(destination: object, param_name: str = _PREFIXED_EXPERT_PARAM) -> SimpleNamespace:
     return SimpleNamespace(
         param_weight=destination,
-        param_name="decoder.layers.0.mlp.experts.linear_fc2.weight0",
+        param_name=param_name,
         mapping=SimpleNamespace(
             hf_param="weight",
             tp_size=1,
@@ -29,8 +35,10 @@ def _expert_task(destination: object) -> SimpleNamespace:
     )
 
 
+@pytest.mark.parametrize("param_name", [_PREFIXED_EXPERT_PARAM, _BARE_EXPERT_PARAM])
 def test_glm5_next_bridge_direct_load_bypasses_logical_weight_conversion(
     monkeypatch: pytest.MonkeyPatch,
+    param_name: str,
 ) -> None:
     weight = _fp8((256, 256))
     scale = torch.tensor([[1.25, 2.5], [3.75, 5.0]], dtype=torch.float32)
@@ -48,7 +56,7 @@ def test_glm5_next_bridge_direct_load_bypasses_logical_weight_conversion(
     )
 
     loaded = Glm5NextBridge().maybe_load_native_hf_weight(
-        _expert_task(destination),
+        _expert_task(destination, param_name),
         {"weight": weight, "weight_scale_inv": scale},
     )
 
