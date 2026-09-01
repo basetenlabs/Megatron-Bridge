@@ -80,15 +80,19 @@ class _Gemma4DenseQKVMapping(QKVMapping):
         self.allow_hf_name_mismatch = True
 
 
-def _gemma4_kv_heads(config, *, sliding: bool, default: int | None = None) -> int | None:
-    """KV-head count for one Gemma 4 layer type.
+def _gemma4_per_layer(config, name: str, *, sliding: bool, default=None):
+    """Read a per-layer attribute for one Gemma 4 layer type.
 
-    Gemma 4's sliding and global layers carry different KV-head counts (16 vs 4 on
-    the 31B), so transformers >= 5.15 refuses ``config.num_key_value_heads`` with
+    Gemma 4's sliding and global layers genuinely disagree -- on the 31B, sliding
+    layers are head_dim 256 with 16 KV heads while global layers are head_dim 512
+    with 4 -- so transformers >= 5.15 refuses the global read with
     AmbiguousGlobalPerLayerAttributeError and directs callers at per_layer_config.
-    Reading it globally is not merely deprecated here -- there is no single correct
-    answer. Older releases expose no per_layer_config and answer the global
-    attribute, so both paths are kept.
+    There is no single correct global answer for this model, so the guard is right.
+
+    Note the error does not subclass AttributeError, so ``getattr(config, name,
+    default)`` does not absorb it: every such read has to come through here.
+    Older releases expose no per_layer_config and answer the attribute directly,
+    which is what the final fallback preserves.
     """
     per_layer = getattr(config, "per_layer_config", None)
     layer_types = getattr(config, "layer_types", None)
@@ -96,10 +100,10 @@ def _gemma4_kv_heads(config, *, sliding: bool, default: int | None = None) -> in
         want = "sliding_attention" if sliding else "full_attention"
         for idx, layer_type in enumerate(layer_types):
             if layer_type == want and idx < len(per_layer):
-                heads = getattr(per_layer[idx], "num_key_value_heads", None)
-                if heads is not None:
-                    return heads
-    return getattr(config, "num_key_value_heads", default)
+                value = getattr(per_layer[idx], name, None)
+                if value is not None:
+                    return value
+    return getattr(config, name, default)
 
 
 def _infer_attn_pattern(layer_types: list[str]) -> tuple[int, int] | list[str]:
@@ -235,11 +239,11 @@ class Gemma4Bridge(MegatronModelBridge):
         sliding_rope = rope_params.get("sliding_attention", {})
         full_rope = rope_params.get("full_attention", {})
         num_attention_heads = hf_config.num_attention_heads
-        num_query_groups = _gemma4_kv_heads(hf_config, sliding=True)
+        num_query_groups = _gemma4_per_layer(hf_config, "num_key_value_heads", sliding=True)
         num_global_query_groups = getattr(hf_config, "num_global_key_value_heads", None)
         if num_global_query_groups is None:
-            num_global_query_groups = _gemma4_kv_heads(
-                hf_config, sliding=False, default=num_query_groups
+            num_global_query_groups = _gemma4_per_layer(
+                hf_config, "num_key_value_heads", sliding=False, default=num_query_groups
             )
 
         self._dense_num_attention_heads = num_attention_heads
@@ -258,8 +262,11 @@ class Gemma4Bridge(MegatronModelBridge):
             ffn_hidden_size=hf_config.intermediate_size,
             num_attention_heads=num_attention_heads,
             num_query_groups=num_query_groups,
-            kv_channels=getattr(hf_config, "head_dim", 256),
-            global_kv_channels=getattr(hf_config, "global_head_dim", 512),
+            kv_channels=_gemma4_per_layer(hf_config, "head_dim", sliding=True, default=256),
+            global_kv_channels=(
+                getattr(hf_config, "global_head_dim", None)
+                or _gemma4_per_layer(hf_config, "head_dim", sliding=False, default=512)
+            ),
             num_global_query_groups=num_global_query_groups,
             seq_length=hf_config.max_position_embeddings,
             vocab_size=hf_config.vocab_size,
@@ -290,12 +297,14 @@ class Gemma4Bridge(MegatronModelBridge):
             rope_theta_from_hf(hf_config),
         )
 
-        head_dim = getattr(hf_config, "head_dim", 256)
+        head_dim = _gemma4_per_layer(hf_config, "head_dim", sliding=True, default=256)
         provider.softmax_scale = 1.0
         provider.kv_channels = head_dim
         provider.qk_layernorm = True
 
-        provider.global_head_dim = getattr(hf_config, "global_head_dim", 512)
+        provider.global_head_dim = getattr(hf_config, "global_head_dim", None) or _gemma4_per_layer(
+            hf_config, "head_dim", sliding=False, default=512
+        )
         provider.num_global_key_value_heads = getattr(hf_config, "num_global_key_value_heads", 2)
         provider.attention_k_eq_v = getattr(hf_config, "attention_k_eq_v", False)
 
@@ -428,8 +437,9 @@ class Gemma4Bridge(MegatronModelBridge):
                     text_config, "num_attention_heads", getattr(self, "_dense_num_attention_heads", 8)
                 )
                 kv_head_dim = q_weight.shape[0] // num_q_heads
-                num_kv_heads = _gemma4_kv_heads(
+                num_kv_heads = _gemma4_per_layer(
                     text_config,
+                    "num_key_value_heads",
                     sliding=True,
                     default=getattr(self, "_dense_num_query_groups", 2),
                 )
