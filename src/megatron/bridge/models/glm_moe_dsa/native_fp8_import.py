@@ -20,10 +20,16 @@ import torch
 
 
 _FP8_BLOCK_SIZE = 128
+# VL wrappers (GLM-5.3-Flash) expose the language backbone on
+# ``language_model.``, so every converted parameter carries that prefix;
+# text-only checkpoints (GLM-5.2) resolve bare ``decoder.`` names. Both must
+# gate into the native path — a bare-``decoder.``-anchored match silently
+# routes the VL model through the dequantize-then-requantize fallback while
+# the layout verifier stays green.
 _ROUTED_EXPERT_WEIGHT = re.compile(
-    r"^decoder\.layers\.\d+\.mlp\.experts\.linear_fc(?P<projection>[12])\.weight(?P<expert>\d+)$"
+    r"^(?:language_model\.)?decoder\.layers\.\d+\.mlp\.experts\.linear_fc(?P<projection>[12])\.weight(?P<expert>\d+)$"
 )
-_ROUTED_EXPERT_PREFIX = re.compile(r"^decoder\.layers\.\d+\.mlp\.experts\.linear_fc[12]\.weight")
+_ROUTED_EXPERT_PREFIX = re.compile(r"^(?:language_model\.)?decoder\.layers\.\d+\.mlp\.experts\.linear_fc[12]\.weight")
 
 
 @dataclass(frozen=True)

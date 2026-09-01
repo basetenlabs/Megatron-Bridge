@@ -147,3 +147,19 @@ def test_glm_bridge_direct_load_bypasses_logical_weight_conversion(
     assert loaded is True
     assert torch.equal(destination._rowwise_data, weight.view(torch.uint8))
     assert torch.equal(destination._rowwise_scale_inv[:, :2], scale)
+
+
+def test_prepare_accepts_vl_language_model_prefixed_names() -> None:
+    """GLM-5.3-Flash's VL wrapper prefixes every parameter with language_model."""
+    down = _fp8((256, 256))
+    scale = torch.tensor([[1.5, 2.5], [3.5, 4.5]], dtype=torch.float32)
+
+    result = prepare_native_fp8_expert_weight(
+        megatron_param="language_model.decoder.layers.2.mlp.experts.linear_fc2.weight3",
+        hf_param="down.weight",
+        hf_state_dict={"down.weight": down, "down.weight_scale_inv": scale},
+        tp_size=1,
+        tp_rank=0,
+    )
+
+    assert torch.equal(result.rowwise_data, down.view(torch.uint8))

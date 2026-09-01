@@ -18,9 +18,13 @@ def _fp8(shape: tuple[int, int], offset: int = 0) -> torch.Tensor:
 
 
 def _expert_task(destination: object) -> SimpleNamespace:
+    # GLM-5.3-Flash ships a vision tower, so the bridge wraps the backbone and
+    # every converted parameter carries the ``language_model.`` prefix — the
+    # exact name shape the native gate must accept (an anchored bare-decoder
+    # match silently fell through to the dequantize/requantize path).
     return SimpleNamespace(
         param_weight=destination,
-        param_name="decoder.layers.0.mlp.experts.linear_fc2.weight0",
+        param_name="language_model.decoder.layers.0.mlp.experts.linear_fc2.weight0",
         mapping=SimpleNamespace(
             hf_param="weight",
             tp_size=1,
@@ -78,7 +82,7 @@ def test_glm5_next_bridge_ignores_non_expert_parameters(
     )
     task = SimpleNamespace(
         param_weight=torch.zeros((4, 4)),
-        param_name="decoder.layers.0.mlp.shared_experts.linear_fc2.weight",
+        param_name="language_model.decoder.layers.0.mlp.shared_experts.linear_fc2.weight",
         mapping=SimpleNamespace(hf_param="weight", tp_size=1, tp_rank=0),
     )
 
