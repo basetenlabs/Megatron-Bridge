@@ -29,6 +29,7 @@ MoE layer specification:
 
 import copy
 import inspect
+import logging
 import types
 import weakref
 from contextlib import nullcontext
@@ -269,6 +270,91 @@ class Gemma4DenseTransformerLayerSubmodules(TransformerLayerSubmodules):
     post_self_attn_layernorm: LayerNormBuilder = IdentityOp
     post_mlp_layernorm: LayerNormBuilder = IdentityOp
     post_per_layer_input_norm: LayerNormBuilder = IdentityOp
+
+
+logger = logging.getLogger(__name__)
+
+# --- FlexAttention fallback for the sliding layers -------------------------------------
+#
+# Gemma 4's sliding layers are head_dim 256 with a 1024-token window. FA4 serves that on
+# sm90, but its sm100 kernel asserts outright --
+# flash_attn/cute/sm100_hd256_2cta_fmha_forward.py: "SM100 forward with head_dim=256 does
+# not support local attention yet" -- and cuDNN has no hd256 *backward* kernel on
+# sm100/sm103 at all (it serves the shape for inference and reports No_Backend for
+# training). FA2 covers sm100 but needs a per-arch source build and is excluded on sm103
+# by TE's exact-tuple capability allowlist, so it fixes one architecture and leaves the
+# next one broken.
+#
+# torch FlexAttention covers both: the window becomes a block-sparse mask, so cost is
+# O(S * window) instead of O(S^2). Measured on sm103 at the real per-rank shape, 131k
+# costs 7.04 GiB against the 256 GiB the unfused path could not even allocate, and it
+# matches FA4 on sm90 and FA2 on sm100 to bf16 rounding on out/dq/dk/dv.
+_FLEX_IMPORT_ERROR: Optional[BaseException] = None
+try:
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+except ImportError as _exc:  # pragma: no cover - torch < 2.5
+    create_block_mask = None
+    flex_attention = None
+    _FLEX_IMPORT_ERROR = _exc
+
+# Failures that mean "this kernel cannot serve this shape", as opposed to a real bug. Only
+# these route to flex; everything else keeps the original contract and propagates.
+_FLEX_FALLBACK_SIGNATURES = (
+    "does not support local attention",
+    "no dot product attention backend is available",
+    "no backend supports the provided input",
+)
+
+_OOM_ERRORS = tuple(
+    err
+    for err in (getattr(torch.cuda, "OutOfMemoryError", None), getattr(torch, "OutOfMemoryError", None))
+    if isinstance(err, type)
+)
+
+
+def _is_unsupported_shape_error(exc: BaseException) -> bool:
+    """True when `exc` says the kernel rejects this geometry, not that something broke.
+
+    Out-of-memory is explicitly excluded: it subclasses RuntimeError, and silently
+    switching backends to make an OOM disappear would hide a real capacity problem.
+    """
+    if _OOM_ERRORS and isinstance(exc, _OOM_ERRORS):
+        return False
+    text = str(exc).lower()
+    return any(signature in text for signature in _FLEX_FALLBACK_SIGNATURES)
+
+
+@lru_cache(maxsize=None)
+def _compiled_flex_attention():
+    # Compiled lazily: torch.compile at import time would cost every process that merely
+    # imports this module, including ones that never touch a sliding layer.
+    return torch.compile(flex_attention, dynamic=False)
+
+
+@lru_cache(maxsize=None)
+def _compiled_block_mask_builder():
+    return torch.compile(create_block_mask)
+
+
+@lru_cache(maxsize=32)
+def _sliding_block_mask(left: int, q_len: int, kv_len: int, device: str):
+    """Block-sparse mask for a `left`-token causal window, cached per shape.
+
+    ``B=None, H=None`` is load-bearing, not tidiness: passing concrete batch/head sizes to
+    an uncompiled ``create_block_mask`` materializes a dense int64 [B, H, S, S] grid --
+    1024 GiB at S=131072 -- which fails as a perfectly ordinary-looking OOM.
+
+    ``left`` is an inclusive key *offset*, so a 1024-token window is ``left == 1023``. TE
+    stores exactly that in ``config.window_size[0]``. Using 1024 here would attend 1025
+    keys: one leaked token per query, no crash, and in bf16 the error hides under a ULP.
+    """
+
+    def sliding_window_causal(b, h, q_idx, kv_idx):
+        return (q_idx >= kv_idx) & (q_idx - kv_idx <= left)
+
+    return _compiled_block_mask_builder()(
+        sliding_window_causal, B=None, H=None, Q_LEN=q_len, KV_LEN=kv_len, device=device
+    )
 
 
 def _is_gemma4_sliding_layer(config: TransformerConfig, layer_number: int) -> bool:
@@ -754,9 +840,16 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
     production sequence lengths. Those layers therefore go through torch SDPA's memory-efficient
     backend, which has neither limitation.
 
-    Sliding layers (head_dim 256) are already served well by TE and keep the inherited path
-    unchanged. The choice is made once per layer at construction from ``layer_number``; it is
-    never a runtime fallback, so a TE failure on a sliding layer stays loud.
+    Sliding layers (head_dim 256 + a local window) keep the inherited TE path where the flash
+    kernel accepts that geometry, which on sm90 it does. Where it does not -- FA4's sm100
+    kernel asserts on local attention, and cuDNN has no hd256 *backward* kernel on
+    sm100/sm103 -- the layer falls back to FlexAttention, once, latched, and logged.
+
+    The sliding/global split is still decided at construction from ``layer_number``. What is
+    now dynamic is only *which* sliding kernel runs, and only for failures that say "this
+    geometry is unsupported": every other TE failure still propagates, so a genuine bug on a
+    sliding layer stays loud. ``Gemma4DenseProvider.force_flex_attention`` skips the TE
+    attempt where it is known to fail.
     """
 
     def __init__(
@@ -788,6 +881,23 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
 
         self.is_gemma4_sliding_layer = is_sliding
         if is_sliding:
+            # Latched, not re-tried per step: the flash kernel's rejection is a property
+            # of (arch, geometry), so retrying would pay an exception and a wasted kernel
+            # compile on every microbatch to reach the same answer. Gemma4DenseProvider
+            # can set force_flex_attention to skip the doomed attempt altogether on
+            # hardware where the failure is known in advance.
+            self._flex_sliding_active = bool(getattr(config, "force_flex_attention", False))
+            self._gemma4_window = config.window_size
+            self._sliding_softmax_scale = (
+                softmax_scale if softmax_scale is not None else config.softmax_scale
+            )
+            self._sliding_attention_dropout = (
+                config.attention_dropout if attention_dropout is None else attention_dropout
+            )
+            # Stored rather than read off the TE base class at call time, matching
+            # sdpa_attn_mask_type below: the attribute name on the base is not part of
+            # its contract.
+            self._sliding_attn_mask_type = attn_mask_type
             return
 
         # Global layers bypass TE entirely, so whatever TE would have resolved for them
@@ -816,7 +926,37 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
     ) -> Tensor:
         """Route sliding layers to Transformer Engine and global layers to torch SDPA."""
         if self.is_gemma4_sliding_layer:
-            return super().forward(
+            if not self._flex_sliding_active:
+                try:
+                    return super().forward(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        attn_mask_type,
+                        attention_bias=attention_bias,
+                        packed_seq_params=packed_seq_params,
+                        num_splits=num_splits,
+                    )
+                except Exception as exc:
+                    # Anything that is not "this kernel rejects this geometry" keeps the
+                    # original contract and stays loud. `raise` re-raises with the
+                    # original traceback intact.
+                    if not _is_unsupported_shape_error(exc):
+                        raise
+                    logger.warning(
+                        "Gemma 4 sliding attention: Transformer Engine cannot serve "
+                        "head_dim %d with window %s on this device (%s). Falling back to "
+                        "FlexAttention for the remainder of the process. Set "
+                        "Gemma4DenseProvider.force_flex_attention=True to skip this "
+                        "attempt on future runs.",
+                        query.size(-1),
+                        self._gemma4_window,
+                        exc,
+                    )
+                    self._flex_sliding_active = True
+
+            return self._flex_sliding_attention(
                 query,
                 key,
                 value,
@@ -873,6 +1013,91 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
                 is_causal=is_causal,
                 scale=scale,
             )
+
+        # [b, np, sq, hn] -> [sq, b, np * hn]
+        context = context.permute(2, 0, 1, 3).contiguous()
+        return context.view(context.size(0), context.size(1), -1)
+
+    def _flex_sliding_attention(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        attn_mask_type: Optional[AttnMaskType],
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        num_splits: Optional[int] = None,
+    ) -> Tensor:
+        """Sliding-window attention via FlexAttention, for devices whose flash kernel refuses.
+
+        Semantically identical to the TE path it replaces: same causal window, same scale,
+        same GQA expansion, same [s, b, np, hn] in and out. Verified against the kernels TE
+        itself dispatches -- FA4 on sm90 and FA2 on sm100 -- matching out/dq/dk/dv to bf16
+        rounding, with flex and the flash kernel missing an exact fp32 reference by the
+        same margin.
+
+        Every feature TE supports here and flex does not raises rather than being silently
+        dropped, because this runs as a fallback: a silent semantic change would surface
+        as a slightly wrong model, not as an error.
+        """
+        if flex_attention is None:
+            raise RuntimeError(
+                "Gemma 4 sliding attention needs torch.nn.attention.flex_attention, which "
+                f"this torch does not provide: {_FLEX_IMPORT_ERROR}"
+            )
+        if packed_seq_params is not None or attention_bias is not None or num_splits is not None:
+            raise ValueError(
+                "Gemma 4 sliding attention fell back to FlexAttention, which supports none "
+                "of packed_seq_params, attention_bias, or num_splits."
+            )
+
+        mask_type = attn_mask_type if attn_mask_type is not None else self._sliding_attn_mask_type
+        if mask_type not in (AttnMaskType.causal, AttnMaskType.padding_causal):
+            raise ValueError(
+                f"Gemma 4 sliding attention expects a causal mask type; got {mask_type}."
+            )
+        if attention_mask is not None:
+            # A padding mask would have to be AND-ed into mask_mod. Dropping it would
+            # silently attend to padding, so refuse instead of guessing.
+            raise ValueError(
+                "Gemma 4 sliding attention fell back to FlexAttention, which does not yet "
+                "fold an explicit attention_mask into its block mask."
+            )
+
+        dropout_p = self._sliding_attention_dropout if self.training else 0.0
+        if dropout_p:
+            raise ValueError(
+                "Gemma 4 sliding attention fell back to FlexAttention, which has no "
+                f"attention dropout; got attention_dropout={dropout_p}."
+            )
+
+        window = self._gemma4_window
+        if not window or window[1]:
+            raise ValueError(
+                "Gemma 4 sliding attention expects a left-only causal window "
+                f"(left, 0); got window_size={window!r}."
+            )
+        left = int(window[0])
+
+        # Expand K/V heads exactly as the global-layer path does; the ratio comes from the
+        # tensors because Gemma4DenseSelfAttention may have sliced query heads per TP rank.
+        heads_per_group = query.size(2) // key.size(2)
+        if heads_per_group > 1:
+            key = key.repeat_interleave(heads_per_group, dim=2)
+            value = value.repeat_interleave(heads_per_group, dim=2)
+
+        # [s, b, np, hn] -> [b, np, s, hn]; hn stays stride-1, so these are views.
+        query, key, value = (tensor.permute(1, 2, 0, 3) for tensor in (query, key, value))
+
+        scale = (
+            self._sliding_softmax_scale
+            if self._sliding_softmax_scale is not None
+            else query.size(-1) ** -0.5
+        )
+        block_mask = _sliding_block_mask(left, query.size(2), key.size(2), str(query.device))
+
+        context = _compiled_flex_attention()(query, key, value, block_mask=block_mask, scale=scale)
 
         # [b, np, sq, hn] -> [sq, b, np * hn]
         context = context.permute(2, 0, 1, 3).contiguous()
