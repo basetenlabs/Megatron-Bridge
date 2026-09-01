@@ -9,6 +9,7 @@ from megatron.bridge.models.glm_moe_dsa import glm5_bridge as glm5_bridge_module
 from megatron.bridge.models.glm_moe_dsa.glm5_bridge import GLM5Bridge
 from megatron.bridge.models.glm_moe_dsa.native_fp8_import import (
     copy_native_fp8_expert_weight,
+    is_routed_expert_weight,
     prepare_native_fp8_expert_weight,
 )
 
@@ -94,6 +95,14 @@ def test_copy_native_weight_preserves_compact_scales_and_zeros_padding() -> None
     assert torch.equal(destination._rowwise_data, weight.view(torch.uint8))
     assert torch.equal(destination._rowwise_scale_inv[:, :2], scale)
     assert torch.count_nonzero(destination._rowwise_scale_inv[:, 2:]) == 0
+
+
+def test_routed_expert_names_tolerate_wrapper_prefixes() -> None:
+    assert is_routed_expert_weight("decoder.layers.3.mlp.experts.linear_fc1.weight7")
+    assert is_routed_expert_weight("language_model.decoder.layers.3.mlp.experts.linear_fc1.weight7")
+    assert not is_routed_expert_weight("decoder.layers.3.mlp.shared_experts.linear_fc2.weight")
+    assert not is_routed_expert_weight("language_model.decoder.layers.3.mlp.shared_experts.linear_fc2.weight")
+    assert not is_routed_expert_weight("visual.blocks.0.attn.qkv.weight")
 
 
 def test_prepare_rejects_incomplete_blocks() -> None:
