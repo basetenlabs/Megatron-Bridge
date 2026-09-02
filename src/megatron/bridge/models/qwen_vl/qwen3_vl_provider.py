@@ -133,6 +133,10 @@ class Qwen3VLModelProvider(GPTModelProvider):
     # Maximum sequence length for vision encoder CUDA graphs (must accommodate largest input)
     # If None, calculated from num_position_embeddings / spatial_merge_size^2
     max_vision_cuda_graph_seq_length: Optional[int] = None
+    # Number of whole images per chunk when encoding the vision tower under an outer
+    # activation checkpoint; 0 disables chunking. Bounds live vision-encoder activation
+    # memory on many-image samples at the cost of recomputing the tower per chunk.
+    vision_encoder_chunk_images: int = 0
 
     def finalize(self) -> None:
         if (self.context_parallel_size or 1) > 1:
@@ -298,6 +302,10 @@ class Qwen3VLMoEModelProvider(GPTModelProvider):
     vision_cuda_graph_scope: List[str] = field(default_factory=list)
     # Maximum sequence length for vision encoder CUDA graphs (must accommodate largest input)
     max_vision_cuda_graph_seq_length: Optional[int] = None
+    # Number of whole images per chunk when encoding the vision tower under an outer
+    # activation checkpoint; 0 disables chunking. Bounds live vision-encoder activation
+    # memory on many-image samples at the cost of recomputing the tower per chunk.
+    vision_encoder_chunk_images: int = 0
 
     def finalize(self) -> None:
         if (self.context_parallel_size or 1) > 1:

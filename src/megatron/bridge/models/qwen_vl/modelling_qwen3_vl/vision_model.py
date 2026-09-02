@@ -16,7 +16,7 @@ from collections.abc import Callable
 from typing import Optional
 
 import torch
-from megatron.core import InferenceParams
+from megatron.core import InferenceParams, tensor_parallel
 from megatron.core.models.common.vision_module.vision_module import VisionModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -302,6 +302,70 @@ class Qwen3VLVisionModel(VisionModule):
             and self.training
         )
 
+    def _chunked_encode(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        grid_thw: torch.Tensor,
+        chunk_images: int,
+        extra_block_kwargs: Optional[dict],
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Encode the vision tower in chunks of whole images under an outer checkpoint.
+
+        Vision attention never crosses image boundaries (``build_packed_seq_params``
+        emits per-image ``cu_seqlens``), so a chunk of whole images produces exactly
+        the same output as encoding every image in one pass. Running each chunk's
+        decoder and merger inside :func:`tensor_parallel.checkpoint` keeps only the
+        chunk inputs alive through the forward pass and recomputes one chunk at a time
+        in the backward pass, so live vision-encoder activation memory is bounded by
+        the chunk size instead of the full multi-image sequence.
+
+        Args:
+            hidden_states: Patch embeddings for all images, shape ``[total_tokens, hidden]``.
+            rotary_pos_emb: Rotary embeddings aligned with ``hidden_states``.
+            grid_thw: Per-image grid sizes, shape ``[num_images, 3]``.
+            chunk_images: Number of whole images per chunk (> 0).
+            extra_block_kwargs: Extra kwargs forwarded to the decoder.
+
+        Returns:
+            The merged vision embeddings for all images and the concatenated
+            deepstack feature list, matching the non-chunked forward's outputs.
+        """
+        tokens_per_image = grid_thw.prod(-1).tolist()
+        num_images = len(tokens_per_image)
+        merged_chunks: list[torch.Tensor] = []
+        deepstack_by_level: Optional[list[list[torch.Tensor]]] = None
+        offset = 0
+        for start in range(0, num_images, chunk_images):
+            end = min(start + chunk_images, num_images)
+            chunk_tokens = int(sum(tokens_per_image[start:end]))
+            chunk_hidden = hidden_states[offset : offset + chunk_tokens]
+            chunk_rotary = rotary_pos_emb[offset : offset + chunk_tokens]
+            packed_seq_params = self.build_packed_seq_params(grid_thw[start:end])
+
+            def chunk_forward(chunk_hidden, chunk_rotary, packed_seq_params=packed_seq_params):
+                decoded, deepstack = self.decoder(
+                    hidden_states=chunk_hidden[:, None],
+                    attention_mask=None,
+                    inference_params=None,
+                    rotary_pos_emb=chunk_rotary,
+                    packed_seq_params=packed_seq_params,
+                    **(extra_block_kwargs or {}),
+                )
+                return (self.merger(decoded), *deepstack)
+
+            outputs = tensor_parallel.checkpoint(chunk_forward, False, chunk_hidden, chunk_rotary)
+            merged_chunks.append(outputs[0])
+            if deepstack_by_level is None:
+                deepstack_by_level = [[feat] for feat in outputs[1:]]
+            else:
+                for level, feat in zip(deepstack_by_level, outputs[1:]):
+                    level.append(feat)
+            offset += chunk_tokens
+
+        deepstack_feature_lists = [torch.cat(level, dim=0) for level in (deepstack_by_level or [])]
+        return torch.cat(merged_chunks, dim=0), deepstack_feature_lists
+
     def forward(
         self,
         hidden_states: Optional[torch.Tensor],
@@ -333,6 +397,20 @@ class Qwen3VLVisionModel(VisionModule):
 
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, 1, 1, -1).repeat(1, 1, 1, 2)
+
+        # Chunk the tower over whole images under an outer checkpoint when configured,
+        # to bound live vision-encoder activation memory on many-image samples. Only
+        # in training with grad enabled (recompute has nothing to save otherwise) and
+        # off the CUDA-graph path (which needs a fixed, padded, single sequence).
+        chunk_images = self.config.vision_encoder_chunk_images
+        if (
+            chunk_images > 0
+            and self.training
+            and torch.is_grad_enabled()
+            and not self._uses_vision_cuda_graph()
+            and grid_thw.shape[0] > chunk_images
+        ):
+            return self._chunked_encode(hidden_states, rotary_pos_emb, grid_thw, chunk_images, extra_block_kwargs)
 
         # Check if we need to pad for CUDA graphs
         use_cuda_graph_padding = self._uses_vision_cuda_graph()
