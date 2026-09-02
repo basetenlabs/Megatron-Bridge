@@ -309,21 +309,6 @@ class Qwen3VLVisionModel(VisionModule):
         inference_params: Optional[InferenceParams] = None,
         extra_block_kwargs: dict = None,
     ) -> torch.Tensor:
-        """Encode images to embeddings."""
-        # We don't train the vision tower, so when no parameter requires grad we
-        # don't need to save (or recompute) its activations — run it under no_grad.
-        if not any(p.requires_grad for p in self.parameters()):
-            with torch.no_grad():
-                return self._encode(hidden_states, grid_thw, inference_params, extra_block_kwargs)
-        return self._encode(hidden_states, grid_thw, inference_params, extra_block_kwargs)
-
-    def _encode(
-        self,
-        hidden_states: Optional[torch.Tensor],
-        grid_thw: torch.Tensor,
-        inference_params: Optional[InferenceParams] = None,
-        extra_block_kwargs: dict = None,
-    ) -> torch.Tensor:
         """Forward function of the Qwen3 Vision Model. This function passes the input tensors
         through the embedding layer and then the transformer.
 
