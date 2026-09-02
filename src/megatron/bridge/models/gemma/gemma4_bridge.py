@@ -80,32 +80,6 @@ class _Gemma4DenseQKVMapping(QKVMapping):
         self.allow_hf_name_mismatch = True
 
 
-def _gemma4_per_layer(config, name: str, *, sliding: bool, default=None):
-    """Read a per-layer attribute for one Gemma 4 layer type.
-
-    Gemma 4's sliding and global layers genuinely disagree -- on the 31B, sliding
-    layers are head_dim 256 with 16 KV heads while global layers are head_dim 512
-    with 4 -- so transformers >= 5.15 refuses the global read with
-    AmbiguousGlobalPerLayerAttributeError and directs callers at per_layer_config.
-    There is no single correct global answer for this model, so the guard is right.
-
-    Note the error does not subclass AttributeError, so ``getattr(config, name,
-    default)`` does not absorb it: every such read has to come through here.
-    Older releases expose no per_layer_config and answer the attribute directly,
-    which is what the final fallback preserves.
-    """
-    per_layer = getattr(config, "per_layer_config", None)
-    layer_types = getattr(config, "layer_types", None)
-    if per_layer and layer_types:
-        want = "sliding_attention" if sliding else "full_attention"
-        for idx, layer_type in enumerate(layer_types):
-            if layer_type == want and idx < len(per_layer):
-                value = getattr(per_layer[idx], name, None)
-                if value is not None:
-                    return value
-    return getattr(config, name, default)
-
-
 def _infer_attn_pattern(layer_types: list[str]) -> tuple[int, int] | list[str]:
     """Use a compact cycle when possible, otherwise preserve the per-layer pattern."""
     for i, lt in enumerate(layer_types):
@@ -239,12 +213,36 @@ class Gemma4Bridge(MegatronModelBridge):
         sliding_rope = rope_params.get("sliding_attention", {})
         full_rope = rope_params.get("full_attention", {})
         num_attention_heads = hf_config.num_attention_heads
-        num_query_groups = _gemma4_per_layer(hf_config, "num_key_value_heads", sliding=True)
+
+        # transformers >= 5.15 raises AmbiguousGlobalPerLayerAttributeError on
+        # hf_config.head_dim / .num_key_value_heads for Gemma 4, because they really do
+        # vary by layer (sliding: head_dim 256 with 16 KV heads, global: 512 with 4).
+        # It is a RuntimeError, so a getattr default does not absorb it -- read a
+        # representative layer of each type instead. Homogeneous checkpoints expose no
+        # per_layer_config and answer directly, which the fallback to hf_config preserves.
+        per_layer_config = getattr(hf_config, "per_layer_config", None) or ()
+        hf_layer_types = getattr(hf_config, "layer_types", None) or ()
+        sliding_layer_config = next(
+            (
+                per_layer_config[index]
+                for index, layer_type in enumerate(hf_layer_types)
+                if layer_type == "sliding_attention" and index < len(per_layer_config)
+            ),
+            hf_config,
+        )
+        global_layer_config = next(
+            (
+                per_layer_config[index]
+                for index, layer_type in enumerate(hf_layer_types)
+                if layer_type == "full_attention" and index < len(per_layer_config)
+            ),
+            hf_config,
+        )
+
+        num_query_groups = getattr(sliding_layer_config, "num_key_value_heads", None)
         num_global_query_groups = getattr(hf_config, "num_global_key_value_heads", None)
         if num_global_query_groups is None:
-            num_global_query_groups = _gemma4_per_layer(
-                hf_config, "num_key_value_heads", sliding=False, default=num_query_groups
-            )
+            num_global_query_groups = getattr(global_layer_config, "num_key_value_heads", None) or num_query_groups
 
         self._dense_num_attention_heads = num_attention_heads
         self._dense_num_query_groups = num_query_groups
@@ -262,10 +260,9 @@ class Gemma4Bridge(MegatronModelBridge):
             ffn_hidden_size=hf_config.intermediate_size,
             num_attention_heads=num_attention_heads,
             num_query_groups=num_query_groups,
-            kv_channels=_gemma4_per_layer(hf_config, "head_dim", sliding=True, default=256),
+            kv_channels=getattr(sliding_layer_config, "head_dim", None) or 256,
             global_kv_channels=(
-                getattr(hf_config, "global_head_dim", None)
-                or _gemma4_per_layer(hf_config, "head_dim", sliding=False, default=512)
+                getattr(hf_config, "global_head_dim", None) or getattr(global_layer_config, "head_dim", None) or 512
             ),
             num_global_query_groups=num_global_query_groups,
             seq_length=hf_config.max_position_embeddings,
@@ -297,13 +294,38 @@ class Gemma4Bridge(MegatronModelBridge):
             rope_theta_from_hf(hf_config),
         )
 
-        head_dim = _gemma4_per_layer(hf_config, "head_dim", sliding=True, default=256)
+        # transformers >= 5.15 raises AmbiguousGlobalPerLayerAttributeError on
+        # hf_config.head_dim / .num_key_value_heads for Gemma 4, because they really do
+        # vary by layer (sliding: head_dim 256 with 16 KV heads, global: 512 with 4).
+        # It is a RuntimeError, so a getattr default does not absorb it -- read a
+        # representative layer of each type instead. Homogeneous checkpoints expose no
+        # per_layer_config and answer directly, which the fallback to hf_config preserves.
+        per_layer_config = getattr(hf_config, "per_layer_config", None) or ()
+        hf_layer_types = getattr(hf_config, "layer_types", None) or ()
+        sliding_layer_config = next(
+            (
+                per_layer_config[index]
+                for index, layer_type in enumerate(hf_layer_types)
+                if layer_type == "sliding_attention" and index < len(per_layer_config)
+            ),
+            hf_config,
+        )
+        global_layer_config = next(
+            (
+                per_layer_config[index]
+                for index, layer_type in enumerate(hf_layer_types)
+                if layer_type == "full_attention" and index < len(per_layer_config)
+            ),
+            hf_config,
+        )
+
+        head_dim = getattr(sliding_layer_config, "head_dim", None) or 256
         provider.softmax_scale = 1.0
         provider.kv_channels = head_dim
         provider.qk_layernorm = True
 
-        provider.global_head_dim = getattr(hf_config, "global_head_dim", None) or _gemma4_per_layer(
-            hf_config, "head_dim", sliding=False, default=512
+        provider.global_head_dim = (
+            getattr(hf_config, "global_head_dim", None) or getattr(global_layer_config, "head_dim", None) or 512
         )
         provider.num_global_key_value_heads = getattr(hf_config, "num_global_key_value_heads", 2)
         provider.attention_k_eq_v = getattr(hf_config, "attention_k_eq_v", False)
@@ -437,14 +459,20 @@ class Gemma4Bridge(MegatronModelBridge):
                     text_config, "num_attention_heads", getattr(self, "_dense_num_attention_heads", 8)
                 )
                 kv_head_dim = q_weight.shape[0] // num_q_heads
-                num_kv_heads = _gemma4_per_layer(
+                layer_types = getattr(text_config, "layer_types", None)
+                per_layer_config = getattr(text_config, "per_layer_config", None) or ()
+                sliding_layer_config = next(
+                    (
+                        per_layer_config[index]
+                        for index, layer_type in enumerate(layer_types or ())
+                        if layer_type == "sliding_attention" and index < len(per_layer_config)
+                    ),
                     text_config,
-                    "num_key_value_heads",
-                    sliding=True,
-                    default=getattr(self, "_dense_num_query_groups", 2),
+                )
+                num_kv_heads = getattr(sliding_layer_config, "num_key_value_heads", None) or getattr(
+                    self, "_dense_num_query_groups", 2
                 )
                 layer_match = re.search(r"layers\.(\d+)\.", q_name)
-                layer_types = getattr(text_config, "layer_types", None)
                 if layer_match and layer_types:
                     layer_idx = int(layer_match.group(1))
                     if layer_idx < len(layer_types) and layer_types[layer_idx] == "full_attention":
