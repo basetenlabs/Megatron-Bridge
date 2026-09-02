@@ -58,6 +58,29 @@ def test_is_routed_expert_weight_matches_only_expert_projections():
     assert not is_routed_expert_weight("decoder.layers.3.self_attn.q_proj.weight")
 
 
+def test_is_routed_expert_weight_tolerates_a_wrapped_backbone():
+    """A wrapped backbone must not silently disable native import."""
+    assert is_routed_expert_weight("language_model.decoder.layers.3.mlp.experts.linear_fc1.weight7")
+    assert is_routed_expert_weight("model.language_model.decoder.layers.0.mlp.experts.linear_fc2.weight0")
+    # Tolerating a prefix must not widen what else matches.
+    assert not is_routed_expert_weight("language_model.decoder.layers.3.mlp.shared_experts.linear_fc1.weight")
+    assert not is_routed_expert_weight("language_model.decoder.layers.3.self_attn.q_proj.weight")
+    assert not is_routed_expert_weight("vision_tower.encoder.layers.3.mlp.experts.linear_fc1.weight0")
+
+
+def test_prepare_accepts_the_same_names_the_gate_accepts():
+    """The capture groups must survive the prefix, not just the match."""
+    from megatron.bridge.models.kimi.native_nvfp4_import import _ROUTED_EXPERT_WEIGHT
+
+    bare = _ROUTED_EXPERT_WEIGHT.fullmatch("decoder.layers.3.mlp.experts.linear_fc1.weight7")
+    wrapped = _ROUTED_EXPERT_WEIGHT.fullmatch(
+        "language_model.decoder.layers.3.mlp.experts.linear_fc1.weight7"
+    )
+    assert bare is not None and wrapped is not None
+    assert bare.group("projection") == wrapped.group("projection") == "1"
+    assert bare.group("expert") == wrapped.group("expert") == "7"
+
+
 def test_scale_regroup_preserves_values_exactly():
     """The regrouped NVFP4 scales must reconstruct the MXFP4 values bit for bit."""
     packed, scale = _random_mxfp4(64, 256)
