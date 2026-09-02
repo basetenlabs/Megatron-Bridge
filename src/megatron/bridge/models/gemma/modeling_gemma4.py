@@ -832,6 +832,11 @@ def wire_gemma4_kv_sharing(model: nn.Module) -> None:
 class Gemma4DenseCoreAttention(TEDotProductAttention):
     """Gemma 4 dense core attention: Transformer Engine for sliding layers, SDPA for global ones.
 
+    Sibling of ``Gemma4TEDotProductAttention`` (the MoE path, further down this
+    file), which does the same sliding-vs-global window dispatch but takes an int
+    ``window_size`` and converts it, and deep-copies the config. This one takes
+    the dense provider's tuple as-is and shallow-copies. Keep the two in step.
+
     Gemma 4 global layers run head_dim_qk == head_dim_v == 512. TE FlashAttention and cuDNN
     FusedAttention both reject that head dim on sm90 ("Selected backend = NoBackend"), while
     ``megatron.core.transformer.dot_product_attention.DotProductAttention`` -- what
@@ -867,7 +872,11 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
         # Shallow copy: only window_size is rebound, and deep-copying a TransformerConfig
         # drags in process-group and init-method references.
         config = copy.copy(config)
-        config.window_size = (config.window_size or (511, 0)) if is_sliding else None
+        # No fallback: _is_gemma4_sliding_layer returns False when window_size is
+        # falsy, so is_sliding implies it is set. A default here would also read
+        # like Gemma4TEDotProductAttention's genuine (window_size - 1, 0) int
+        # conversion, which this is not -- the dense provider already stores a tuple.
+        config.window_size = config.window_size if is_sliding else None
 
         super().__init__(
             config=config,
@@ -878,6 +887,19 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
             softmax_scale=softmax_scale,
             **kwargs,
         )
+
+        # mcore's DotProductAttention asserts context_parallel_size == 1 in
+        # __init__; inheriting TEDotProductAttention drops that guard, and both
+        # non-TE paths here ignore CP -- torch SDPA on the global layers and
+        # FlexAttention on the sliding fallback would each attend only over the
+        # rank-local sq/cp chunk and produce silently wrong gradients. Fail at
+        # construction instead, matching gemma2_provider.py's check.
+        if getattr(config, "context_parallel_size", 1) != 1 and not is_sliding:
+            raise ValueError(
+                "Gemma 4 global attention runs through torch SDPA, which does not "
+                "implement context parallelism; context_parallel_size must be 1 "
+                f"(got {config.context_parallel_size})."
+            )
 
         self.is_gemma4_sliding_layer = is_sliding
         if is_sliding:

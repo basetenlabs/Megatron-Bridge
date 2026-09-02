@@ -634,10 +634,18 @@ class Gemma4Bridge(MegatronModelBridge):
         # MoE names alone made this branch dead code for dense models: global
         # layers fell through to the sliding reshape and raised
         # "shape '[64, 256, r]' is invalid for input of size ...".
-        head_size_global = getattr(config, "global_head_dim", None) or getattr(config, "global_kv_channels", None)
-        num_kv_global = getattr(config, "num_global_key_value_heads", None) or getattr(
-            config, "num_global_query_groups", None
-        )
+        # Resolved as a pair, not field by field: mixing a head dim from one
+        # spelling with a KV-head count from the other would reshape with an
+        # inconsistent geometry. hasattr rather than `or` so a legitimate 0 is
+        # not read as missing.
+        if hasattr(config, "global_head_dim"):
+            head_size_global = config.global_head_dim
+            num_kv_global = getattr(config, "num_global_key_value_heads", None)
+        elif hasattr(config, "global_kv_channels"):
+            head_size_global = config.global_kv_channels
+            num_kv_global = getattr(config, "num_global_query_groups", None)
+        else:
+            head_size_global = num_kv_global = None
 
         if (
             linear_out_weight.numel() != expected_numel_sliding
@@ -652,7 +660,17 @@ class Gemma4Bridge(MegatronModelBridge):
                 hidden_size = config.hidden_size
                 attention_output_gate = getattr(config, "attention_output_gate", False)
 
-            q_out, k_out, _ = split_qkv_weights(_GlobalAttnCfg(), linear_out_weight, feature_dim=feature_dim)
-            return {"q_proj": q_out, "k_proj": k_out, "v_proj": ABSENT_PROJECTION}
+            q_out, k_out, v_out = split_qkv_weights(
+                _GlobalAttnCfg(), linear_out_weight, feature_dim=feature_dim
+            )
+            # ABSENT_PROJECTION is only true under K=V tying, where HF ships no
+            # v_proj weight for these layers. Without the flag the global layers
+            # have a live V that goes through _v_norm into attention, and
+            # declaring it absent would silently drop its adapter on export.
+            # The numel guard above cannot tell the two apart: the fused QKV
+            # allocates the V slots either way.
+            if getattr(config, "attention_k_eq_v", False):
+                return {"q_proj": q_out, "k_proj": k_out, "v_proj": ABSENT_PROJECTION}
+            return {"q_proj": q_out, "k_proj": k_out, "v_proj": v_out}
 
         return super()._split_qkv_linear_out_weight(megatron_model, linear_out_weight)
