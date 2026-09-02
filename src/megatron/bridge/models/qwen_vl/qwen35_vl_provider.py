@@ -460,6 +460,10 @@ class Qwen35VLMoEModelProvider(GPTModelProvider):
     vision_cuda_graph_impl: str = "none"
     vision_cuda_graph_scope: List[str] = field(default_factory=list)
     max_vision_cuda_graph_seq_length: Optional[int] = None
+    # Number of whole images per chunk when encoding the vision tower under an outer
+    # activation checkpoint; 0 disables chunking. Bounds live vision-encoder activation
+    # memory on many-image samples at the cost of recomputing the tower per chunk.
+    vision_encoder_chunk_images: int = 0
 
     # Heterogeneous dist checkpoint (needed for hybrid architecture)
     hetereogenous_dist_checkpoint: bool = True
