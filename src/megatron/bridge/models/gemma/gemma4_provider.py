@@ -301,6 +301,14 @@ class Gemma4ModelProvider(GPTModelProvider):
     hidden_dropout: float = 0.0
     attention_backend: AttnBackend = AttnBackend.auto
     softmax_scale: float = 1.0
+
+    # Same meaning as on Gemma4DenseProvider: the sliding layers normally run on
+    # Transformer Engine, and where the flash kernel refuses hd256 + a local window
+    # (FA4's sm100 path asserts on local attention; cuDNN has no hd256 backward kernel
+    # on sm100/sm103) Gemma4MoEAttention falls back to FlexAttention. Setting this True
+    # skips the doomed TE attempt where the failure is known in advance. Required, not
+    # optional: Gemma4MoEAttention raises at construction if the field is absent.
+    force_flex_attention: bool = False
     qk_layernorm: bool = True
     attention_k_eq_v: bool = False
 
