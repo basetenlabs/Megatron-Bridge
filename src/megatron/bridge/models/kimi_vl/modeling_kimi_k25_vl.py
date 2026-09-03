@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import logging
 from typing import List, Optional
 
@@ -400,8 +401,14 @@ class KimiK25VLModel(MegatronModule):
 
     def _extract_image_features(self, pixel_values, grid_thws):
         """Extract and project image features."""
-        image_features = self.vision_tower(pixel_values, grid_thws)
-        return self.mm_projector(image_features)
+        # We don't train the vision tower, so when no parameter requires grad we
+        # don't need to save (or recompute) its activations — run it under no_grad.
+        frozen = not any(p.requires_grad for p in self.vision_tower.parameters()) and not any(
+            p.requires_grad for p in self.mm_projector.parameters()
+        )
+        with torch.no_grad() if frozen else contextlib.nullcontext():
+            image_features = self.vision_tower(pixel_values, grid_thws)
+            return self.mm_projector(image_features)
 
     def forward(
         self,
