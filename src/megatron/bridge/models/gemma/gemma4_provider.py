@@ -159,6 +159,15 @@ class Gemma4DenseProvider(GPTModelProvider):
     window_size: Optional[Tuple[int, int]] = (511, 0)
     window_attn_skip_freq: Union[int, List[int]] = 6
 
+    # Sliding layers (head_dim 256 + local window) normally run on Transformer Engine.
+    # Where the flash kernel refuses that geometry -- FA4's sm100 path asserts on local
+    # attention, and cuDNN has no hd256 backward kernel on sm100/sm103 -- the core
+    # attention module falls back to FlexAttention automatically and logs it. Setting
+    # this True skips the doomed TE attempt entirely, which is worth doing on Blackwell
+    # where the failure is known in advance rather than paying an exception and a wasted
+    # kernel compile on the first microbatch.
+    force_flex_attention: bool = False
+
     bf16: bool = True
     fp16: bool = False
     params_dtype: torch.dtype = torch.bfloat16
