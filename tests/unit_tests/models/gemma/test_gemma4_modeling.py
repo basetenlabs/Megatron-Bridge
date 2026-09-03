@@ -28,11 +28,13 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.training.config.instantiate_utils import instantiate
 
 from megatron.bridge.models.gemma.modeling_gemma4 import (
+    Gemma4CoreAttention,
     Gemma4DenseCoreAttention,
     Gemma4DenseMLP,
     Gemma4DenseRotaryEmbedding,
     Gemma4DenseSelfAttention,
     Gemma4DenseTransformerLayer,
+    Gemma4MoEAttention,
     Gemma4MoEExperts,
     Gemma4MoELayer,
     Gemma4MoERouter,
@@ -838,7 +840,28 @@ class TestGemma4SelfAttention:
         assert calls["rotary_pos_emb"] is global_rope
 
 
-class TestGemma4TEDotProductAttention:
+def _moe_cfg(**overrides):
+    """A MoE attention config carrying what the shared base actually reads.
+
+    The old Gemma4TEDotProductAttention was a bare TEDotProductAttention subclass and
+    needed only the pattern and the window. Sharing the dense path means the sliding
+    branch also reads force_flex_attention (deliberately un-defaulted -- a config
+    without it is mis-wired) and the global branch resolves softmax_scale and
+    attention_dropout for SDPA, since it never reaches TE.
+    """
+    cfg = dict(
+        interleaved_attn_pattern=(1, 1),
+        window_size=512,
+        force_flex_attention=False,
+        softmax_scale=1.0,
+        attention_dropout=0.0,
+        context_parallel_size=1,
+    )
+    cfg.update(overrides)
+    return SimpleNamespace(**cfg)
+
+
+class TestGemma4MoEAttention:
     def test_init_sets_local_window_size(self, monkeypatch):
         calls = []
 
@@ -849,16 +872,16 @@ class TestGemma4TEDotProductAttention:
             "megatron.bridge.models.gemma.modeling_gemma4.TEDotProductAttention.__init__",
             fake_init,
         )
-        cfg = SimpleNamespace(interleaved_attn_pattern=(1, 1), window_size=512)
 
-        Gemma4TEDotProductAttention(
-            config=cfg,
+        Gemma4MoEAttention(
+            config=_moe_cfg(),
             layer_number=1,
             attn_mask_type=object(),
             attention_type="self",
             attention_dropout=0.0,
         )
 
+        # int 512 -> (511, 0): TE bounds the key offset, so 512 keys, not 513.
         assert calls[0]["config"].window_size == (511, 0)
 
     def test_init_clears_global_window_size(self, monkeypatch):
@@ -871,16 +894,62 @@ class TestGemma4TEDotProductAttention:
             "megatron.bridge.models.gemma.modeling_gemma4.TEDotProductAttention.__init__",
             fake_init,
         )
-        cfg = SimpleNamespace(interleaved_attn_pattern=(1, 1), window_size=512)
 
-        Gemma4TEDotProductAttention(
-            config=cfg,
+        Gemma4MoEAttention(
+            config=_moe_cfg(),
             layer_number=2,
             attn_mask_type=object(),
             attention_type="self",
         )
 
         assert calls[0]["config"].window_size is None
+
+    def test_old_name_is_an_alias(self):
+        # gemma4_bridge registers AutoMapping by class name and other code may still
+        # construct the old name; both must resolve to the same class.
+        assert Gemma4TEDotProductAttention is Gemma4MoEAttention
+
+    def test_shares_the_dense_attention_path(self):
+        # The whole point of the refactor: one implementation, two layer-type hooks.
+        assert issubclass(Gemma4MoEAttention, Gemma4CoreAttention)
+        assert issubclass(Gemma4DenseCoreAttention, Gemma4CoreAttention)
+        for shared in ("forward", "_flex_sliding_attention", "_sdpa_attention_mask"):
+            assert getattr(Gemma4MoEAttention, shared) is getattr(Gemma4CoreAttention, shared)
+            assert getattr(Gemma4DenseCoreAttention, shared) is getattr(Gemma4CoreAttention, shared)
+        # ...and only the hooks differ.
+        for hook in ("_gemma4_is_sliding_layer", "_gemma4_window_size"):
+            assert getattr(Gemma4MoEAttention, hook) is not getattr(Gemma4DenseCoreAttention, hook)
+
+    def test_sliding_layer_needs_force_flex_attention(self, monkeypatch):
+        monkeypatch.setattr(
+            "megatron.bridge.models.gemma.modeling_gemma4.TEDotProductAttention.__init__",
+            lambda self, **kwargs: None,
+        )
+        cfg = _moe_cfg()
+        del cfg.force_flex_attention
+
+        with pytest.raises(AttributeError, match="force_flex_attention"):
+            Gemma4MoEAttention(
+                config=cfg,
+                layer_number=1,
+                attn_mask_type=object(),
+                attention_type="self",
+            )
+
+    def test_global_layer_rejects_context_parallelism(self, monkeypatch):
+        monkeypatch.setattr(
+            "megatron.bridge.models.gemma.modeling_gemma4.TEDotProductAttention.__init__",
+            lambda self, **kwargs: None,
+        )
+        # Inherited from the shared base: the global layers run on SDPA, which has no
+        # context parallelism, so CP > 1 would silently attend over the rank-local chunk.
+        with pytest.raises(ValueError, match="context_parallel_size must be 1"):
+            Gemma4MoEAttention(
+                config=_moe_cfg(context_parallel_size=2),
+                layer_number=2,
+                attn_mask_type=object(),
+                attention_type="self",
+            )
 
 
 class TestGemma4DenseCoreAttention:
@@ -1989,7 +2058,7 @@ class TestGemma4MoEHelpers:
         assert calls == [("config", True, {"extra": "value"})]
         assert layer_spec.module is Gemma4TransformerLayer
         assert layer_spec.submodules.self_attention.module is Gemma4SelfAttention
-        assert attn_submodules.core_attention is Gemma4TEDotProductAttention
+        assert attn_submodules.core_attention is Gemma4MoEAttention
         assert attn_submodules.linear_proj != "old_proj"
         assert layer_spec.submodules.mlp.module is Gemma4MoELayer
         assert mlp_submodules.router is Gemma4TopKRouter
@@ -2034,7 +2103,7 @@ class TestGemma4MoEHelpers:
         _gemma4_block_spec("config", use_transformer_engine=False)
 
         assert layer_spec.module is Gemma4TransformerLayer
-        assert attn_submodules.core_attention is Gemma4TEDotProductAttention
+        assert attn_submodules.core_attention is Gemma4MoEAttention
         assert attn_submodules.linear_proj == "old_proj"
 
     def test_public_gemma4_block_spec_checkpoint_target_is_instantiable(self):
