@@ -1,14 +1,19 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""cp2-vs-cp1 parity for the GLM-5 Next KDA context-parallel path.
+"""cp2-vs-cp1 parity for the KDA context-parallel path.
 
-Two ranks build the same ``Glm5NextKDA`` twice: once with a 2-rank CP group
+The head-parallel CP forward lives on ``KimiK3Attention``, so both KDA layers
+that use it are covered: Kimi K3 itself and GLM-5 Next, which differs only in
+its two-stage output gate.
+
+Two ranks build the same layer twice: once with a 2-rank CP group
 (sequence-sharded zigzag input) and once with a singleton CP group (the cp=1
 reference on the full stream). Identical weights, identical documents. The
 gathered cp=2 output must match the cp=1 output, and the cp=2 parameter
 gradients — summed across CP ranks — must match the reference gradients.
 
-Run standalone: ``python test_glm5_next_kda_cp.py`` (needs 2 GPUs + FLA).
+Run standalone: ``python test_kimi_k3_kda_cp.py [kimi_k3|glm5_next]``
+(needs 2 GPUs + FLA).
 """
 
 import os
@@ -16,6 +21,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+
 
 try:
     import fla  # noqa: F401
@@ -40,6 +46,21 @@ CONV_KERNEL = 4
 DOC_LENS = (128, 64)
 SEQ_LEN = sum(DOC_LENS)
 DTYPE = torch.bfloat16
+
+
+LAYERS = ("kimi_k3", "glm5_next")
+
+
+def _layer_class(name: str):
+    if name == "kimi_k3":
+        from megatron.bridge.models.kimi.kimi_k3_layers import KimiK3Attention
+
+        return KimiK3Attention
+    if name == "glm5_next":
+        from megatron.bridge.models.glm5_next.modeling_glm5_next.kda import Glm5NextKDA
+
+        return Glm5NextKDA
+    raise ValueError(f"unknown KDA layer {name!r}, expected one of {LAYERS}")
 
 
 @dataclass
@@ -104,9 +125,7 @@ def _local_shard(full: torch.Tensor, rank: int) -> torch.Tensor:
 
 def _unshard(gathered: list[torch.Tensor]) -> torch.Tensor:
     """Rebuild the natural-order [s, b, h] stream from per-rank zigzag shards."""
-    out = torch.empty(
-        (SEQ_LEN, *gathered[0].shape[1:]), dtype=gathered[0].dtype, device=gathered[0].device
-    )
+    out = torch.empty((SEQ_LEN, *gathered[0].shape[1:]), dtype=gathered[0].dtype, device=gathered[0].device)
     for rank, shard in enumerate(gathered):
         cursor, doc_start = 0, 0
         for doc_len in DOC_LENS:
@@ -117,14 +136,12 @@ def _unshard(gathered: list[torch.Tensor]) -> torch.Tensor:
     return out
 
 
-def _run_rank(rank: int, world: int, rdv_file: str, result_file: str):
+def _run_rank(rank: int, world: int, rdv_file: str, result_file: str, layer_name: str):
     torch.cuda.set_device(rank)
-    torch.distributed.init_process_group(
-        "nccl", init_method=f"file://{rdv_file}", world_size=world, rank=rank
-    )
+    torch.distributed.init_process_group("nccl", init_method=f"file://{rdv_file}", world_size=world, rank=rank)
     from megatron.core.packed_seq_params import PackedSeqParams
 
-    from megatron.bridge.models.glm5_next.modeling_glm5_next.kda import Glm5NextKDA
+    layer_class = _layer_class(layer_name)
 
     cp_group = torch.distributed.new_group(list(range(world)))
     singletons = [torch.distributed.new_group([r]) for r in range(world)]
@@ -136,12 +153,14 @@ def _run_rank(rank: int, world: int, rdv_file: str, result_file: str):
     psp = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
 
     torch.manual_seed(1234)
-    layer_cp = Glm5NextKDA(
-        config, layer_number=1, pg_collection=_PGs(tp=self_group, cp=cp_group)
-    ).to(device)
-    layer_ref = Glm5NextKDA(
-        config, layer_number=1, pg_collection=_PGs(tp=self_group, cp=self_group)
-    ).to(device)
+    layer_cp = layer_class(config, layer_number=1, pg_collection=_PGs(tp=self_group, cp=cp_group)).to(device)
+    layer_ref = layer_class(config, layer_number=1, pg_collection=_PGs(tp=self_group, cp=self_group)).to(device)
+    # _init_kda allocates A_log/dt_bias with torch.empty. Uninitialized memory
+    # that happens to hold a NaN or a huge value makes chunk_kda return NaN and
+    # the parity assertion fail at random, so pin them before the forward.
+    with torch.no_grad():
+        layer_cp.A_log.normal_(mean=0.0, std=0.5)
+        layer_cp.dt_bias.normal_(mean=0.0, std=0.5)
     layer_ref.load_state_dict(layer_cp.state_dict())
 
     torch.manual_seed(7)  # identical stream on both ranks
@@ -197,32 +216,35 @@ def _server_venv_python() -> str:
 
 
 @requires_2gpu_fla
-def test_glm5_next_kda_cp_matches_cp1():
+@pytest.mark.parametrize("layer_name", LAYERS)
+def test_kda_cp_matches_cp1(layer_name):
     import re
     import subprocess
 
     proc = subprocess.run(
-        [_server_venv_python(), os.path.abspath(__file__)],
+        [_server_venv_python(), os.path.abspath(__file__), layer_name],
         capture_output=True,
         text=True,
         timeout=1800,
     )
     output = proc.stdout + proc.stderr
-    assert proc.returncode == 0, f"standalone parity run failed:\n{output[-4000:]}"
+    assert proc.returncode == 0, f"standalone {layer_name} parity run failed:\n{output[-4000:]}"
     match = re.search(r"RESULT fwd=([0-9.eE+-]+) grad=([0-9.eE+-]+)", output)
     assert match, f"no RESULT line in output:\n{output[-4000:]}"
     fwd_err, grad_rel_err = float(match.group(1)), float(match.group(2))
     # bf16 activations with fp32 state; the a2a itself is exact so tolerances
     # only absorb reduction-order noise.
-    assert fwd_err < 5e-2, f"cp2 forward diverges from cp1: max abs err {fwd_err}"
-    assert grad_rel_err < 5e-2, f"cp2 grads diverge from cp1: max rel err {grad_rel_err}"
+    assert fwd_err < 5e-2, f"{layer_name} cp2 forward diverges from cp1: max abs err {fwd_err}"
+    assert grad_rel_err < 5e-2, f"{layer_name} cp2 grads diverge from cp1: max rel err {grad_rel_err}"
 
 
 if __name__ == "__main__":
+    import sys
     import tempfile
 
+    selected = sys.argv[1] if len(sys.argv) > 1 else LAYERS[0]
     with tempfile.TemporaryDirectory() as d:
         rdv, result = os.path.join(d, "rdv"), os.path.join(d, "result")
-        torch.multiprocessing.spawn(_run_rank, args=(CP, rdv, result), nprocs=CP, join=True)
+        torch.multiprocessing.spawn(_run_rank, args=(CP, rdv, result, selected), nprocs=CP, join=True)
         fwd_err, grad_rel_err = open(result).read().split()
         print(f"RESULT fwd={fwd_err} grad={grad_rel_err}")
