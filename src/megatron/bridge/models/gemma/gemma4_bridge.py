@@ -288,7 +288,21 @@ class Gemma4Bridge(MegatronModelBridge):
 
     def _build_moe_provider(self, hf_config) -> Gemma4ModelProvider:
         """Build a Gemma4ModelProvider from HF config (MoE path)."""
-        provider_kwargs = self.hf_config_to_provider_kwargs(hf_config)
+        # hf_config_to_provider_kwargs is the *generic* mapping loop -- raw getattr
+        # over a name table -- so on transformers >= 5.15 it trips the per-layer
+        # guard (num_key_value_heads, head_dim) and aborts before the MoE provider
+        # exists. The dense path never hits this because it hand-builds its
+        # provider. Opt into the global read for this call only: for Gemma 4 the
+        # global values ARE the sliding-layer values (26B-A4B: 8 KV heads at
+        # head_dim 256, 25 of 30 layers sliding), which is the primary geometry the
+        # provider wants, and the global layers get their own geometry applied
+        # below from global_head_dim / num_global_key_value_heads.
+        _prev_global_access = getattr(hf_config, "allow_global_per_layer_attribute_access", False)
+        hf_config.allow_global_per_layer_attribute_access = True
+        try:
+            provider_kwargs = self.hf_config_to_provider_kwargs(hf_config)
+        finally:
+            hf_config.allow_global_per_layer_attribute_access = _prev_global_access
         provider = Gemma4ModelProvider(**provider_kwargs)
 
         provider.window_size = getattr(hf_config, "sliding_window", 1024)
