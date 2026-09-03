@@ -51,7 +51,12 @@ def gemma4_e4b_pretrain_2gpu_h100_bf16_config() -> ConfigContainer:
     - Dual RoPE: sliding θ=10 000, global θ=1 000 000 with 0.25 partial rotation
     - Per-Layer Embeddings (PLE, vocab=262144, dim=256)
     - Shared KV cache across the last 18 layers
-    - Local (non-TE) transformer spec via ``get_gemma4_layer_spec``
+    - Mostly-local transformer spec via ``get_gemma4_layer_spec``: linears and
+      norms are local, but core attention is ``Gemma4DenseCoreAttention``,
+      which subclasses ``TEDotProductAttention`` and so requires Transformer
+      Engine. There is no TE-free path for this model -- head_dim 512 on the
+      global layers has no fused kernel, and mcore's local
+      ``DotProductAttention`` materializes the full score matrix.
 
     Default parallelism: TP=2, PP=1, seq_length=4096.
     Override at launch time with Hydra-style args, e.g.::
@@ -99,7 +104,8 @@ def gemma4_e4b_pretrain_2gpu_h100_bf16_config() -> ConfigContainer:
 
     cfg.scheduler.lr_warmup_iters = 100
 
-    # Implementation — Dense E4B uses the local (non-TE) spec
+    # Implementation — Dense E4B uses the mostly-local spec; core attention
+    # still goes through Transformer Engine (see the class docstring)
     cfg.model.transformer_impl = "local"
     cfg.model.cuda_graph_impl = "none"
     cfg.model.cuda_graph_scope = "full"
