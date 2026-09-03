@@ -309,6 +309,11 @@ class Gemma4ModelProvider(GPTModelProvider):
     # skips the doomed TE attempt where the failure is known in advance. Required, not
     # optional: Gemma4MoEAttention raises at construction if the field is absent.
     force_flex_attention: bool = False
+
+    # Escape hatch: route MoE core attention back through plain Transformer Engine
+    # (Gemma4TEDotProductAttention) instead of the shared SDPA/flex path. Only useful
+    # for bisecting the refactor -- TE cannot serve the hd512 global layers.
+    legacy_moe_core_attention: bool = False
     qk_layernorm: bool = True
     attention_k_eq_v: bool = False
 
