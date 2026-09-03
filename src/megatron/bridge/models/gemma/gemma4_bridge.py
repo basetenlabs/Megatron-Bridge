@@ -56,11 +56,6 @@ from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 
 
 # Register Gemma4 custom module types for AutoMapping
-# Registered under both names: AutoMapping keys off type(module).__name__, and the MoE
-# core attention class is now Gemma4MoEAttention. The old name stays registered because
-# it remains a module-level alias, and dropping it would silently change conversion for
-# anything still constructing it by the old name.
-AutoMapping.register_module_type("Gemma4TEDotProductAttention", "replicated")
 AutoMapping.register_module_type("Gemma4MoEAttention", "replicated")
 AutoMapping.register_module_type("Gemma4SelfAttention", "replicated")
 AutoMapping.register_module_type("Gemma4TransformerLayer", "replicated")

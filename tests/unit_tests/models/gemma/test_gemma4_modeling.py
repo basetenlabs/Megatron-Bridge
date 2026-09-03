@@ -42,7 +42,6 @@ from megatron.bridge.models.gemma.modeling_gemma4 import (
     Gemma4RMSNorm,
     Gemma4RotaryEmbedding,
     Gemma4SelfAttention,
-    Gemma4TEDotProductAttention,
     Gemma4TopKRouter,
     Gemma4TransformerLayer,
     _attach_ple_modules,
@@ -843,8 +842,8 @@ class TestGemma4SelfAttention:
 def _moe_cfg(**overrides):
     """A MoE attention config carrying what the shared base actually reads.
 
-    The old Gemma4TEDotProductAttention was a bare TEDotProductAttention subclass and
-    needed only the pattern and the window. Sharing the dense path means the sliding
+    The MoE attention class used to be a bare TEDotProductAttention subclass needing
+    only the pattern and the window. Sharing the dense path means the sliding
     branch also reads force_flex_attention (deliberately un-defaulted -- a config
     without it is mis-wired) and the global branch resolves softmax_scale and
     attention_dropout for SDPA, since it never reaches TE.
@@ -903,11 +902,6 @@ class TestGemma4MoEAttention:
         )
 
         assert calls[0]["config"].window_size is None
-
-    def test_old_name_is_an_alias(self):
-        # gemma4_bridge registers AutoMapping by class name and other code may still
-        # construct the old name; both must resolve to the same class.
-        assert Gemma4TEDotProductAttention is Gemma4MoEAttention
 
     def test_shares_the_dense_attention_path(self):
         # The whole point of the refactor: one implementation, two layer-type hooks.

@@ -1244,11 +1244,39 @@ class Gemma4MoEAttention(Gemma4CoreAttention):
         return (window - 1, 0)
 
 
-# Kept so existing imports, tests and the AutoMapping registration by class name keep
-# resolving; the old name described the implementation (it was a bare
-# TEDotProductAttention subclass) rather than the model family, and it is no longer
-# accurate now that the MoE path leaves TE for two of its cases.
-Gemma4TEDotProductAttention = Gemma4MoEAttention
+class Gemma4TEDotProductAttention(TEDotProductAttention):
+    """Gemma 4 MoE core attention, plain Transformer Engine — the pre-refactor path.
+
+    Kept selectable via ``Gemma4ModelProvider.legacy_moe_core_attention`` so the old
+    behaviour stays one config flag away rather than one revert away. Note it cannot
+    serve the hd512 global layers: ``attention_backend="flash"`` resolves to NoBackend
+    there and ``"auto"`` falls to the unfused O(S^2) path, which OOMs above ~32k. Use
+    Gemma4MoEAttention unless you are specifically bisecting the refactor.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        attention_dropout: Optional[float] = None,
+        **kwargs,
+    ):
+        config = copy.deepcopy(config)
+        if _is_local_attn_layer(layer_number, config.interleaved_attn_pattern):
+            config.window_size = (config.window_size - 1, 0)
+        else:
+            config.window_size = None
+
+        super().__init__(
+            config=config,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            attention_type=attention_type,
+            attention_dropout=attention_dropout,
+            **kwargs,
+        )
 
 
 def get_gemma4_layer_spec(config: Optional[TransformerConfig] = None) -> ModuleSpec:
@@ -2040,7 +2068,11 @@ def gemma4_block_spec(config, use_transformer_engine=True, **kwargs):
         if isinstance(attn_spec.module, type) and issubclass(attn_spec.module, SelfAttention):
             attn_spec.module = Gemma4SelfAttention
         if hasattr(attn_spec, "submodules") and attn_spec.submodules is not None:
-            attn_spec.submodules.core_attention = Gemma4MoEAttention
+            attn_spec.submodules.core_attention = (
+                Gemma4TEDotProductAttention
+                if getattr(config, "legacy_moe_core_attention", False)
+                else Gemma4MoEAttention
+            )
             if use_transformer_engine:
                 attn_spec.submodules.linear_proj = TERowParallelLinearLayerNorm
 
