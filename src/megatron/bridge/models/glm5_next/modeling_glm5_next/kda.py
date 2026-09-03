@@ -221,7 +221,11 @@ class Glm5NextKDA(KimiK3Attention):
         )
         q, k, v, forget_gate, gate, beta_logits = torch.split(packed, [section // cp for section in sections], dim=-1)
 
-        conv_inputs = {"q": q, "k": k, "v": v}
+        # FLA's causal_conv1d skips the contiguity guard for x and multiplies the
+        # token offset by the row stride in int32; on these split views (row
+        # stride sum(sections)/cp) that wraps at 2^31/stride tokens (209,389 at
+        # cp=4, 104,694 at cp=2) and reads garbage. Pass contiguous rows.
+        conv_inputs = {"q": q.contiguous(), "k": k.contiguous(), "v": v.contiguous()}
         for name in conv_inputs:
             conv_weight = get_parameter_local_cp(getattr(self, f"{name}_conv1d").weight, dim=0, cp_group=self.cp_group)
             conv_inputs[name] = _short_conv(conv_inputs[name], conv_weight, cu_seqlens)
