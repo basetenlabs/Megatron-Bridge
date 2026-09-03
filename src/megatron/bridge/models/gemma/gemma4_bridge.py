@@ -657,9 +657,35 @@ class Gemma4Bridge(MegatronModelBridge):
         qkv_total_sliding = config.num_attention_heads + 2 * config.num_query_groups
         expected_numel_sliding = qkv_total_sliding * config.kv_channels * (feature_dim or 1)
 
-        if linear_out_weight.numel() != expected_numel_sliding and hasattr(config, "global_head_dim"):
-            num_kv_global = config.num_global_key_value_heads
+        # Gemma 4's global layers have a different attention geometry than its
+        # sliding ones (on gemma-4-31B: 4 KV heads at head_dim 512, versus 16 at
+        # 256), so a global layer's fused QKV cannot be reshaped with the sliding
+        # dims that live on config. The branch below re-splits it with the global
+        # ones. It has to accept both spellings because the two providers name the
+        # same two fields differently -- Gemma4ModelProvider (MoE) uses HF's
+        # global_head_dim / num_global_key_value_heads, Gemma4DenseProvider uses
+        # Megatron's global_kv_channels / num_global_query_groups. Gating on the
+        # MoE names alone made this branch dead code for dense models: global
+        # layers fell through to the sliding reshape and raised
+        # "shape '[64, 256, r]' is invalid for input of size ...".
+        # Resolved as a pair, not field by field: mixing a head dim from one
+        # spelling with a KV-head count from the other would reshape with an
+        # inconsistent geometry. hasattr rather than `or` so a legitimate 0 is
+        # not read as missing.
+        if hasattr(config, "global_head_dim"):
             head_size_global = config.global_head_dim
+            num_kv_global = getattr(config, "num_global_key_value_heads", None)
+        elif hasattr(config, "global_kv_channels"):
+            head_size_global = config.global_kv_channels
+            num_kv_global = getattr(config, "num_global_query_groups", None)
+        else:
+            head_size_global = num_kv_global = None
+
+        if (
+            linear_out_weight.numel() != expected_numel_sliding
+            and head_size_global is not None
+            and num_kv_global is not None
+        ):
 
             class _GlobalAttnCfg:
                 num_attention_heads = config.num_attention_heads
@@ -668,7 +694,17 @@ class Gemma4Bridge(MegatronModelBridge):
                 hidden_size = config.hidden_size
                 attention_output_gate = getattr(config, "attention_output_gate", False)
 
-            q_out, k_out, _ = split_qkv_weights(_GlobalAttnCfg(), linear_out_weight, feature_dim=feature_dim)
-            return {"q_proj": q_out, "k_proj": k_out, "v_proj": ABSENT_PROJECTION}
+            q_out, k_out, v_out = split_qkv_weights(
+                _GlobalAttnCfg(), linear_out_weight, feature_dim=feature_dim
+            )
+            # ABSENT_PROJECTION is only true under K=V tying, where HF ships no
+            # v_proj weight for these layers. Without the flag the global layers
+            # have a live V that goes through _v_norm into attention, and
+            # declaring it absent would silently drop its adapter on export.
+            # The numel guard above cannot tell the two apart: the fused QKV
+            # allocates the V slots either way.
+            if getattr(config, "attention_k_eq_v", False):
+                return {"q_proj": q_out, "k_proj": k_out, "v_proj": ABSENT_PROJECTION}
+            return {"q_proj": q_out, "k_proj": k_out, "v_proj": v_out}
 
         return super()._split_qkv_linear_out_weight(megatron_model, linear_out_weight)

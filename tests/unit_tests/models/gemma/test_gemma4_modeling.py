@@ -24,9 +24,11 @@ import pytest
 import torch
 from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.training.config.instantiate_utils import instantiate
 
 from megatron.bridge.models.gemma.modeling_gemma4 import (
+    Gemma4DenseCoreAttention,
     Gemma4DenseMLP,
     Gemma4DenseRotaryEmbedding,
     Gemma4DenseSelfAttention,
@@ -879,6 +881,101 @@ class TestGemma4TEDotProductAttention:
         )
 
         assert calls[0]["config"].window_size is None
+
+
+class TestGemma4DenseCoreAttention:
+    """Dispatch, the CP guard, and the SDPA mask/scale translation."""
+
+    @staticmethod
+    def _cfg(**over):
+        cfg = SimpleNamespace(
+            window_size=(1023, 0),
+            window_attn_skip_freq=["sliding_attention", "full_attention"],
+            context_parallel_size=1,
+            softmax_type="vanilla",
+            softmax_scale=1.0,
+            attention_dropout=0.0,
+            sequence_parallel=False,
+            num_layers=2,
+            num_kv_shared_layers=0,
+            force_flex_attention=False,
+        )
+        for k, v in over.items():
+            setattr(cfg, k, v)
+        return cfg
+
+    def _build(self, monkeypatch, layer_number, **over):
+        calls = []
+        monkeypatch.setattr(
+            "megatron.bridge.models.gemma.modeling_gemma4.TEDotProductAttention.__init__",
+            lambda self, **kw: calls.append(kw),
+        )
+        layer = Gemma4DenseCoreAttention(
+            config=self._cfg(**over),
+            layer_number=layer_number,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+        )
+        return layer, calls
+
+    def test_sliding_layer_keeps_the_window(self, monkeypatch):
+        layer, calls = self._build(monkeypatch, layer_number=1)
+        assert layer.is_gemma4_sliding_layer is True
+        # the dense provider already stores a tuple; it is passed through as-is
+        assert calls[0]["config"].window_size == (1023, 0)
+
+    def test_global_layer_clears_the_window(self, monkeypatch):
+        layer, calls = self._build(monkeypatch, layer_number=2)
+        assert layer.is_gemma4_sliding_layer is False
+        assert calls[0]["config"].window_size is None
+
+    def test_global_layer_rejects_context_parallelism(self, monkeypatch):
+        """mcore's DotProductAttention asserted this; inheriting TE dropped it.
+
+        The SDPA path would otherwise attend over the rank-local sq/cp chunk and
+        return silently wrong gradients rather than failing.
+        """
+        with pytest.raises(ValueError, match="context_parallel_size must be 1"):
+            self._build(monkeypatch, layer_number=2, context_parallel_size=2)
+
+    def test_sliding_layer_allows_context_parallelism(self, monkeypatch):
+        """Sliding layers stay on TE, which does implement CP."""
+        layer, _ = self._build(monkeypatch, layer_number=1, context_parallel_size=2)
+        assert layer.is_gemma4_sliding_layer is True
+
+    def test_global_layer_rejects_non_vanilla_softmax(self, monkeypatch):
+        with pytest.raises(ValueError, match="vanilla softmax"):
+            self._build(monkeypatch, layer_number=2, softmax_type="off-by-one")
+
+    def test_sdpa_mask_is_inverted_not_forwarded(self, monkeypatch):
+        """Megatron masks mean True == drop; SDPA bool masks mean True == keep."""
+        layer, _ = self._build(monkeypatch, layer_number=2)
+        megatron_mask = torch.tensor([[[[False, True], [False, False]]]])
+        attn_mask, is_causal = layer._sdpa_attention_mask(
+            megatron_mask, AttnMaskType.padding_causal, q_len=2, kv_len=2
+        )
+        assert is_causal is False
+        assert torch.equal(attn_mask, ~megatron_mask)
+
+    def test_sdpa_prefers_is_causal_when_no_mask(self, monkeypatch):
+        """No explicit mask means never allocating [sq, sk]."""
+        layer, _ = self._build(monkeypatch, layer_number=2)
+        attn_mask, is_causal = layer._sdpa_attention_mask(
+            None, AttnMaskType.causal, q_len=4, kv_len=4
+        )
+        assert attn_mask is None and is_causal is True
+
+    def test_sdpa_decode_step_needs_no_causal_mask(self, monkeypatch):
+        """q_len == 1 is decode against a KV cache; causal masking is a no-op."""
+        layer, _ = self._build(monkeypatch, layer_number=2)
+        assert layer._sdpa_attention_mask(None, AttnMaskType.causal, 1, 9) == (None, False)
+
+    def test_sdpa_rejects_a_non_bool_mask(self, monkeypatch):
+        layer, _ = self._build(monkeypatch, layer_number=2)
+        with pytest.raises(TypeError, match="boolean"):
+            layer._sdpa_attention_mask(
+                torch.zeros(1, 1, 2, 2), AttnMaskType.padding_causal, 2, 2
+            )
 
 
 class TestGemma4RotaryEmbeddings:
