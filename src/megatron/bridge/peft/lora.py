@@ -25,9 +25,11 @@ from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.utils import unwrap_model
 
 from megatron.bridge.peft.base import PEFT
+from megatron.bridge.models.common.te_layers import TERowParallelLinearLayerNorm
 from megatron.bridge.peft.lora_layers import (
     LinearAdapter,
     LoRALinear,
+    LoRALinearFusedPostLN,
     LoRATopKRouter,
     TEFusedLoRALinear,
 )
@@ -258,6 +260,15 @@ class LoRA(PEFT, ModuleMatcher):
             adapter = adapter_cls(attrs.in_features, attrs.out_features, dim, **adapter_kwargs)
             if isinstance(module, TopKRouter):
                 return LoRATopKRouter(module, adapter)
+            # A fused post-LN in the wrapped module means the adapter must be
+            # added *before* that norm; see LoRALinearFusedPostLN. Opt-in per
+            # provider: Gemma 2/3 and EXAONE 4 use the same class on two LoRA
+            # surfaces each and need the same treatment, but have not been
+            # verified, so they keep the historical behaviour until they are.
+            if isinstance(module, TERowParallelLinearLayerNorm) and getattr(
+                module.config, "lora_delta_inside_fused_post_ln", False
+            ):
+                return LoRALinearFusedPostLN(module, adapter)
             if enable_op_fuser:
                 return TEFusedLoRALinear(module, adapter)
             else:

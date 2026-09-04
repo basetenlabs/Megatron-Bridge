@@ -314,6 +314,13 @@ class Gemma4ModelProvider(GPTModelProvider):
     # (Gemma4TEDotProductAttention) instead of the shared SDPA/flex path. Only useful
     # for bisecting the refactor -- TE cannot serve the hd512 global layers.
     legacy_moe_core_attention: bool = False
+
+    # gemma4_block_spec swaps linear_proj for TERowParallelLinearLayerNorm, which
+    # fuses the post-attention RMSNorm into the projection. LoRA must therefore add
+    # its delta *before* that norm (Norm(Wx + BAx), not Norm(Wx) + BAx). The dense
+    # spec uses a plain row_parallel_linear and is unaffected -- which is why dense
+    # Gemma 4 measures mismatch_kl 0.0006 while the MoE sat at 0.11.
+    lora_delta_inside_fused_post_ln: bool = True
     qk_layernorm: bool = True
     attention_k_eq_v: bool = False
 

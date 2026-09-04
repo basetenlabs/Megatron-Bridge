@@ -88,6 +88,35 @@ class LoRALinear(AdapterWrapper):
         return combined, bias
 
 
+class LoRALinearFusedPostLN(LoRALinear):
+    """LoRA for a linear that has a post-layernorm fused into its ``forward``.
+
+    ``TERowParallelLinearLayerNorm`` (Gemma-style post-LN) returns
+    ``Norm(Wx)``, so the base :class:`LoRALinear` -- which adds the adapter to
+    whatever ``forward()`` returned -- produces ``Norm(Wx) + BAx``. The
+    reference implementation computes ``Norm(Wx + BAx)``.
+
+    Those are not close. RMSNorm's Jacobian rescales the delta by
+    ``gamma / rms(Wx)`` *and* projects out its component along ``Wx``, so
+    injecting outside the norm is wrong in magnitude and direction both --
+    measured on Gemma 4 26B-A4B, cosine between the two as low as 0.31, a 3.5x
+    inflated adapter effect, and correlation with HF+peft of 0.316. Moving the
+    delta inside the norm takes that to 0.928 and drops trainer-vs-HF logprob
+    rms from 0.885 to 0.067, which is the base-model (adapter-free) noise floor.
+
+    The adapter consumes ``x``, the same tensor the wrapped projection consumes
+    -- this module has no *input* norm, only an output one.
+    """
+
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
+        """Add the adapter to the projection output *before* the fused post-LN."""
+        pre_norm_output, bias = self.to_wrap.forward_without_post_layernorm(x, *args, **kwargs)
+        if self._adapter_enabled:
+            adapter_output = self.adapter_forward(self.adapter, x.contiguous(), *args, **kwargs)
+            pre_norm_output = pre_norm_output + adapter_output.reshape(pre_norm_output.shape)
+        return self.to_wrap.post_layernorm(pre_norm_output), bias
+
+
 class LoRATopKRouter(AdapterWrapper):
     """Adapter wrapper that applies LoRA to router gating logits."""
 
