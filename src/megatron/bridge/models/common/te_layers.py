@@ -46,6 +46,17 @@ class TERowParallelLinearLayerNorm(TERowParallelLinear):
         )
         self.post_layernorm = TENorm(config, output_size)
 
+    def forward_without_post_layernorm(self, x):
+        """The raw projection output, *before* the fused post-LN.
+
+        LoRA needs this. The reference (HF/peft) computes ``Norm(Wx + BAx)`` --
+        the delta belongs inside the norm. A wrapper that only sees ``forward()``
+        can add it after, giving ``Norm(Wx) + BAx``, which is wrong in both
+        magnitude and direction: RMSNorm's Jacobian rescales by
+        ``gamma / rms(Wx)`` and projects out the component along ``Wx``.
+        """
+        return super().forward(x)
+
     def forward(self, x):
         """Forward with additional Post-LN on output."""
         output, bias = super().forward(x)
