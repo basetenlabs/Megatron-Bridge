@@ -24,8 +24,8 @@ from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.utils import unwrap_model
 
-from megatron.bridge.peft.base import PEFT
 from megatron.bridge.models.common.te_layers import TERowParallelLinearLayerNorm
+from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.lora_layers import (
     LinearAdapter,
     LoRALinear,
