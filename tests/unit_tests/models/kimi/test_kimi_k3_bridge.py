@@ -26,7 +26,11 @@ from megatron.bridge.models.conversion.param_mapping import (
 )
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.kimi.kimi_k3_bridge import KimiK3Bridge
-from megatron.bridge.models.kimi.kimi_k3_layers import KimiK3MoELayer, KimiK3TransformerLayer
+from megatron.bridge.models.kimi.kimi_k3_layers import (
+    KimiK3Attention,
+    KimiK3MoELayer,
+    KimiK3TransformerLayer,
+)
 from megatron.bridge.models.kimi.kimi_k3_pipeline import (
     bank_num_rows,
     pack_stage_boundary,
@@ -271,6 +275,36 @@ def test_latent_moe_normalizes_after_combine_and_before_up_projection() -> None:
     output = KimiK3MoELayer.postprocess(layer, routed_output, shared_output)
 
     assert torch.equal(output, torch.tensor([12.0]))
+
+
+def test_attention_disables_inner_tp_overlap_without_mutating_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The outer K3 attention block, not its linears, owns SP communication."""
+
+    class _Group:
+        def __init__(self, size: int) -> None:
+            self._size = size
+
+        def size(self) -> int:
+            return self._size
+
+    monkeypatch.setattr(KimiK3Attention, "_init_kda", lambda *_args: None)
+    config = SimpleNamespace(
+        sequence_parallel=True,
+        tp_comm_overlap=True,
+        kimi_kda_layers=(1,),
+    )
+
+    attention = KimiK3Attention(
+        config,
+        layer_number=1,
+        pg_collection=SimpleNamespace(tp=_Group(8), cp=_Group(1)),
+    )
+
+    assert config.tp_comm_overlap is True
+    assert attention.linear_config is not config
+    assert attention.linear_config.tp_comm_overlap is False
 
 
 def test_transformer_layer_does_not_forward_input_ids_to_upstream_moe(
