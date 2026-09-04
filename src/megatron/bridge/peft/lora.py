@@ -260,11 +260,9 @@ class LoRA(PEFT, ModuleMatcher):
             adapter = adapter_cls(attrs.in_features, attrs.out_features, dim, **adapter_kwargs)
             if isinstance(module, TopKRouter):
                 return LoRATopKRouter(module, adapter)
-            # A fused post-LN in the wrapped module means the adapter must be
-            # added *before* that norm; see LoRALinearFusedPostLN. Opt-in per
-            # provider: Gemma 2/3 and EXAONE 4 use the same class on two LoRA
-            # surfaces each and need the same treatment, but have not been
-            # verified, so they keep the historical behaviour until they are.
+            # The delta must go inside the wrapped module's fused post-LN; see LoRALinearFusedPostLN.
+            # Opt-in per provider: Gemma 2/3 and EXAONE 4 use the same class but are unverified, so they
+            # deliberately keep the historical behaviour.
             if isinstance(module, TERowParallelLinearLayerNorm) and getattr(
                 module.config, "lora_delta_inside_fused_post_ln", False
             ):
