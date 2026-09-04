@@ -46,6 +46,14 @@ class TERowParallelLinearLayerNorm(TERowParallelLinear):
         )
         self.post_layernorm = TENorm(config, output_size)
 
+    def forward_without_post_layernorm(self, x):
+        """The raw projection output, *before* the fused post-LN.
+
+        LoRA needs it: the reference computes ``Norm(Wx + BAx)``, so the delta belongs inside
+        the norm. See :class:`~megatron.bridge.peft.lora_layers.LoRALinearFusedPostLN`.
+        """
+        return super().forward(x)
+
     def forward(self, x):
         """Forward with additional Post-LN on output."""
         output, bias = super().forward(x)

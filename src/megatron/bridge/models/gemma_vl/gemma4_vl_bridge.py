@@ -191,7 +191,12 @@ class Gemma4VLBridge(Gemma4Bridge):
         }
 
     def _conversion_mode(self) -> str:
-        mode = getattr(self, "gemma4_conversion_mode", None) or os.environ.get("GEMMA4_CONVERSION_MODE", "auto")
+        # Gemma 4 always converts text-only. Every shipped Gemma 4 recipe is text
+        # (`supports_vision_language=False` in the sampler config), and the VL path
+        # loads 1018 tensors instead of 662 and then dies much later with shape
+        # mismatches in attention and the loss path rather than failing at load.
+        # GEMMA4_CONVERSION_MODE stays as an explicit opt-in for VL work.
+        mode = getattr(self, "gemma4_conversion_mode", None) or os.environ.get("GEMMA4_CONVERSION_MODE", "text")
         mode = mode.lower()
         if mode not in {"auto", "text", "vl", "audio"}:
             raise ValueError(f"Invalid GEMMA4_CONVERSION_MODE={mode!r}; expected auto, text, vl, or audio.")

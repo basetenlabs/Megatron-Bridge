@@ -24,10 +24,12 @@ from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.utils import unwrap_model
 
+from megatron.bridge.models.common.te_layers import TERowParallelLinearLayerNorm
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.lora_layers import (
     LinearAdapter,
     LoRALinear,
+    LoRALinearFusedPostLN,
     LoRATopKRouter,
     TEFusedLoRALinear,
 )
@@ -258,6 +260,13 @@ class LoRA(PEFT, ModuleMatcher):
             adapter = adapter_cls(attrs.in_features, attrs.out_features, dim, **adapter_kwargs)
             if isinstance(module, TopKRouter):
                 return LoRATopKRouter(module, adapter)
+            # The delta must go inside the wrapped module's fused post-LN; see LoRALinearFusedPostLN.
+            # Opt-in per provider: Gemma 2/3 and EXAONE 4 use the same class but are unverified, so they
+            # deliberately keep the historical behaviour.
+            if isinstance(module, TERowParallelLinearLayerNorm) and getattr(
+                module.config, "lora_delta_inside_fused_post_ln", False
+            ):
+                return LoRALinearFusedPostLN(module, adapter)
             if enable_op_fuser:
                 return TEFusedLoRALinear(module, adapter)
             else:

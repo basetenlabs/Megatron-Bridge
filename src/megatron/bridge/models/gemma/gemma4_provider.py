@@ -301,6 +301,24 @@ class Gemma4ModelProvider(GPTModelProvider):
     hidden_dropout: float = 0.0
     attention_backend: AttnBackend = AttnBackend.auto
     softmax_scale: float = 1.0
+
+    # Same meaning as on Gemma4DenseProvider: the sliding layers normally run on
+    # Transformer Engine, and where the flash kernel refuses hd256 + a local window
+    # (FA4's sm100 path asserts on local attention; cuDNN has no hd256 backward kernel
+    # on sm100/sm103) Gemma4MoEAttention falls back to FlexAttention. Setting this True
+    # skips the doomed TE attempt where the failure is known in advance. Required, not
+    # optional: Gemma4MoEAttention raises at construction if the field is absent.
+    force_flex_attention: bool = False
+
+    # Escape hatch: route MoE core attention back through plain Transformer Engine
+    # (Gemma4TEDotProductAttention) instead of the shared SDPA/flex path. Only useful
+    # for bisecting the refactor -- TE cannot serve the hd512 global layers.
+    legacy_moe_core_attention: bool = False
+
+    # gemma4_block_spec fuses the post-attention RMSNorm into linear_proj, so the LoRA delta
+    # must be added *before* it (Norm(Wx + BAx), not Norm(Wx) + BAx). The dense spec uses a
+    # plain row_parallel_linear and is unaffected.
+    lora_delta_inside_fused_post_ln: bool = True
     qk_layernorm: bool = True
     attention_k_eq_v: bool = False
 
