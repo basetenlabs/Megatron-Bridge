@@ -404,6 +404,10 @@ def _extract_megatron_lm_args_from_state_dict(state_dict: dict[str, Any]) -> dic
 # ============================================================================
 
 
+def _noop_async_save(*_args: Any, **_kwargs: Any) -> None:
+    pass
+
+
 def schedule_async_save(global_state: GlobalState, async_request: AsyncRequest) -> None:
     """Schedule the async save request.
 
@@ -411,6 +415,10 @@ def schedule_async_save(global_state: GlobalState, async_request: AsyncRequest) 
         global_state: The global training state containing the async calls queue.
         async_request: the async save request.
     """
+    # Finalization waits for every rank, including ranks with no checkpoint data.
+    if async_request.async_fn is None:
+        async_request = async_request._replace(async_fn=_noop_async_save)
+
     async_queue = global_state.async_calls_queue
     if async_queue is not None:
         async_queue.schedule_async_request(async_request)

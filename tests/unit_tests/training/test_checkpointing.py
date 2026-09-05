@@ -23,6 +23,7 @@ import numpy as np
 import pytest
 import torch
 from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
 from megatron.core.msc_utils import MultiStorageClientFeature
 
 from megatron.bridge.training.checkpointing import (
@@ -66,6 +67,7 @@ from megatron.bridge.training.checkpointing import (
     read_metadata,
     resolve_state_to_load,
     save_checkpoint,
+    schedule_async_save,
 )
 from megatron.bridge.training.config import CheckpointConfig, ConfigContainer
 from megatron.bridge.training.state import GlobalState, TrainState
@@ -77,6 +79,18 @@ class _DummyClass:
 
 
 _dummy_obj = _DummyClass()
+
+
+@pytest.mark.unit
+def test_schedule_async_save_gives_empty_request_work() -> None:
+    queue = Mock()
+    state = Mock(async_calls_queue=queue)
+
+    schedule_async_save(state, AsyncRequest(None, (), []))
+
+    request = queue.schedule_async_request.call_args.args[0]
+    assert request.async_fn is not None
+    request.async_fn()
 
 
 def _write_dataloader_state_marker(path: str) -> None:
