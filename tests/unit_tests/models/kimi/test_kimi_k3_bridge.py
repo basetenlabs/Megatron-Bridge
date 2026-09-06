@@ -119,6 +119,14 @@ def test_provider_bridge_configures_four_layer_proxy(kimi_k3_pretrained: Mock) -
     assert provider.make_vocab_size_divisible_by == 128
     assert provider.use_te_activation_func is True
     assert provider.variable_seq_lengths is True
+    # K3 packs documents into THD rows. Without this the trainer's BSHD path
+    # pads every row of a forward_backward to the longest row in that call, so
+    # an unequal-length RL batch computes n * max(len) tokens for sum(len) of
+    # work. K3 cannot reach THD through context parallelism the way our other
+    # long-context models do -- its head count and tp leave no ranks for cp --
+    # so this explicit opt-in is the only route.
+    assert provider.requires_packed_sequence is True
+    assert provider.packed_sequence_phantom_length == 64
     assert provider.bf16 is True
     assert provider.params_dtype == torch.bfloat16
 
