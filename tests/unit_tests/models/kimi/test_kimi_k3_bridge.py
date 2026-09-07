@@ -119,17 +119,8 @@ def test_provider_bridge_configures_four_layer_proxy(kimi_k3_pretrained: Mock) -
     assert provider.make_vocab_size_divisible_by == 128
     assert provider.use_te_activation_func is True
     assert provider.variable_seq_lengths is True
-    # K3 packs documents into THD rows. Without this the trainer's BSHD path
-    # pads every row of a forward_backward to the longest row in that call, so
-    # an unequal-length RL batch computes n * max(len) tokens for sum(len) of
-    # work. K3 cannot reach THD through context parallelism the way our other
-    # long-context models do -- its head count and tp leave no ranks for cp --
-    # so this explicit opt-in is the only route.
+    # Prefer packing while allowing the trainer's DPO fallback.
     assert provider.requires_packed_sequence is True
-    # K3 is correct unpacked (it trained on BSHD for months), so packing is a
-    # throughput choice. glm5_next leaves this False because its KPool needs
-    # packed cu_seqlens to be correct at all. The trainer uses the distinction
-    # to fall back to BSHD for DPO rather than refusing the request.
     assert provider.packed_sequence_optional is True
     assert provider.packed_sequence_phantom_length == 64
     assert provider.bf16 is True

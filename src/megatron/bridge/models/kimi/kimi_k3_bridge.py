@@ -126,34 +126,12 @@ class KimiK3Bridge(MegatronModelBridge):
         provider.kimi_kda_gate_lower_bound = linear_config["gate_lower_bound"]
         provider.kimi_attn_res_block_size = text_config.attn_res_block_size
 
-        # Pack documents into THD rows instead of one padded BSHD row per datum.
-        # The BSHD path pads every row of a forward_backward to the LONGEST row
-        # in that call (trainers _forward_batch_seq_length -> pad_to_length), so
-        # a batch of unequal-length sequences computes n * max(len) tokens for
-        # sum(len) of real work. THD pads per document to a small quantum
-        # instead, which is the difference between ~3.8x and ~1.0x on a
-        # multi-turn RL batch of 5k-120k token episodes.
-        #
-        # K3 cannot get here the way our other long-context models do. Every
-        # other packing model reaches THD through context parallelism, but K3's
-        # 96 KDA heads and the tp=32 it needs to hold the weights on B200 leave
-        # no ranks for cp (see the head-count constraint in KimiK3Attention's
-        # CP path), so it needs the same explicit opt-in glm5_next uses. The
-        # conv and KDA kernels already segment the packed buffer on cu_seqlens,
-        # which is what packing requires of them.
+        # Prefer packing at CP=1 to avoid batch-wide padding. Conv and KDA
+        # kernels already isolate documents via cu_seqlens.
         provider.requires_packed_sequence = True
-        # ...but unlike glm5_next, K3 is CORRECT on the unpacked path -- it
-        # trained there for months. Packing is a throughput choice, not a
-        # correctness requirement, and the distinction matters for DPO: the THD
-        # DPO sequence reduction needs context parallelism, which no K3 golden
-        # row has. Flagging packing as optional lets the trainer fall back to
-        # BSHD for that one loss instead of refusing the request, while
-        # glm5_next (whose KPool derives pool boundaries from cu_seqlens, so
-        # BSHD would be silently wrong) keeps failing loudly.
+        # BSHD remains correct, so DPO can fall back when CP=1.
         provider.packed_sequence_optional = True
-        # Loss-masked EP synchronization rows still traverse the fused KDA
-        # kernels, so give them a kernel-safe length with no THD tail. 64 is a
-        # multiple of every K3 row's document quantum (lcm(2*cp, cp*tp)).
+        # Loss-masked EP sync rows still run KDA; 64 aligns with K3 document quanta.
         provider.packed_sequence_phantom_length = 64
 
         provider.use_te_activation_func = True
