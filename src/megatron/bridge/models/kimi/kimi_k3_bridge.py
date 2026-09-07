@@ -142,6 +142,15 @@ class KimiK3Bridge(MegatronModelBridge):
         # conv and KDA kernels already segment the packed buffer on cu_seqlens,
         # which is what packing requires of them.
         provider.requires_packed_sequence = True
+        # ...but unlike glm5_next, K3 is CORRECT on the unpacked path -- it
+        # trained there for months. Packing is a throughput choice, not a
+        # correctness requirement, and the distinction matters for DPO: the THD
+        # DPO sequence reduction needs context parallelism, which no K3 golden
+        # row has. Flagging packing as optional lets the trainer fall back to
+        # BSHD for that one loss instead of refusing the request, while
+        # glm5_next (whose KPool derives pool boundaries from cu_seqlens, so
+        # BSHD would be silently wrong) keeps failing loudly.
+        provider.packed_sequence_optional = True
         # Loss-masked EP synchronization rows still traverse the fused KDA
         # kernels, so give them a kernel-safe length with no THD tail. 64 is a
         # multiple of every K3 row's document quantum (lcm(2*cp, cp*tp)).

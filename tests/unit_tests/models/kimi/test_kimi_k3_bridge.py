@@ -126,6 +126,11 @@ def test_provider_bridge_configures_four_layer_proxy(kimi_k3_pretrained: Mock) -
     # long-context models do -- its head count and tp leave no ranks for cp --
     # so this explicit opt-in is the only route.
     assert provider.requires_packed_sequence is True
+    # K3 is correct unpacked (it trained on BSHD for months), so packing is a
+    # throughput choice. glm5_next leaves this False because its KPool needs
+    # packed cu_seqlens to be correct at all. The trainer uses the distinction
+    # to fall back to BSHD for DPO rather than refusing the request.
+    assert provider.packed_sequence_optional is True
     assert provider.packed_sequence_phantom_length == 64
     assert provider.bf16 is True
     assert provider.params_dtype == torch.bfloat16
