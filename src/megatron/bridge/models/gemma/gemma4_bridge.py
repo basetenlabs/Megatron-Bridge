@@ -56,6 +56,8 @@ from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 
 
 # Register Gemma4 custom module types for AutoMapping
+AutoMapping.register_module_type("Gemma4MoEAttention", "replicated")
+# Legacy MoE core attention, selectable via Gemma4ModelProvider.legacy_moe_core_attention.
 AutoMapping.register_module_type("Gemma4TEDotProductAttention", "replicated")
 AutoMapping.register_module_type("Gemma4SelfAttention", "replicated")
 AutoMapping.register_module_type("Gemma4TransformerLayer", "replicated")
@@ -694,9 +696,7 @@ class Gemma4Bridge(MegatronModelBridge):
                 hidden_size = config.hidden_size
                 attention_output_gate = getattr(config, "attention_output_gate", False)
 
-            q_out, k_out, v_out = split_qkv_weights(
-                _GlobalAttnCfg(), linear_out_weight, feature_dim=feature_dim
-            )
+            q_out, k_out, v_out = split_qkv_weights(_GlobalAttnCfg(), linear_out_weight, feature_dim=feature_dim)
             # ABSENT_PROJECTION is only true under K=V tying, where HF ships no
             # v_proj weight for these layers. Without the flag the global layers
             # have a live V that goes through _v_norm into attention, and
