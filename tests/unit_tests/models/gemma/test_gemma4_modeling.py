@@ -840,14 +840,7 @@ class TestGemma4SelfAttention:
 
 
 def _moe_cfg(**overrides):
-    """A MoE attention config carrying what the shared base actually reads.
-
-    The MoE attention class used to be a bare TEDotProductAttention subclass needing
-    only the pattern and the window. Sharing the dense path means the sliding
-    branch also reads force_flex_attention (deliberately un-defaulted -- a config
-    without it is mis-wired) and the global branch resolves softmax_scale and
-    attention_dropout for SDPA, since it never reaches TE.
-    """
+    """MoE attention config with the fields the shared base reads (flex flag, SDPA scale/dropout, CP)."""
     cfg = dict(
         interleaved_attn_pattern=(1, 1),
         window_size=512,
@@ -904,7 +897,7 @@ class TestGemma4MoEAttention:
         assert calls[0]["config"].window_size is None
 
     def test_shares_the_dense_attention_path(self):
-        # The whole point of the refactor: one implementation, two layer-type hooks.
+        # One implementation, two layer-type hooks.
         assert issubclass(Gemma4MoEAttention, Gemma4CoreAttention)
         assert issubclass(Gemma4DenseCoreAttention, Gemma4CoreAttention)
         for shared in ("forward", "_flex_sliding_attention", "_sdpa_attention_mask"):
@@ -935,8 +928,7 @@ class TestGemma4MoEAttention:
             "megatron.bridge.models.gemma.modeling_gemma4.TEDotProductAttention.__init__",
             lambda self, **kwargs: None,
         )
-        # Inherited from the shared base: the global layers run on SDPA, which has no
-        # context parallelism, so CP > 1 would silently attend over the rank-local chunk.
+        # Global layers run on SDPA, which has no context parallelism; inherited from the base.
         with pytest.raises(ValueError, match="context_parallel_size must be 1"):
             Gemma4MoEAttention(
                 config=_moe_cfg(context_parallel_size=2),

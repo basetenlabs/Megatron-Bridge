@@ -832,13 +832,8 @@ def wire_gemma4_kv_sharing(model: nn.Module) -> None:
 class Gemma4CoreAttention(TEDotProductAttention):
     """Gemma 4 core attention: Transformer Engine for sliding layers, SDPA for global ones.
 
-    Shared by both model families. ``Gemma4DenseCoreAttention`` and
-    ``Gemma4MoEAttention`` differ only in how they answer two questions -- is this
-    layer sliding, and what is the window -- which they supply by overriding
-    ``_gemma4_is_sliding_layer`` and ``_gemma4_window_size``. Everything below this
-    point is identical for both, which is the point: the dense family had the SDPA
-    global path and the FlexAttention fallback and the MoE family had neither, so
-    the MoE model could not exceed ~32k before the unfused score matrix OOMed.
+    Shared by both families: ``Gemma4DenseCoreAttention`` and ``Gemma4MoEAttention`` only
+    override ``_gemma4_is_sliding_layer`` and ``_gemma4_window_size``.
 
     Gemma 4 global layers run head_dim_qk == head_dim_v == 512. TE FlashAttention and cuDNN
     FusedAttention both reject that head dim on sm90 ("Selected backend = NoBackend"), while
@@ -862,7 +857,7 @@ class Gemma4CoreAttention(TEDotProductAttention):
 
     @staticmethod
     def _gemma4_is_sliding_layer(config: TransformerConfig, layer_number: int) -> bool:
-        """Whether this layer slides. Overridden per family -- they key off different fields."""
+        """Whether this layer slides; each family keys off a different config field."""
         raise NotImplementedError
 
     @staticmethod
@@ -883,13 +878,9 @@ class Gemma4CoreAttention(TEDotProductAttention):
         is_sliding = self._gemma4_is_sliding_layer(config, layer_number)
 
         # Shallow copy: only window_size is rebound, and deep-copying a TransformerConfig
-        # drags in process-group and init-method references. The MoE family used to
-        # deepcopy here; shallow is the correct one and is now shared.
+        # drags in process-group and init-method references.
         config = copy.copy(config)
-        # No fallback for the sliding case: the layer-type hooks return False when no
-        # window is configured, so is_sliding implies one is set. The window itself
-        # comes from the hook because the two families store it differently -- dense
-        # keeps a (left, right) tuple, MoE an int that needs (w - 1, 0).
+        # is_sliding implies a window is set; the hook normalises dense's tuple and MoE's int.
         config.window_size = self._gemma4_window_size(config) if is_sliding else None
 
         super().__init__(
@@ -1197,11 +1188,7 @@ class Gemma4CoreAttention(TEDotProductAttention):
 
 
 class Gemma4DenseCoreAttention(Gemma4CoreAttention):
-    """Dense Gemma 4 core attention.
-
-    Layer type comes from ``window_attn_skip_freq`` and the provider already stores
-    ``window_size`` as a (left, right) tuple, so the window passes through untouched.
-    """
+    """Dense Gemma 4: layer type from ``window_attn_skip_freq``; ``window_size`` is already a tuple."""
 
     @staticmethod
     def _gemma4_is_sliding_layer(config: TransformerConfig, layer_number: int) -> bool:
@@ -1213,20 +1200,8 @@ class Gemma4DenseCoreAttention(Gemma4CoreAttention):
 
 
 class Gemma4MoEAttention(Gemma4CoreAttention):
-    """MoE Gemma 4 core attention -- the same path as the dense family.
-
-    Two differences from dense, both confined to the hooks below. Layer type comes
-    from ``interleaved_attn_pattern`` rather than ``window_attn_skip_freq``, and the
-    provider stores ``window_size`` as a plain int, which becomes ``(w - 1, 0)`` in
-    TE's key-offset convention -- ``window_size=1024`` attends 1024 keys, not 1025.
-
-    Everything else -- torch SDPA for the head_dim 512 global layers, the
-    FlexAttention fallback where the flash kernel refuses hd256 + a local window,
-    the context-parallel guard, the mask translation -- is inherited unchanged.
-    Before this class existed the MoE family went straight to TE with no fallback,
-    which meant ``attention_backend="flash"`` resolved to NoBackend on the global
-    layers (FA4 rejects hd512 on sm90 and cuDNN has no kernel for it either), and
-    ``"auto"`` fell to the unfused path whose score matrix OOMs past ~32k.
+    """MoE Gemma 4: layer type from ``interleaved_attn_pattern``; the int ``window_size``
+    becomes ``(w - 1, 0)`` in TE's key-offset convention. Everything else is inherited.
     """
 
     @staticmethod
@@ -1245,13 +1220,8 @@ class Gemma4MoEAttention(Gemma4CoreAttention):
 
 
 class Gemma4TEDotProductAttention(TEDotProductAttention):
-    """Gemma 4 MoE core attention, plain Transformer Engine — the pre-refactor path.
-
-    Kept selectable via ``Gemma4ModelProvider.legacy_moe_core_attention`` so the old
-    behaviour stays one config flag away rather than one revert away. Note it cannot
-    serve the hd512 global layers: ``attention_backend="flash"`` resolves to NoBackend
-    there and ``"auto"`` falls to the unfused O(S^2) path, which OOMs above ~32k. Use
-    Gemma4MoEAttention unless you are specifically bisecting the refactor.
+    """Pre-refactor MoE core attention on plain TE, selectable via ``legacy_moe_core_attention``
+    for bisection. Cannot serve the hd512 global layers.
     """
 
     def __init__(

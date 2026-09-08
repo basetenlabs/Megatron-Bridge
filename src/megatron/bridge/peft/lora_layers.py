@@ -89,16 +89,10 @@ class LoRALinear(AdapterWrapper):
 
 
 class LoRALinearFusedPostLN(LoRALinear):
-    """LoRA for a linear with a post-layernorm fused into its ``forward``.
+    """LoRA for a linear whose ``forward`` fuses a post-layernorm.
 
-    ``TERowParallelLinearLayerNorm`` returns ``Norm(Wx)``, so the base
-    :class:`LoRALinear` yields ``Norm(Wx) + BAx`` where the reference computes
-    ``Norm(Wx + BAx)``. RMSNorm's Jacobian rescales the delta and projects out its
-    component along ``Wx``, so injecting outside the norm is wrong in magnitude and
-    direction: on Gemma 4 26B-A4B, cosine 0.31 and correlation with HF+peft 0.316,
-    against 0.928 once the delta moves inside.
-
-    The adapter consumes ``x`` -- this module has no input norm, only an output one.
+    The reference computes ``Norm(Wx + BAx)``; the base class would give ``Norm(Wx) + BAx``,
+    which on Gemma 4 26B-A4B drops correlation with HF+peft from 0.93 to 0.32.
     """
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
