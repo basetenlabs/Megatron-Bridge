@@ -191,6 +191,7 @@ class Gemma4VLBridge(Gemma4Bridge):
         }
 
     def _conversion_mode(self) -> str:
+        return "text"
         # Text-only by default: every shipped Gemma 4 recipe is text, and the VL path fails
         # late with shape mismatches. GEMMA4_CONVERSION_MODE remains the VL opt-in.
         mode = getattr(self, "gemma4_conversion_mode", None) or os.environ.get("GEMMA4_CONVERSION_MODE", "text")
