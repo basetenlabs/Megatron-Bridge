@@ -88,6 +88,27 @@ class LoRALinear(AdapterWrapper):
         return combined, bias
 
 
+class LoRALinearFusedPostLN(LoRALinear):
+    """LoRA for a linear whose ``forward`` fuses a post-layernorm.
+
+    The reference computes ``Norm(Wx + BAx)``; the base class would give ``Norm(Wx) + BAx``,
+    which on Gemma 4 26B-A4B drops correlation with HF+peft from 0.93 to 0.32.
+    """
+
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
+        """Add the adapter to the projection output *before* the fused post-LN."""
+        pre_norm_output, bias = self.to_wrap.forward_without_post_layernorm(x, *args, **kwargs)
+        if bias is not None:
+            raise ValueError(
+                "TERowParallelLinearLayerNorm assumes add_bias_linear=False. "
+                "Post-LN before deferred bias addition is incorrect when bias is present."
+            )
+        if self._adapter_enabled:
+            adapter_output = self.adapter_forward(self.adapter, x.contiguous(), *args, **kwargs)
+            pre_norm_output = pre_norm_output + adapter_output.reshape(pre_norm_output.shape)
+        return self.to_wrap.post_layernorm(pre_norm_output), bias
+
+
 class LoRATopKRouter(AdapterWrapper):
     """Adapter wrapper that applies LoRA to router gating logits."""
 

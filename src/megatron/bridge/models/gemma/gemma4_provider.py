@@ -167,6 +167,8 @@ class Gemma4DenseProvider(GPTModelProvider):
     # where the failure is known in advance rather than paying an exception and a wasted
     # kernel compile on the first microbatch.
     force_flex_attention: bool = False
+    # Needs scaled_masked_softmax_cuda, which the trainer image does not ship.
+    masked_softmax_fusion: bool = False
 
     bf16: bool = True
     fp16: bool = False
@@ -301,6 +303,16 @@ class Gemma4ModelProvider(GPTModelProvider):
     hidden_dropout: float = 0.0
     attention_backend: AttnBackend = AttnBackend.auto
     softmax_scale: float = 1.0
+
+    # Skip the TE attempt on sliding layers and go straight to FlexAttention (as on
+    # Gemma4DenseProvider); the flash kernel rejects hd256 + local on sm100/sm103.
+    force_flex_attention: bool = False
+    # Needs scaled_masked_softmax_cuda, which the trainer image does not ship.
+    masked_softmax_fusion: bool = False
+    # Route MoE core attention through plain TE (Gemma4TEDotProductAttention); bisection only.
+    legacy_moe_core_attention: bool = False
+    # gemma4_block_spec fuses the post-attention RMSNorm into linear_proj; the LoRA delta goes inside.
+    lora_delta_inside_fused_post_ln: bool = True
     qk_layernorm: bool = True
     attention_k_eq_v: bool = False
 

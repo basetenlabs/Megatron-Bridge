@@ -191,7 +191,10 @@ class Gemma4VLBridge(Gemma4Bridge):
         }
 
     def _conversion_mode(self) -> str:
-        mode = getattr(self, "gemma4_conversion_mode", None) or os.environ.get("GEMMA4_CONVERSION_MODE", "auto")
+        return "text"
+        # Text-only by default: every shipped Gemma 4 recipe is text, and the VL path fails
+        # late with shape mismatches. GEMMA4_CONVERSION_MODE remains the VL opt-in.
+        mode = getattr(self, "gemma4_conversion_mode", None) or os.environ.get("GEMMA4_CONVERSION_MODE", "text")
         mode = mode.lower()
         if mode not in {"auto", "text", "vl", "audio"}:
             raise ValueError(f"Invalid GEMMA4_CONVERSION_MODE={mode!r}; expected auto, text, vl, or audio.")
