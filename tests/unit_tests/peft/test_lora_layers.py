@@ -32,6 +32,7 @@ from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.peft.lora_layers import (
     LinearAdapter,
     LoRALinear,
+    LoRALinearFusedPostLN,
     LoRATopKRouter,
     TEFusedLoRALinear,
 )
@@ -863,3 +864,92 @@ class TestCanonicalLoRATopKRouter:
         transformed = lora(model, training=True)
 
         assert isinstance(transformed.mlp.router, LoRATopKRouter)
+
+
+class MockLinearWithFusedPostLN(nn.Module):
+    """Stands in for ``TERowParallelLinearLayerNorm``: ``forward`` returns ``Norm(Wx)``."""
+
+    def __init__(self, in_features=10, out_features=10, deferred_bias=None):
+        """Initialize the mock, optionally returning a deferred bias."""
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=False)
+        self.post_layernorm = nn.LayerNorm(out_features)
+        self._deferred_bias = deferred_bias
+
+    def forward_without_post_layernorm(self, x, *args, **kwargs):
+        """Projection output before the fused post-LN."""
+        return self.linear(x), self._deferred_bias
+
+    def forward(self, x, *args, **kwargs):
+        """Forward with the post-LN fused in, as the real class does."""
+        output, bias = self.forward_without_post_layernorm(x)
+        return self.post_layernorm(output), bias
+
+    @property
+    def weight(self):
+        """Return the wrapped linear weight."""
+        return self.linear.weight
+
+
+class TestLoRALinearFusedPostLN:
+    """The delta must land inside the fused post-layernorm, not after it."""
+
+    @pytest.fixture
+    def base(self):
+        """A linear whose forward fuses a post-layernorm."""
+        return MockLinearWithFusedPostLN()
+
+    @pytest.fixture
+    def adapter(self):
+        """A LoRA adapter with explicit A/B matrices."""
+        return MockLoRAAdapter()
+
+    def test_delta_is_added_inside_the_norm(self, base, adapter):
+        """Output is ``Norm(Wx + BAx)``, which is what HF+peft computes."""
+        wrapped = LoRALinearFusedPostLN(base, adapter)
+        x = torch.randn(5, 10)
+
+        output, _ = wrapped(x)
+
+        pre_norm = base.linear(x)
+        delta = adapter(x)
+        expected_inside = base.post_layernorm(pre_norm + delta)
+        torch.testing.assert_close(output, expected_inside)
+
+    def test_delta_inside_differs_from_delta_after(self, base, adapter):
+        """Guards the actual bug: ``Norm(Wx) + BAx`` is a different function."""
+        wrapped = LoRALinearFusedPostLN(base, adapter)
+        x = torch.randn(5, 10)
+
+        output, _ = wrapped(x)
+
+        wrong = base.post_layernorm(base.linear(x)) + adapter(x)
+        assert not torch.allclose(output, wrong)
+
+    def test_zero_delta_is_a_no_op(self, base, adapter):
+        """With B = 0 the wrapper must reproduce the unwrapped forward exactly."""
+        nn.init.zeros_(adapter.linear_out.weight)
+        wrapped = LoRALinearFusedPostLN(base, adapter)
+        x = torch.randn(5, 10)
+
+        output, _ = wrapped(x)
+
+        torch.testing.assert_close(output, base(x)[0])
+
+    def test_disabled_adapter_is_a_no_op(self, base, adapter):
+        """Disabling the adapter must also reproduce the unwrapped forward."""
+        wrapped = LoRALinearFusedPostLN(base, adapter)
+        wrapped.disable_adapter_layers()
+        x = torch.randn(5, 10)
+
+        output, _ = wrapped(x)
+
+        torch.testing.assert_close(output, base(x)[0])
+
+    def test_deferred_bias_is_rejected(self, adapter):
+        """Post-LN before a deferred bias add is incorrect, so it must not run."""
+        base = MockLinearWithFusedPostLN(deferred_bias=torch.zeros(10))
+        wrapped = LoRALinearFusedPostLN(base, adapter)
+
+        with pytest.raises(ValueError, match="add_bias_linear=False"):
+            wrapped(torch.randn(5, 10))
