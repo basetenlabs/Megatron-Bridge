@@ -56,6 +56,8 @@ from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 
 
 # Register Gemma4 custom module types for AutoMapping
+AutoMapping.register_module_type("Gemma4MoEAttention", "replicated")
+# Legacy MoE core attention, selectable via Gemma4ModelProvider.legacy_moe_core_attention.
 AutoMapping.register_module_type("Gemma4TEDotProductAttention", "replicated")
 AutoMapping.register_module_type("Gemma4SelfAttention", "replicated")
 AutoMapping.register_module_type("Gemma4TransformerLayer", "replicated")
