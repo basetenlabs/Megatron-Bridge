@@ -829,13 +829,11 @@ def wire_gemma4_kv_sharing(model: nn.Module) -> None:
 # ---------------------------------------------------------------------------
 
 
-class Gemma4DenseCoreAttention(TEDotProductAttention):
-    """Gemma 4 dense core attention: Transformer Engine for sliding layers, SDPA for global ones.
+class Gemma4CoreAttention(TEDotProductAttention):
+    """Gemma 4 core attention: Transformer Engine for sliding layers, SDPA for global ones.
 
-    Sibling of ``Gemma4TEDotProductAttention`` (the MoE path, further down this
-    file), which does the same sliding-vs-global window dispatch but takes an int
-    ``window_size`` and converts it, and deep-copies the config. This one takes
-    the dense provider's tuple as-is and shallow-copies. Keep the two in step.
+    Shared by both families: ``Gemma4DenseCoreAttention`` and ``Gemma4MoEAttention`` only
+    override ``_gemma4_is_sliding_layer`` and ``_gemma4_window_size``.
 
     Gemma 4 global layers run head_dim_qk == head_dim_v == 512. TE FlashAttention and cuDNN
     FusedAttention both reject that head dim on sm90 ("Selected backend = NoBackend"), while
@@ -857,6 +855,16 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
     attempt where it is known to fail.
     """
 
+    @staticmethod
+    def _gemma4_is_sliding_layer(config: TransformerConfig, layer_number: int) -> bool:
+        """Whether this layer slides; each family keys off a different config field."""
+        raise NotImplementedError
+
+    @staticmethod
+    def _gemma4_window_size(config: TransformerConfig) -> Tuple[int, int]:
+        """The (left, right) window for a sliding layer, in TE's offset convention."""
+        raise NotImplementedError
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -867,16 +875,13 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
         softmax_scale: Optional[float] = None,
         **kwargs,
     ):
-        is_sliding = _is_gemma4_sliding_layer(config, layer_number)
+        is_sliding = self._gemma4_is_sliding_layer(config, layer_number)
 
         # Shallow copy: only window_size is rebound, and deep-copying a TransformerConfig
         # drags in process-group and init-method references.
         config = copy.copy(config)
-        # No fallback: _is_gemma4_sliding_layer returns False when window_size is
-        # falsy, so is_sliding implies it is set. A default here would also read
-        # like Gemma4TEDotProductAttention's genuine (window_size - 1, 0) int
-        # conversion, which this is not -- the dense provider already stores a tuple.
-        config.window_size = config.window_size if is_sliding else None
+        # is_sliding implies a window is set; the hook normalises dense's tuple and MoE's int.
+        config.window_size = self._gemma4_window_size(config) if is_sliding else None
 
         super().__init__(
             config=config,
@@ -916,14 +921,12 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
                 raise AttributeError(
                     "Gemma 4 sliding attention needs 'force_flex_attention' on the "
                     f"config; {type(config).__name__} does not declare it. "
-                    "Gemma4DenseProvider defines it -- a config that reaches here "
-                    "without it is mis-wired."
+                    "Gemma4DenseProvider and Gemma4ModelProvider both define it -- a "
+                    "config that reaches here without it is mis-wired."
                 )
             self.force_flex_attention = bool(config.force_flex_attention)
             self._gemma4_window = config.window_size
-            self._sliding_softmax_scale = (
-                softmax_scale if softmax_scale is not None else config.softmax_scale
-            )
+            self._sliding_softmax_scale = softmax_scale if softmax_scale is not None else config.softmax_scale
             self._sliding_attention_dropout = (
                 config.attention_dropout if attention_dropout is None else attention_dropout
             )
@@ -987,7 +990,7 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
                         "Gemma 4 sliding attention: Transformer Engine cannot serve "
                         "head_dim %d with window %s on this device (%s). Falling back to "
                         "FlexAttention for every sliding layer for the rest of this "
-                        "process. Set Gemma4DenseProvider.force_flex_attention=True to "
+                        "process. Set force_flex_attention=True on the provider to "
                         "skip this attempt from the start.",
                         query.size(-1),
                         self._gemma4_window,
@@ -1093,9 +1096,7 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
 
         mask_type = attn_mask_type if attn_mask_type is not None else self._sliding_attn_mask_type
         if mask_type not in (AttnMaskType.causal, AttnMaskType.padding_causal):
-            raise ValueError(
-                f"Gemma 4 sliding attention expects a causal mask type; got {mask_type}."
-            )
+            raise ValueError(f"Gemma 4 sliding attention expects a causal mask type; got {mask_type}.")
         if attention_mask is not None:
             # A padding mask would have to be AND-ed into mask_mod. Dropping it would
             # silently attend to padding, so refuse instead of guessing.
@@ -1114,8 +1115,7 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
         window = self._gemma4_window
         if not window or window[1]:
             raise ValueError(
-                "Gemma 4 sliding attention expects a left-only causal window "
-                f"(left, 0); got window_size={window!r}."
+                f"Gemma 4 sliding attention expects a left-only causal window (left, 0); got window_size={window!r}."
             )
         left = int(window[0])
 
@@ -1129,11 +1129,7 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
         # [s, b, np, hn] -> [b, np, s, hn]; hn stays stride-1, so these are views.
         query, key, value = (tensor.permute(1, 2, 0, 3) for tensor in (query, key, value))
 
-        scale = (
-            self._sliding_softmax_scale
-            if self._sliding_softmax_scale is not None
-            else query.size(-1) ** -0.5
-        )
+        scale = self._sliding_softmax_scale if self._sliding_softmax_scale is not None else query.size(-1) ** -0.5
         block_mask = _sliding_block_mask(left, query.size(2), key.size(2), str(query.device))
 
         context = _compiled_flex_attention()(query, key, value, block_mask=block_mask, scale=scale)
@@ -1180,6 +1176,38 @@ class Gemma4DenseCoreAttention(TEDotProductAttention):
                 f"(True == masked out); got dtype {attention_mask.dtype}."
             )
         return ~attention_mask, False
+
+
+class Gemma4DenseCoreAttention(Gemma4CoreAttention):
+    """Dense Gemma 4: layer type from ``window_attn_skip_freq``; ``window_size`` is already a tuple."""
+
+    @staticmethod
+    def _gemma4_is_sliding_layer(config: TransformerConfig, layer_number: int) -> bool:
+        return _is_gemma4_sliding_layer(config, layer_number)
+
+    @staticmethod
+    def _gemma4_window_size(config: TransformerConfig) -> Tuple[int, int]:
+        return config.window_size
+
+
+class Gemma4MoEAttention(Gemma4CoreAttention):
+    """MoE Gemma 4: layer type from ``interleaved_attn_pattern``; the int ``window_size``
+    becomes ``(w - 1, 0)`` in TE's key-offset convention. Everything else is inherited.
+    """
+
+    @staticmethod
+    def _gemma4_is_sliding_layer(config: TransformerConfig, layer_number: int) -> bool:
+        if not getattr(config, "window_size", None):
+            return False
+        return _is_local_attn_layer(layer_number, config.interleaved_attn_pattern)
+
+    @staticmethod
+    def _gemma4_window_size(config: TransformerConfig) -> Tuple[int, int]:
+        window = config.window_size
+        # Already a tuple when a caller pre-normalised it; otherwise convert the int.
+        if isinstance(window, (tuple, list)):
+            return tuple(window)
+        return (window - 1, 0)
 
 
 def get_gemma4_layer_spec(config: Optional[TransformerConfig] = None) -> ModuleSpec:
@@ -1976,7 +2004,11 @@ def gemma4_block_spec(config, use_transformer_engine=True, **kwargs):
         if isinstance(attn_spec.module, type) and issubclass(attn_spec.module, SelfAttention):
             attn_spec.module = Gemma4SelfAttention
         if hasattr(attn_spec, "submodules") and attn_spec.submodules is not None:
-            attn_spec.submodules.core_attention = Gemma4TEDotProductAttention
+            attn_spec.submodules.core_attention = (
+                Gemma4TEDotProductAttention
+                if getattr(config, "legacy_moe_core_attention", False)
+                else Gemma4MoEAttention
+            )
             if use_transformer_engine:
                 attn_spec.submodules.linear_proj = TERowParallelLinearLayerNorm
 
