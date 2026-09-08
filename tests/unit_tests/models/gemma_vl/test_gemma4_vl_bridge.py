@@ -647,37 +647,38 @@ def bridge():
     return Gemma4VLBridge()
 
 
+def _moe_vl_provider(bridge, hf_pretrained, monkeypatch):
+    """Build the MoE VL provider through ``provider_bridge``'s inline VL construction.
+
+    ``Gemma4VLBridge._conversion_mode`` is hard-wired to ``"text"`` in this fork, so
+    ``provider_bridge`` never selects its VL branch on its own. That branch is still live
+    code with no separate builder method, so pin the mode locally to reach it.
+    """
+    monkeypatch.setattr(bridge, "_conversion_mode", lambda: "vl")
+    return bridge.provider_bridge(hf_pretrained)
+
+
 class TestGemma4VLBridgeInitialization:
     def test_inherits_causal_bridge(self):
         assert issubclass(Gemma4VLBridge, Gemma4Bridge)
 
 
 class TestGemma4VLBridgeConversionMode:
-    def test_conversion_mode_returns_text_when_env_set(self, bridge, monkeypatch):
-        monkeypatch.setenv("GEMMA4_CONVERSION_MODE", "text")
+    @pytest.mark.parametrize("env", [None, "text", "auto", "vl", "audio", "bad-mode"])
+    def test_conversion_mode_is_text_whatever_the_environment_says(self, bridge, monkeypatch, env):
+        """Gemma 4 converts text-only; the environment no longer selects a mode."""
+        if env is None:
+            monkeypatch.delenv("GEMMA4_CONVERSION_MODE", raising=False)
+        else:
+            monkeypatch.setenv("GEMMA4_CONVERSION_MODE", env)
 
         assert bridge._conversion_mode() == "text"
-
-    def test_conversion_mode_returns_auto_by_default(self, bridge, monkeypatch):
-        monkeypatch.delenv("GEMMA4_CONVERSION_MODE", raising=False)
-
-        assert bridge._conversion_mode() == "auto"
-
-    def test_conversion_mode_audio_dispatch(self, bridge, monkeypatch):
-        monkeypatch.setenv("GEMMA4_CONVERSION_MODE", "audio")
-
-        assert bridge._conversion_mode() == "audio"
-
-    def test_conversion_mode_rejects_invalid_env(self, bridge, monkeypatch):
-        monkeypatch.setenv("GEMMA4_CONVERSION_MODE", "bad-mode")
-
-        with pytest.raises(ValueError, match="Invalid GEMMA4_CONVERSION_MODE"):
-            bridge._conversion_mode()
 
 
 class TestGemma4VLBridgeProviderBridgeMoE:
     def test_returns_provider(self, bridge, mock_hf_pretrained_moe):
-        assert isinstance(bridge.provider_bridge(mock_hf_pretrained_moe), Gemma4VLModelProvider)
+        # Text-only conversion, so the base MoE provider -- not the VL subclass.
+        assert type(bridge.provider_bridge(mock_hf_pretrained_moe)) is Gemma4ModelProvider
 
     def test_basic_transformer_config(self, bridge, mock_hf_pretrained_moe):
         p = bridge.provider_bridge(mock_hf_pretrained_moe)
@@ -704,8 +705,8 @@ class TestGemma4VLBridgeProviderBridgeMoE:
     def test_softmax_scale_is_one(self, bridge, mock_hf_pretrained_moe):
         assert bridge.provider_bridge(mock_hf_pretrained_moe).softmax_scale == 1.0
 
-    def test_vl_specific_config(self, bridge, mock_hf_pretrained_moe):
-        p = bridge.provider_bridge(mock_hf_pretrained_moe)
+    def test_vl_specific_config(self, bridge, mock_hf_pretrained_moe, monkeypatch):
+        p = _moe_vl_provider(bridge, mock_hf_pretrained_moe, monkeypatch)
         assert p.image_token_id == 258_880
         assert p.video_token_id == 258_884
         assert p.bos_token_id == 2
@@ -730,8 +731,8 @@ class TestGemma4VLBridgeProviderBridgeMoE:
     def test_logit_softcapping(self, bridge, mock_hf_pretrained_moe):
         assert bridge.provider_bridge(mock_hf_pretrained_moe).final_logit_softcapping == 30.0
 
-    def test_vision_config_set(self, bridge, mock_hf_pretrained_moe):
-        p = bridge.provider_bridge(mock_hf_pretrained_moe)
+    def test_vision_config_set(self, bridge, mock_hf_pretrained_moe, monkeypatch):
+        p = _moe_vl_provider(bridge, mock_hf_pretrained_moe, monkeypatch)
         assert p.vision_config is mock_hf_pretrained_moe.config.vision_config
         assert p.text_config is mock_hf_pretrained_moe.config.text_config
 
@@ -758,13 +759,17 @@ class TestGemma4VLBridgeProviderBridgeMoE:
 
 class TestGemma4VLBridgeProviderBridgeDense:
     def test_accepts_dense_with_per_layer_inputs(self, bridge, mock_hf_pretrained_dense):
-        mock_hf_pretrained_dense.config.text_config.hidden_size_per_layer_input = 256
-        p = bridge.provider_bridge(mock_hf_pretrained_dense)
+        # _conversion_mode is hard-wired to "text", so build the VL provider directly.
+        hf_config = mock_hf_pretrained_dense.config
+        hf_config.text_config.hidden_size_per_layer_input = 256
+        p = bridge._build_dense_vl_provider(hf_config, hf_config.text_config, hf_config.vision_config)
         assert isinstance(p, Gemma4DenseVLProvider)
         assert p.per_layer_embed_dim == 256
 
     def test_returns_dense_vl_provider(self, bridge, mock_hf_pretrained_dense):
-        assert isinstance(bridge.provider_bridge(mock_hf_pretrained_dense), Gemma4DenseVLProvider)
+        hf_config = mock_hf_pretrained_dense.config
+        p = bridge._build_dense_vl_provider(hf_config, hf_config.text_config, hf_config.vision_config)
+        assert isinstance(p, Gemma4DenseVLProvider)
 
     def test_preserves_logit_softcapping(self, bridge, mock_hf_pretrained_dense):
         assert bridge.provider_bridge(mock_hf_pretrained_dense).final_logit_softcapping == 30.0
@@ -906,20 +911,22 @@ class TestGemma4VLBridgeMappingRegistry:
         assert any("norm" in n for n in names)
 
     def test_has_vision_tower_mapping(self, bridge):
-        names = self._collect_names(bridge.mapping_registry())
+        # mapping_registry() only dispatches to the text registries in this fork, so the
+        # VL registry builders are exercised directly.
+        names = self._collect_names(bridge._moe_vl_mapping_registry())
         assert any("vision_tower" in n for n in names)
 
     def test_has_embed_vision_mapping(self, bridge):
-        names = self._collect_names(bridge.mapping_registry())
+        names = self._collect_names(bridge._moe_vl_mapping_registry())
         assert any("embed_vision" in n for n in names)
 
     def test_has_audio_tower_mapping(self, bridge):
         """VL bridge includes audio_tower mappings."""
-        names = self._collect_names(bridge.mapping_registry())
+        names = self._collect_names(bridge._moe_vl_mapping_registry())
         assert any("audio_tower" in n for n in names)
 
     def test_has_embed_audio_mapping(self, bridge):
-        names = self._collect_names(bridge.mapping_registry())
+        names = self._collect_names(bridge._moe_vl_mapping_registry())
         assert any("embed_audio" in n for n in names)
 
     def test_has_qkv_mapping(self, bridge):
@@ -935,9 +942,8 @@ class TestGemma4VLBridgeMappingRegistry:
         names = self._collect_names(bridge.mapping_registry())
         assert any("post_shared_expert_layernorm" in n for n in names)
 
-    def test_has_direct_pre_shared_expert_norm_mapping(self, bridge, mock_hf_config_moe):
-        bridge.hf_config = mock_hf_config_moe
-        names = self._collect_names(bridge.mapping_registry())
+    def test_has_direct_pre_shared_expert_norm_mapping(self, bridge):
+        names = self._collect_names(bridge._moe_vl_mapping_registry())
         assert "language_model.decoder.layers.*.pre_shared_expert_layernorm.weight" in names
         assert "model.language_model.layers.*.pre_feedforward_layernorm.weight" in names
 
@@ -983,11 +989,8 @@ class TestGemma4VLBridgeMappingRegistry:
         hf_targets = self._collect_hf_targets(registry)
         assert all(n.startswith("model.language_model.") for n in hf_targets)
 
-    def test_dense_vl_audio_tower_replicated_mappings(self, bridge, mock_hf_config_dense, monkeypatch):
-        monkeypatch.setenv("GEMMA4_CONVERSION_MODE", "vl")
-        bridge.hf_config = mock_hf_config_dense
-
-        names = self._collect_names(bridge.mapping_registry())
+    def test_dense_vl_audio_tower_replicated_mappings(self, bridge):
+        names = self._collect_names(bridge._dense_vl_mapping_registry())
 
         assert "audio_tower.**" in names
         assert "model.audio_tower.**" in names
@@ -996,20 +999,22 @@ class TestGemma4VLBridgeMappingRegistry:
 
 
 class TestGemma4VLBridgeEdgeCases:
-    def test_custom_token_ids(self, bridge, mock_hf_pretrained_moe):
+    def test_custom_token_ids(self, bridge, mock_hf_pretrained_moe, monkeypatch):
         mock_hf_pretrained_moe.config.image_token_id = 99999
         mock_hf_pretrained_moe.config.bos_token_id = 42
-        p = bridge.provider_bridge(mock_hf_pretrained_moe)
+        p = _moe_vl_provider(bridge, mock_hf_pretrained_moe, monkeypatch)
         assert p.image_token_id == 99999
         assert p.bos_token_id == 42
 
-    def test_default_image_token_id(self, bridge, mock_hf_pretrained_moe):
+    def test_default_image_token_id(self, bridge, mock_hf_pretrained_moe, monkeypatch):
         del mock_hf_pretrained_moe.config.image_token_id
-        assert bridge.provider_bridge(mock_hf_pretrained_moe).image_token_id == 258_880
+        p = _moe_vl_provider(bridge, mock_hf_pretrained_moe, monkeypatch)
+        assert p.image_token_id == 258_880
 
-    def test_default_vision_soft_tokens(self, bridge, mock_hf_pretrained_moe):
+    def test_default_vision_soft_tokens(self, bridge, mock_hf_pretrained_moe, monkeypatch):
         del mock_hf_pretrained_moe.config.vision_soft_tokens_per_image
-        assert bridge.provider_bridge(mock_hf_pretrained_moe).vision_soft_tokens_per_image == 280
+        p = _moe_vl_provider(bridge, mock_hf_pretrained_moe, monkeypatch)
+        assert p.vision_soft_tokens_per_image == 280
 
     def test_different_vocab_sizes(self, bridge, mock_hf_pretrained_moe):
         for vs in [256000, 262144, 300000]:
