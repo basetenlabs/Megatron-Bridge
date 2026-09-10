@@ -40,10 +40,12 @@ from megatron.bridge.peft.utils import (
 logger = logging.getLogger(__name__)
 
 
-def _should_treat_linear_fc1_as_unfused(full_name: str) -> bool:
+def _should_treat_linear_fc1_as_unfused(full_name: str, *, split_expert_fc1: bool) -> bool:
     """Return True when CanonicalLoRA should keep linear_fc1 as a single adapter."""
 
-    return full_name.startswith("vision_model.") or full_name.endswith(".mlp.experts.linear_fc1")
+    return full_name.startswith("vision_model.") or (
+        full_name.endswith(".mlp.experts.linear_fc1") and not split_expert_fc1
+    )
 
 
 class ModuleDict(nn.ModuleDict):
@@ -212,6 +214,8 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             so it is comparable to a dense model. Defaults to False.
         share_expert_adapters (bool): When True, grouped MoE expert linears share one adapter across all local
             experts on the EP rank. Set to False to create one adapter per local expert instead. Defaults to True.
+        split_expert_fc1 (bool): When True, grouped MoE expert FC1 uses independent gate and up adapters just
+            like dense FC1. Defaults to False to preserve the existing fused expert FC1 checkpoint layout.
     """
 
     target_modules: List[str] = field(
@@ -233,6 +237,7 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
     lora_B_init_method: str = "zero"
     normalize_moe_lora: bool = False
     share_expert_adapters: bool = True
+    split_expert_fc1: bool = False
 
     def __post_init__(self) -> None:
         """Eagerly build ``canonical_mapping`` from the initial ``target_modules``.
@@ -374,7 +379,9 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                     replicate_adapter=attrs.replicate_adapter,
                 )
 
-            if name == "linear_fc1" and _should_treat_linear_fc1_as_unfused(full_name):
+            if name == "linear_fc1" and _should_treat_linear_fc1_as_unfused(
+                full_name, split_expert_fc1=self.split_expert_fc1
+            ):
                 logger.info(f"Adding lora to: {full_name} (treating unsupported canonical linear_fc1 as unfused)")
                 adapter = adapter_cls(attrs.in_features, attrs.out_features, **adapter_kwargs)
                 return LoRALinear(m, adapter)

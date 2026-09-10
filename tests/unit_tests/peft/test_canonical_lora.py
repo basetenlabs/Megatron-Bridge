@@ -387,6 +387,7 @@ class TestCanonicalLoRA:
     def test_canonical_lora_treats_moe_expert_linear_fc1_as_unfused(self):
         """Grouped expert linear_fc1 should keep a single unfused LoRA adapter."""
         model = MoEMegatronStyleModel()
+        model.language_model.decoder.layers[0].mlp.experts.linear_fc1.num_gemms = 2
         lora = CanonicalLoRA(target_modules=["linear_fc1_up", "linear_fc1_gate"])
 
         def mock_get_attrs(module, is_expert=False):
@@ -412,6 +413,42 @@ class TestCanonicalLoRA:
         assert isinstance(layer.mlp.experts.linear_fc1, LoRALinear)
         assert not isinstance(layer.mlp.experts.linear_fc1, LoRALinearSplitFC1UpGate)
         assert isinstance(layer.mlp.shared_experts.linear_fc1, LoRALinearSplitFC1UpGate)
+
+    def test_canonical_lora_can_split_grouped_expert_fc1_per_expert(self):
+        """Opt-in canonical expert FC1 should create independent gate/up pairs per expert."""
+        model = MoEMegatronStyleModel()
+        model.language_model.decoder.layers[0].mlp.experts.linear_fc1.num_gemms = 2
+        lora = CanonicalLoRA(
+            target_modules=["linear_fc1_up", "linear_fc1_gate"],
+            share_expert_adapters=False,
+            split_expert_fc1=True,
+        )
+
+        def mock_get_attrs(module, is_expert=False):
+            return AdapterAttributes(
+                input_is_parallel=False,
+                in_features=module.in_features,
+                out_features=module.out_features,
+                disable_tensor_parallel_comm=False,
+                disable_sequence_parallel_comm=True,
+                base_linear_is_parallel=True,
+            )
+
+        with patch(
+            "megatron.bridge.peft.canonical_lora.get_adapter_attributes_from_linear",
+            side_effect=mock_get_attrs,
+        ):
+            transformed_model = lora(model, training=True)
+
+        routed_fc1 = transformed_model.language_model.decoder.layers[0].mlp.experts.linear_fc1
+        assert isinstance(routed_fc1, LoRALinearSplitFC1UpGate)
+        assert isinstance(routed_fc1.adapter.adapter_gate, GroupedExpertLinearAdapter)
+        assert isinstance(routed_fc1.adapter.adapter_up, GroupedExpertLinearAdapter)
+        assert routed_fc1.adapter.adapter_gate is not routed_fc1.adapter.adapter_up
+        assert routed_fc1.adapter.adapter_gate.linear_in.weight.shape == torch.Size([2, 32, 512])
+        assert routed_fc1.adapter.adapter_gate.linear_out.weight.shape == torch.Size([2, 1024, 32])
+        assert routed_fc1.adapter.adapter_up.linear_in.weight.shape == torch.Size([2, 32, 512])
+        assert routed_fc1.adapter.adapter_up.linear_out.weight.shape == torch.Size([2, 1024, 32])
 
     def test_canonical_lora_normalize_moe_lora_reduces_expert_dim(self):
         """Expert linear_fc1 should get reduced dim when normalize_moe_lora is enabled."""
