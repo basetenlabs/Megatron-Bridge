@@ -37,6 +37,7 @@ from megatron.bridge.models.glm_moe_dsa.native_fp8_import import (
     prepare_native_fp8_expert_weight,
 )
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+from megatron.bridge.models.hf_pretrained.state import SafeTensorsStateSource, StateDict
 from megatron.bridge.models.mla_provider import MLAModelProvider
 
 
@@ -392,6 +393,12 @@ class GLM5Bridge(MegatronModelBridge):
     @staticmethod
     def _maybe_dequant_fp8(weight, param_name, hf_state_dict):
         scale_inv = hf_state_dict.get(param_name + "_scale_inv")
+        if isinstance(hf_state_dict, StateDict) and isinstance(hf_state_dict.source, SafeTensorsStateSource):
+            device = hf_state_dict.source.fp8_dequantize_device
+            if device is not None and weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                weight = weight.to(device)
+                if scale_inv is not None:
+                    scale_inv = scale_inv.to(device)
         return maybe_dequantize_fp8_blockwise(weight, scale_inv)
 
 

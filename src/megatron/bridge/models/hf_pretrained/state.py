@@ -16,8 +16,9 @@ import fnmatch
 import json
 import logging
 from abc import ABC, abstractmethod
-from collections import defaultdict
-from collections.abc import Mapping
+from collections import OrderedDict, defaultdict
+from collections.abc import Iterator, Mapping
+from contextlib import ExitStack, contextmanager
 from functools import lru_cache
 from pathlib import Path, PureWindowsPath
 from typing import (
@@ -26,6 +27,7 @@ from typing import (
     List,
     Optional,
     Pattern,
+    Protocol,
     Set,
     Tuple,
     Union,
@@ -36,6 +38,12 @@ import torch
 
 
 logger = logging.getLogger(__name__)
+
+
+class _SafeTensorReader(Protocol):
+    def keys(self) -> list[str]: ...
+
+    def get_tensor(self, name: str) -> torch.Tensor: ...
 
 
 def _validate_safetensors_shard_filename(filename: object, *, tensor_key: str, index_file: Path) -> str:
@@ -180,6 +188,13 @@ class StateDict(Mapping[str, torch.Tensor]):
         """
         return self.source.load_tensors(keys_to_load)
 
+    def _exact_keys(self) -> Mapping[str, str] | List[str]:
+        if isinstance(self.source, SafeTensorsStateSource) and self.source.reader_cache_active:
+            index = self.source.key_to_filename_map
+            if index:
+                return index
+        return self._get_all_keys()
+
     def _match_keys(self, pattern: Union[str, Pattern]) -> List[str]:
         """Match keys against a glob pattern or regex."""
         all_keys = self._get_all_keys()
@@ -270,11 +285,13 @@ class StateDict(Mapping[str, torch.Tensor]):
                     raise KeyError(f"No keys match pattern: {key}")
                 return self._load_tensors(matched_keys)
             else:
-                if key not in self._get_all_keys():
+                if key not in self._exact_keys():
                     raise KeyError(f"Key not found: {key}")
                 return self._load_tensors([key])[key]
         elif isinstance(key, list):
-            all_keys_set = set(self._get_all_keys())
+            all_keys_set = self._exact_keys()
+            if not isinstance(all_keys_set, Mapping):
+                all_keys_set = set(all_keys_set)
             missing_keys = [k for k in key if k not in all_keys_set]
             if missing_keys:
                 raise KeyError(f"Keys not found: {missing_keys}")
@@ -305,7 +322,7 @@ class StateDict(Mapping[str, torch.Tensor]):
 
     def __contains__(self, key: str) -> bool:
         """Check if a key exists in the state dict."""
-        return key in self._get_all_keys()
+        return key in self._exact_keys()
 
     def __repr__(self) -> str:
         """String representation."""
@@ -321,7 +338,7 @@ class StateDict(Mapping[str, torch.Tensor]):
         Returns `default` if the key is not found.
         Note: This method is for single key lookup and does not support patterns.
         """
-        if key in self._get_all_keys():
+        if key in self._exact_keys():
             return self._load_tensors([key])[key]
         return default
 
@@ -450,6 +467,69 @@ class SafeTensorsStateSource(StateSource):
         self._resolved_path_cache: Optional[Path] = None
         self._keys_cache: Optional[List[str]] = None
         self._key_to_filename_map_cache: Optional[Dict[str, str]] = None
+        self._reader_cache: OrderedDict[str, tuple[ExitStack, _SafeTensorReader, frozenset[str]]] | None = None
+        self._reader_cache_capacity = 0
+        self.fp8_dequantize_device: torch.device | None = None
+
+    @property
+    def reader_cache_active(self) -> bool:
+        """Whether bounded reader reuse is active for this source instance."""
+        return self._reader_cache is not None
+
+    @contextmanager
+    def cached_readers(
+        self, *, max_open_files: int, fp8_dequantize_device: torch.device | None = None
+    ) -> Iterator[None]:
+        """Reuse shard handles while importing an immutable checkpoint.
+
+        Handles and exact-key indexing are scoped to this source, not patched
+        onto global classes. GLM blockwise FP8 import can optionally dequantize
+        on the supplied device; tensor storage remains otherwise unchanged.
+        All handles close and the device policy resets on success or failure.
+        """
+        if max_open_files < 1:
+            raise ValueError("max_open_files must be positive")
+        if self.reader_cache_active:
+            raise RuntimeError("cached_readers scopes cannot be nested on one source")
+        self._reader_cache = OrderedDict()
+        self._reader_cache_capacity = max_open_files
+        self.fp8_dequantize_device = fp8_dequantize_device
+        try:
+            yield
+        finally:
+            for stack, _, _ in self._reader_cache.values():
+                stack.close()
+            self._reader_cache = None
+            self._reader_cache_capacity = 0
+            self.fp8_dequantize_device = None
+
+    def _load_cached_tensors(self, keys: List[str]) -> Dict[str, torch.Tensor] | None:
+        from safetensors import safe_open
+
+        cache = self._reader_cache
+        index = self.key_to_filename_map
+        if cache is None or not index or any(key not in index for key in keys):
+            return None
+        result = {}
+        for key in keys:
+            filename = index[key]
+            if filename not in cache:
+                stack = ExitStack()
+                try:
+                    reader = stack.enter_context(safe_open(self.path / filename, framework="pt", device="cpu"))
+                    cache[filename] = (stack, reader, frozenset(reader.keys()))
+                except BaseException:
+                    stack.close()
+                    raise
+                if len(cache) > self._reader_cache_capacity:
+                    _, (old_stack, _, _) = cache.popitem(last=False)
+                    old_stack.close()
+            cache.move_to_end(filename)
+            _, reader, file_keys = cache[filename]
+            if key not in file_keys:
+                return None
+            result[key] = reader.get_tensor(key)
+        return result
 
     @staticmethod
     def _ignore_source_key_prefixes(
@@ -584,6 +664,11 @@ class SafeTensorsStateSource(StateSource):
     def load_tensors(self, keys_to_load: List[str]) -> Dict[str, torch.Tensor]:
         if not keys_to_load:
             return {}
+
+        if self.reader_cache_active:
+            cached = self._load_cached_tensors(keys_to_load)
+            if cached is not None:
+                return cached
 
         import time
         from glob import glob as file_glob
