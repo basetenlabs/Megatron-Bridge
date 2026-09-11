@@ -97,6 +97,18 @@ class _DummyClass:
 _dummy_obj = _DummyClass()
 
 
+@pytest.mark.unit
+def test_schedule_async_save_gives_empty_request_work() -> None:
+    queue = Mock()
+    state = Mock(async_calls_queue=queue)
+
+    schedule_async_save(state, NVRxAsyncRequest(None, (), []))
+
+    request = queue.schedule_async_request.call_args.args[0]
+    assert request.async_fn is not None
+    request.async_fn()
+
+
 def _write_dataloader_state_marker(path: str) -> None:
     """Write a marker if an unsafe deserializer executes a test payload."""
     Path(path).write_text("dataloader state payload executed")
