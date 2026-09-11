@@ -246,7 +246,7 @@ class LoRA(PEFT, ModuleMatcher):
                 adapter_kwargs.update(
                     num_local_experts=module.num_gemms,
                     params_device=first_param.device,
-                    params_dtype=first_param.dtype,
+                    params_dtype=self.lora_dtype or first_param.dtype,
                 )
             else:
                 adapter_kwargs.update(
