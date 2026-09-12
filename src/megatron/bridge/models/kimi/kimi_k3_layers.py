@@ -250,6 +250,11 @@ class KimiK3Attention(MegatronModule):
         self.sequence_parallel = config.sequence_parallel
         self.linear_config = copy.copy(config)
         self.linear_config.sequence_parallel = False
+        # K3 attention owns the sequence-parallel gather/scatter around the
+        # complete attention block. Its internal linears must not also use TE
+        # UserBuffers, which would duplicate collectives and expect the wrong
+        # tensor shape. MLP linears retain overlap through the parent config.
+        self.linear_config.tp_comm_overlap = False
 
         self.layer_idx = layer_number - 1
         self.is_kda = layer_number in config.kimi_kda_layers
