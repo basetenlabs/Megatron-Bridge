@@ -119,6 +119,10 @@ def test_provider_bridge_configures_four_layer_proxy(kimi_k3_pretrained: Mock) -
     assert provider.make_vocab_size_divisible_by == 128
     assert provider.use_te_activation_func is True
     assert provider.variable_seq_lengths is True
+    # Prefer packing while allowing the trainer's DPO fallback.
+    assert provider.requires_packed_sequence is True
+    assert provider.packed_sequence_optional is True
+    assert provider.packed_sequence_phantom_length == 64
     assert provider.bf16 is True
     assert provider.params_dtype == torch.bfloat16
 

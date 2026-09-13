@@ -126,6 +126,14 @@ class KimiK3Bridge(MegatronModelBridge):
         provider.kimi_kda_gate_lower_bound = linear_config["gate_lower_bound"]
         provider.kimi_attn_res_block_size = text_config.attn_res_block_size
 
+        # Prefer packing at CP=1 to avoid batch-wide padding. Conv and KDA
+        # kernels already isolate documents via cu_seqlens.
+        provider.requires_packed_sequence = True
+        # BSHD remains correct, so DPO can fall back when CP=1.
+        provider.packed_sequence_optional = True
+        # Loss-masked EP sync rows still run KDA; 64 aligns with K3 document quanta.
+        provider.packed_sequence_phantom_length = 64
+
         provider.use_te_activation_func = True
         provider.bias_activation_fusion = False
         provider.bias_dropout_fusion = False
