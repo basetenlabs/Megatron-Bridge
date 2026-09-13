@@ -60,6 +60,11 @@ class Qwen3VLTransformerConfig(TransformerConfig):
     use_hf_vision_model: bool = False
     # Maximum sequence length for vision encoder CUDA graphs.
     max_vision_cuda_graph_seq_length: Optional[int] = None
+    # Number of whole images per chunk when encoding the vision tower under an outer
+    # activation checkpoint. 0 encodes all images in a single pass (default); a value
+    # > 0 bounds live vision-encoder activation memory on many-image samples at the
+    # cost of recomputing the tower per chunk in the backward pass.
+    vision_encoder_chunk_images: int = 0
 
 
 def get_vision_model_config(hf_config, megatron_config=None):
@@ -153,6 +158,10 @@ def get_vision_model_config(hf_config, megatron_config=None):
     # Propagate max vision CUDA graph sequence length from provider
     if megatron_config is not None and hasattr(megatron_config, "max_vision_cuda_graph_seq_length"):
         config.max_vision_cuda_graph_seq_length = megatron_config.max_vision_cuda_graph_seq_length
+
+    # Propagate vision-encoder image chunking from provider
+    if megatron_config is not None and hasattr(megatron_config, "vision_encoder_chunk_images"):
+        config.vision_encoder_chunk_images = megatron_config.vision_encoder_chunk_images
 
     if megatron_config is not None and hasattr(megatron_config, "use_cpu_initialization"):
         config.use_cpu_initialization = megatron_config.use_cpu_initialization
