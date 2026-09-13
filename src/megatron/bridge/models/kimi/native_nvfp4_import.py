@@ -56,9 +56,11 @@ _E4M3_MIN_EXACT_EXPONENT = -9
 _E4M3_MAX_EXACT_EXPONENT = 8
 
 _ROUTED_EXPERT_WEIGHT = re.compile(
-    r"^decoder\.layers\.\d+\.mlp\.experts\.linear_fc(?P<projection>[12])\.weight(?P<expert>\d+)$"
+    r"^(?:\w+\.)*decoder\.layers\.\d+\.mlp\.experts\.linear_fc(?P<projection>[12])\.weight(?P<expert>\d+)$"
 )
-_ROUTED_EXPERT_PREFIX = re.compile(r"^decoder\.layers\.\d+\.mlp\.experts\.linear_fc[12]\.weight")
+_ROUTED_EXPERT_PREFIX = re.compile(
+    r"^(?:\w+\.)*decoder\.layers\.\d+\.mlp\.experts\.linear_fc[12]\.weight"
+)
 
 
 @dataclass(frozen=True)
