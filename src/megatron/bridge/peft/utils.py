@@ -2445,25 +2445,42 @@ class GroupedExpertLinearAdapter(nn.Module):
 def _make_cross_ep_replicated(weight: nn.Parameter) -> None:
     """Mark a weight as logically replicated across the intra-PP-stage group.
 
-    Megatron's DDP routes ``is_expert=True`` parameters through the expert
-    data-parallel group only, which does not span the EP axis. A weight
-    that must stay bit-identical across all EP ranks (e.g., the shared
-    side of :class:`SharedOuterGroupedExpertAdapter`, which a serving
-    engine consumes as a single global LoRA tensor) is otherwise left
-    unsynced. This helper closes that gap with two primitives:
+    A weight that must stay bit-identical across all EP ranks (e.g., the
+    shared side of :class:`SharedOuterGroupedExpertAdapter`, which a serving
+    engine consumes as a single global LoRA tensor) needs two things, and
+    they do NOT use the same process group:
 
-      * a one-shot broadcast from group rank 0 so every rank starts with
-        bit-identical values despite per-rank RNG forks;
-      * a backward hook that SUM all-reduces the gradient across the group
-        so the optimizer step on every rank applies the same update.
+      * a one-shot broadcast over ``tensor_and_data_parallel_group`` (with
+        context parallel), which by Megatron's construction equals
+        ETP × EP × EDP — every rank in the current pipeline stage that
+        holds a copy — so all of them start from identical values despite
+        per-rank RNG forks;
+      * a backward hook that SUM all-reduces the gradient over the
+        **expert-model-parallel group only**.
 
-    SUM is the correct reduction: each rank's local gradient is the partial
-    loss gradient over its (token, expert) subset, and the total gradient
-    is the sum of those partials. AVG would train at 1/N the intended rate.
+    The gradient hook covers the EP axis and nothing else, because that is
+    the only axis Megatron's DDP leaves uncovered for this weight. Routing
+    is decided by ``param.allreduce`` (``distributed_data_parallel.py``:
+    ``is_expert_parallel = not getattr(param, 'allreduce', True)``), not by
+    the owning module's ``is_expert`` flag. This weight keeps the default
+    ``allreduce=True``, so DDP places it in the regular bucket and reduces
+    it over ``dp_cp`` — a group that spans EP × EDP, since EP is carved out
+    of the data-parallel axis.
 
-    The intra-PP-stage group is ``tensor_and_data_parallel_group`` with
-    context parallel included, which by Megatron's construction equals
-    ETP × EP × EDP — all ranks within the current pipeline stage.
+    That composition yields exactly the right answer. Write ``g[ep][edp]``
+    for a rank's local partial and ``S = Σ g``. The correct gradient is a
+    SUM over the expert axis (distinct experts contribute additively to the
+    same shared matrix) and a MEAN over the expert-data axis (distinct
+    microbatches of the same experts), i.e. ``S / EDP``. After the hook each
+    rank holds ``T[edp] = Σ_ep g[ep][edp]``; DDP then pre-scales by ``1/D``
+    (``D = EP × EDP``) and SUM-reduces, giving
+    ``(1/D) · Σ_{ep,edp} T[edp] = (1/D) · EP · S = S / EDP``.
+
+    Reducing over the wider ETP × EP × EDP group instead would double-count
+    the expert-data axis: every rank would already hold ``S`` before DDP
+    ran, and DDP's ``1/D`` pre-scale followed by a SUM over ``D`` identical
+    values returns ``S`` unchanged — leaving the shared weight training
+    ``EDP`` times too fast relative to every other parameter.
 
     Args:
         weight: The parameter to keep replicated across the group. Must
@@ -2473,23 +2490,28 @@ def _make_cross_ep_replicated(weight: nn.Parameter) -> None:
 
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return
+
     try:
-        group = parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
+        replica_group = parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
     except AssertionError:
         return
-    if torch.distributed.get_world_size(group=group) <= 1:
-        return
 
-    if weight.is_cuda:
+    if weight.is_cuda and torch.distributed.get_world_size(group=replica_group) > 1:
         # NCCL requires CUDA tensors; pre-GPU construction relies on
         # deterministic init matching across ranks.
-        src_rank = torch.distributed.get_global_rank(group, 0)
+        src_rank = torch.distributed.get_global_rank(replica_group, 0)
         with torch.no_grad():
-            torch.distributed.broadcast(weight.data, src=src_rank, group=group)
+            torch.distributed.broadcast(weight.data, src=src_rank, group=replica_group)
+
+    # Only the EP axis needs a hook; DDP covers dp_cp (which spans EP × EDP)
+    # for this weight, so summing over anything wider double-counts EDP.
+    grad_group = parallel_state.get_expert_model_parallel_group(check_initialized=False)
+    if grad_group is None or torch.distributed.get_world_size(group=grad_group) <= 1:
+        return
 
     def _all_reduce_grad(grad: torch.Tensor) -> torch.Tensor:
         grad = grad.contiguous()
-        torch.distributed.all_reduce(grad, op=torch.distributed.ReduceOp.SUM, group=group)
+        torch.distributed.all_reduce(grad, op=torch.distributed.ReduceOp.SUM, group=grad_group)
         return grad
 
     weight.register_hook(_all_reduce_grad)
@@ -2517,10 +2539,14 @@ class PackedPerExpertLinear(nn.Module):
         init_method: Optional[Callable] = None,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
+        pg_collection: ProcessGroupCollection | None = None,
     ):
         super().__init__()
         if not hasattr(torch, "_grouped_mm"):
             raise RuntimeError("PackedPerExpertLinear requires torch._grouped_mm (torch >= 2.9).")
+        # Needed by ``sharded_state_dict`` to place this rank's expert shard on
+        # the EP axis. Discovered from the owning adapter's collection.
+        self.pg_collection = pg_collection
         self.num_local_experts = num_local_experts
         self.in_features = in_features
         self.out_features = out_features
@@ -2553,7 +2579,17 @@ class PackedPerExpertLinear(nn.Module):
         key = f"{prefix}weight"
         return {
             key: _make_grouped_expert_sharded_tensor(
-                self.weight.data, key, tp_axis=None, sharded_offsets=sharded_offsets
+                # The Parameter itself, NOT ``.data``: Megatron maps optimizer
+                # state to model shards by ``id(sharded_tensor.data)`` (see
+                # dist_checkpointing/optimizer.py: get_param_id_to_sharded_param_map).
+                # ``.data`` allocates a fresh Tensor object, so the identity
+                # never matches, the weight is silently dropped from the map,
+                # and saving optimizer state dies with ``KeyError``.
+                self.weight,
+                key,
+                tp_axis=None,
+                sharded_offsets=sharded_offsets,
+                pg_collection=self.pg_collection,
             )
         }
 
@@ -2602,6 +2638,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         base_linear_is_parallel: bool = True,
         params_device: Optional[torch.device] = None,
         params_dtype: Optional[torch.dtype] = None,
+        pg_collection: ProcessGroupCollection | None = None,
     ) -> None:
         """Initialize shared-outer LoRA weights with one shared and one per-expert side."""
 
@@ -2622,6 +2659,13 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
             model_parallel_config = ModelParallelConfig()
         model_parallel_config.perform_initialization = True
         self.config = model_parallel_config
+        # TODO: When the PEFT transform API has explicit PG plumbing, pass the
+        # model-level collection here instead of relying on config/default discovery.
+        self.pg_collection = _get_pg_collection(
+            pg_collection,
+            model_parallel_config,
+            required_pgs=["tp", "ep", "expt_tp", "expt_dp"],
+        )
 
         # ``input_is_parallel`` selects fc1 (column-parallel base) vs fc2
         # (row-parallel base). Mirrors :class:`ParallelLinearAdapter` and
@@ -2648,6 +2692,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
                 init_method=row_init,
                 device=params_device,
                 dtype=params_dtype,
+                pg_collection=self.pg_collection,
             )
         else:
             # Per-expert A (intermediate → rank); shared B (rank → hidden).
@@ -2658,6 +2703,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
                 init_method=column_init,
                 device=params_device,
                 dtype=params_dtype,
+                pg_collection=self.pg_collection,
             )
             self.linear_out = RowParallelLinear(
                 dim,
