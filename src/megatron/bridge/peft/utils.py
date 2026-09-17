@@ -2639,8 +2639,16 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         params_device: Optional[torch.device] = None,
         params_dtype: Optional[torch.dtype] = None,
         pg_collection: ProcessGroupCollection | None = None,
+        split_fc1_component: bool = False,
     ) -> None:
-        """Initialize shared-outer LoRA weights with one shared and one per-expert side."""
+        """Initialize shared-outer LoRA weights with one shared and one per-expert side.
+
+        ``split_fc1_component``: set by ``CanonicalLoRA``, which builds one
+        adapter per logical projection, so this adapter's fc1 ``linear_out``
+        holds gate OR up rather than the packed pair. The SwiGLU
+        gate/up interleave factory in ``sharded_state_dict`` must then not be
+        applied -- there is nothing left to de-interleave.
+        """
 
         super().__init__()
         self.base_linear_name = base_linear_name
@@ -2671,6 +2679,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         # (row-parallel base). Mirrors :class:`ParallelLinearAdapter` and
         # :class:`GroupedExpertLinearAdapter`.
         self._is_fc1 = not input_is_parallel
+        self.split_fc1_component = split_fc1_component
 
         column_init = ParallelLinearAdapter._get_init_fn(self, column_init_method)
         row_init = ParallelLinearAdapter._get_init_fn(self, row_init_method)
@@ -2762,7 +2771,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         linear_in_sd = self.linear_in.sharded_state_dict(f"{prefix}linear_in.", sharded_offsets, metadata)
         linear_out_sd = self.linear_out.sharded_state_dict(f"{prefix}linear_out.", sharded_offsets, metadata)
 
-        if self._is_fc1:
+        if self._is_fc1 and not self.split_fc1_component:
             singleton_local_shards = (metadata or {}).get("singleton_local_shards", False)
             linear_out_key = f"{prefix}linear_out.weight"
             linear_out_sd[linear_out_key] = _apply_grouped_expert_swiglu_sharded_factory(
