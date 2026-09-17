@@ -121,18 +121,31 @@ class LoRALinearSplitQKV(AdapterWrapper):
                     "Cannot infer head size without kv_channels or hidden_size/num_attention_heads or num_query_groups."
                 )
 
-        if head_num is None:
-            if query.size(-1) % head_size != 0:
-                raise ValueError("Query projection size must be divisible by head_size.")
-            head_num = query.size(-1) // head_size
+        # Head counts come from the ADAPTER OUTPUTS, not the config. The config
+        # is model-global while these tensors are tensor-parallel shards, and
+        # the two diverge whenever q and kv shard differently. Qwen3.5 MoE has
+        # num_query_groups=2, so at TP=4 the query shards four ways while two
+        # kv groups cannot: reshaping with the global counts gave the query
+        # prod/4 rows and the key prod rows, and the cat below raised
+        # "Sizes of tensors must match except in dimension 1".
+        #
+        # Deriving from the tensors is also what makes the result match the
+        # layout this rank's own fused linear_qkv emits, which is what the
+        # adapter output is added to. At TP=1 local == global, so this is
+        # identical to reading the config.
+        if query.size(-1) % head_size != 0:
+            raise ValueError("Query projection size must be divisible by head_size.")
+        if key.size(-1) % head_size != 0:
+            raise ValueError("Key projection size must be divisible by head_size.")
+        head_num = query.size(-1) // head_size
+        num_query_groups = key.size(-1) // head_size
 
-        if not num_query_groups:
-            if key.size(-1) % head_size != 0:
-                raise ValueError("Key projection size must be divisible by head_size.")
-            num_query_groups = key.size(-1) // head_size
-
-        if head_num % num_query_groups != 0:
-            raise ValueError("num_attention_heads must be divisible by num_query_groups.")
+        if num_query_groups == 0 or head_num % num_query_groups != 0:
+            raise ValueError(
+                f"local query heads ({head_num}) must be a positive multiple of "
+                f"local kv groups ({num_query_groups}); head_size={head_size}, "
+                f"query width={query.size(-1)}, key width={key.size(-1)}"
+            )
 
         heads_per_group = head_num // num_query_groups
 
