@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, List, Literal, Optional, Tuple
 
 import torch
+from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.transformer.moe.router import TopKRouter
 from torch import nn
@@ -134,9 +135,17 @@ class LoRALinearSplitQKV(AdapterWrapper):
         # adapter output is added to. At TP=1 local == global, so this is
         # identical to reading the config.
         if query.size(-1) % head_size != 0:
-            raise ValueError("Query projection size must be divisible by head_size.")
+            raise ValueError(
+                f"query width {query.size(-1)} is not a multiple of "
+                f"head_size {head_size}"
+            )
         if key.size(-1) % head_size != 0:
-            raise ValueError("Key projection size must be divisible by head_size.")
+            raise ValueError(
+                f"key width {key.size(-1)} is not a multiple of head_size "
+                f"{head_size}: this rank does not hold whole kv heads, which "
+                "happens when tensor_model_parallel_size exceeds "
+                "num_query_groups"
+            )
         head_num = query.size(-1) // head_size
         num_query_groups = key.size(-1) // head_size
 
@@ -476,6 +485,28 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             if name == "linear_qkv":
                 adapter_q, adapter_k, adapter_v = None, None, None
                 kv_out_features = m.config.kv_channels * m.config.num_query_groups
+                # The k/v adapters are column-parallel over the GLOBAL kv width,
+                # so tensor parallelism splits that width evenly -- unlike the
+                # base linear_qkv, which replicates kv heads when there are
+                # fewer groups than TP ranks. When TP exceeds num_query_groups
+                # the split lands mid-head, the rank no longer holds whole kv
+                # heads, and no interleaving of q/k/v can reconstruct the
+                # packed layout. Refuse here, where the numbers are still in
+                # scope, rather than in the forward.
+                _tp = parallel_state.get_tensor_model_parallel_world_size()
+                if kv_out_features % (_tp * m.config.kv_channels) != 0:
+                    raise ValueError(
+                        "canonical LoRA cannot split q/k/v at "
+                        f"tensor_model_parallel_size={_tp} for this model: "
+                        f"num_query_groups={m.config.num_query_groups} with "
+                        f"kv_channels={m.config.kv_channels} gives a global kv "
+                        f"width of {kv_out_features}, and sharding that over "
+                        f"{_tp} ranks leaves {kv_out_features // _tp} features "
+                        "per rank, which is not a whole number of kv heads. "
+                        f"Use tensor_model_parallel_size <= "
+                        f"{m.config.num_query_groups}, or LoRA() with the "
+                        "fused linear_qkv target."
+                    )
                 # An attention output gate (Qwen3.5/3.6) doubles the q slice: the
                 # projection emits the gate alongside the query.
                 q_out_features = (
