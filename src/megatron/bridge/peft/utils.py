@@ -1555,6 +1555,7 @@ class ParallelLinearAdapter(nn.Module):
         sharded_offsets: Tuple = (),
         metadata: Optional[Dict] = None,
         mamba_dim_info: Optional[Dict] = None,
+        gdn_dim_info: Optional[Dict] = None,
     ) -> ShardedStateDict:
         """Create sharded state dictionary for distributed checkpointing.
 
@@ -1634,6 +1635,35 @@ class ParallelLinearAdapter(nn.Module):
                             ["z", "x", "B", "C", "dt"],
                             0,  # split along dimension 0
                         )
+
+        # Special handling for the Gated DeltaNet in_proj, for the same reason as
+        # Mamba's above: its output axis is packed rank-major --
+        # ``[rank0: q|k|v|z|beta|alpha][rank1: ...]`` -- so the UNSHARDED tensor
+        # depends on TP and there is no single canonical global array for
+        # dist-checkpointing to reshard. Emitted as one ShardedTensor it claims a
+        # plain contiguous TP split, and loading a TP=1 save at TP=2 hands rank 0
+        # the first half and reads it with TP=2's section boundaries: correct for
+        # the first ``q_dim/TP`` rows, unrelated values after (measured on
+        # Qwen3.5-0.8B at TP=2, first wrong row 1024 == 2048/2).
+        #
+        # Splitting by section gives each of q/k/v/z/beta/alpha its own key, so
+        # each one's global tensor is TP-invariant and a contiguous split of it is
+        # correct again. The section table is the mixer's own
+        # ``in_proj_split_sections`` -- the same one the BASE in_proj.weight
+        # already checkpoints with, which is why base weights reshard fine and
+        # only the adapter on top of them did not.
+        if gdn_dim_info is not None:
+            from megatron.core.ssm.utils import _split_tensor_factory
+
+            sections = list(gdn_dim_info["sections"])
+            names = list(gdn_dim_info["names"])
+            for k, v in linear_out_sd.items():
+                if k == f"{prefix}linear_out.weight" and isinstance(v, ShardedTensor):
+                    # Same guard as the Mamba branch: only split when the local
+                    # width is exactly the sections, so a config/shape mismatch
+                    # leaves the tensor alone rather than corrupting it.
+                    if v.data.size(0) == sum(sections):
+                        linear_out_sd[k] = _split_tensor_factory(v, sections, names, 0)
 
         if self.is_expert:
             self._set_expert_replica_ids(linear_in_sd, linear_out_sd)

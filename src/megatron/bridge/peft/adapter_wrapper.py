@@ -251,6 +251,28 @@ class AdapterWrapper(nn.Module):
         adapter_sharded_state_dict_kwargs = {}
         if isinstance(self.adapter, ParallelLinearAdapter) and "mixer.in_proj" in self.adapter.base_linear_name:
             adapter_sharded_state_dict_kwargs["mamba_dim_info"] = _compute_mamba_dim_info(self.to_wrap)
+        elif isinstance(self.adapter, ParallelLinearAdapter):
+            # Gated DeltaNet's fused in_proj needs the same per-section checkpoint
+            # split as Mamba's above. Keyed on the section table the mixer attaches
+            # to the projection rather than on a name: GDN's in_proj lives at
+            # ``self_attention.in_proj``, not ``mixer.in_proj``, so a name match
+            # like the Mamba branch's would silently miss it -- which is how the
+            # adapter ended up resharding wrong while the base weight did not.
+            #
+            # BOTH halves of the table are required, and no default is supplied
+            # for either. The GDN variants do not agree on the split: gdn.py has
+            # six sections (query/key/value/z/beta/alpha) and gdn2.py has seven
+            # (query/key/value/z/f/b/w), with gated_delta_product deriving its
+            # own. Every one of them publishes the names beside the sizes, so
+            # taking both from the module handles each variant correctly, while
+            # assuming either shape would be wrong for the others.
+            sections = getattr(self.to_wrap, "in_proj_split_sections", None)
+            names = getattr(self.to_wrap, "in_proj_split_names", None)
+            if sections and names and len(sections) == len(names):
+                adapter_sharded_state_dict_kwargs["gdn_dim_info"] = {
+                    "sections": sections,
+                    "names": names,
+                }
 
         sharded_state_dict = {}
         # The wrapped module may be a plain nn.Linear (simple, non-parallel path) that
