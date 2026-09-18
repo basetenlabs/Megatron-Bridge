@@ -170,19 +170,11 @@ class LoRA(PEFT, ModuleMatcher):
         Returns:
             nn.Module: The modified module with LoRA applied, or the original module if not a target.
         """
-        # The GDN mixer publishes the rank-local section sizes of its fused
-        # in_proj output. The walk reaches a parent before its children, so pass
-        # the table to the projection the adapter wraps rather than re-deriving
-        # it. CanonicalLoRA.transform already does this; the plain path did not,
-        # which left the fused in_proj adapter with no way to checkpoint its
-        # sections and so resharding it across TP corrupted the weights.
+        # Propagate the section sizes and split names from
+        # parent to child modules
         in_proj_sections = getattr(module, "in_proj_split_sections", None)
         in_proj_names = getattr(module, "in_proj_split_names", None)
         if in_proj_sections and in_proj_names and hasattr(module, "in_proj"):
-            # Both or neither: the sizes are meaningless for checkpointing
-            # without the names that key each shard, and the GDN variants
-            # disagree on how many sections there are, so a half-propagated
-            # table is worse than none.
             module.in_proj.in_proj_split_sections = in_proj_sections
             module.in_proj.in_proj_split_names = in_proj_names
 
