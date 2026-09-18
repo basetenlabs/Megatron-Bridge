@@ -170,6 +170,14 @@ class LoRA(PEFT, ModuleMatcher):
         Returns:
             nn.Module: The modified module with LoRA applied, or the original module if not a target.
         """
+        # Propagate the section sizes and split names from
+        # parent to child modules
+        in_proj_sections = getattr(module, "in_proj_split_sections", None)
+        in_proj_names = getattr(module, "in_proj_split_names", None)
+        if in_proj_sections and in_proj_names and hasattr(module, "in_proj"):
+            module.in_proj.in_proj_split_sections = in_proj_sections
+            module.in_proj.in_proj_split_names = in_proj_names
+
         # Skip already transformed modules
         adapter_types = (LoRALinear, LoRATopKRouter)
         if isinstance(module, adapter_types):

@@ -251,6 +251,18 @@ class AdapterWrapper(nn.Module):
         adapter_sharded_state_dict_kwargs = {}
         if isinstance(self.adapter, ParallelLinearAdapter) and "mixer.in_proj" in self.adapter.base_linear_name:
             adapter_sharded_state_dict_kwargs["mamba_dim_info"] = _compute_mamba_dim_info(self.to_wrap)
+        elif isinstance(self.adapter, ParallelLinearAdapter):
+            # Replicate the logic in CanonicalLora ("in_proj" case in transform function)
+            # in_proj_split_sections and in_proj_split_names occur in gdn layers in QwenVL
+            # Need to add the relevant sharding information for the adapter
+            # in order to properly cross TP boundaries (reshard model with different TP)
+            sections = getattr(self.to_wrap, "in_proj_split_sections", None)
+            names = getattr(self.to_wrap, "in_proj_split_names", None)
+            if sections and names and len(sections) == len(names):
+                adapter_sharded_state_dict_kwargs["gdn_dim_info"] = {
+                    "sections": sections,
+                    "names": names,
+                }
 
         sharded_state_dict = {}
         # The wrapped module may be a plain nn.Linear (simple, non-parallel path) that
