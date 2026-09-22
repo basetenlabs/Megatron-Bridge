@@ -734,7 +734,8 @@ def test_global_param_names_skip_adapter(monkeypatch):
     assert names == ["decoder.layers.0.mlp.linear_fc1.to_wrap.weight"]
 
 
-def test_megatron_global_adapters_info_all_pp_ranks(monkeypatch):
+@pytest.mark.parametrize("replicate_adapter", [False, True])
+def test_megatron_global_adapters_info_all_pp_ranks(monkeypatch, replicate_adapter):
     bridge = DummyBridge()
 
     class DummyGroup:
@@ -799,6 +800,7 @@ def test_megatron_global_adapters_info_all_pp_ranks(monkeypatch):
     )
 
     adapter = FakeAdapter()
+    adapter.replicate_adapter = replicate_adapter
     monkeypatch.setattr(bridge, "_get_adapter_wrap_module", lambda *_: (adapter, None))
 
     info = bridge._megatron_global_adapters_info_all_pp_ranks([FakeModel()])
@@ -816,7 +818,8 @@ def test_megatron_global_adapters_info_all_pp_ranks(monkeypatch):
     ) = info[0]
     assert global_base_name == "decoder.layers.0.mlp.linear_fc1.adapter"
     assert local_base_prefix == "decoder.layers.0.mlp.linear_fc1"
-    assert input_is_parallel is True and base_linear_is_parallel is False
+    assert input_is_parallel is True
+    assert base_linear_is_parallel is (not replicate_adapter)
     assert requires_expert_splits is False
     assert alpha == 8 and dim == 2 and pp_rank == 0 and vp_stage == 0
 

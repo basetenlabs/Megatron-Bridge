@@ -6433,6 +6433,16 @@ class TestResolveStateToLoad:
         """None means the caller already decided not to load."""
         assert resolve_state_to_load("RNG", None, {"anything": object()}) == (True, None)
 
+    @patch("torch.distributed.is_initialized", return_value=True)
+    @patch("torch.distributed.get_backend", return_value="gloo")
+    @patch("torch.distributed.all_reduce")
+    def test_missing_local_shard_still_votes(self, all_reduce, _backend, _initialized):
+        assert resolve_state_to_load("RNG", None, {"anything": object()}) == (True, None)
+
+        all_reduce.assert_called_once()
+        assert all_reduce.call_args.args[0].item() == 0
+        assert all_reduce.call_args.kwargs["op"] == torch.distributed.ReduceOp.MIN
+
     def test_empty_metadata_preserves_existing_behavior(self):
         """Unreadable or absent metadata must not silently disable loading."""
         rng_state = self._rng_state(pp_size=1, tp_size=8, dp_size=12)
