@@ -30,7 +30,7 @@ from functools import partial
 from logging import getLogger
 from pathlib import Path
 from time import time
-from typing import Any, Callable, Literal, Mapping, NamedTuple, Optional, Protocol, Union, runtime_checkable
+from typing import Any, Callable, Literal, NamedTuple, Optional, Protocol, Union, runtime_checkable
 
 import numpy as np
 import torch
