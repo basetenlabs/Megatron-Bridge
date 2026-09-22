@@ -37,13 +37,13 @@ import types
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from torch import Tensor
-
 from megatron.core.tensor_parallel import scatter_to_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
+from torch import Tensor
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
+
 
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -142,9 +142,7 @@ class Glm5NextVLModel(MegatronModule):
 
             if pixel_values is not None:
                 image_embeds = self.get_image_features(pixel_values, image_grid_thw).pooler_output
-                image_embeds = torch.cat(image_embeds, dim=0).to(
-                    inputs_embeds.device, inputs_embeds.dtype
-                )
+                image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = self._splice(
                     inputs_embeds,
                     input_ids,
@@ -156,9 +154,7 @@ class Glm5NextVLModel(MegatronModule):
 
             if pixel_values_videos is not None:
                 video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw).pooler_output
-                video_embeds = torch.cat(video_embeds, dim=0).to(
-                    inputs_embeds.device, inputs_embeds.dtype
-                )
+                video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = self._splice(
                     inputs_embeds,
                     input_ids,
@@ -171,11 +167,7 @@ class Glm5NextVLModel(MegatronModule):
             inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()
 
             if self.config.sequence_parallel:
-                tp_group = (
-                    self.config._pg_collection.tp
-                    if self.config._pg_collection is not None
-                    else None
-                )
+                tp_group = self.config._pg_collection.tp if self.config._pg_collection is not None else None
                 inputs_embeds = scatter_to_sequence_parallel_region(inputs_embeds, group=tp_group)
                 if padding_mask is not None:
                     # GPTModel scatters this alongside its own embedding, but that
@@ -185,9 +177,7 @@ class Glm5NextVLModel(MegatronModule):
                     # the hidden states it is indexed against. Same transpose dance
                     # as upstream: the mask is [batch, seq].
                     padding_mask = (
-                        scatter_to_sequence_parallel_region(
-                            padding_mask.transpose(0, 1).contiguous(), group=tp_group
-                        )
+                        scatter_to_sequence_parallel_region(padding_mask.transpose(0, 1).contiguous(), group=tp_group)
                         .transpose(0, 1)
                         .contiguous()
                     )
@@ -291,9 +281,7 @@ class Glm5NextVLModel(MegatronModule):
         span = 2 * cp_size * local_rows
         global_placeholders = torch.zeros(span, dtype=torch.int32, device=device)
         gathered = torch.empty(cp_size * local_rows, dtype=torch.int32, device=device)
-        torch.distributed.all_gather_into_tensor(
-            gathered, placeholders.to(torch.int32).contiguous(), group=cp_group
-        )
+        torch.distributed.all_gather_into_tensor(gathered, placeholders.to(torch.int32).contiguous(), group=cp_group)
         flat_positions = torch.cat(positions, dim=0).clamp_(max=span - 1)
         global_placeholders[flat_positions] = gathered
 
@@ -337,9 +325,7 @@ class Glm5NextVLModel(MegatronModule):
             )
 
         placeholders = input_ids.view(-1) == token_id
-        index = self._local_feature_index(
-            placeholders, packed_seq_params, cp_group, n_features=features.size(0)
-        )
+        index = self._local_feature_index(placeholders, packed_seq_params, cp_group, n_features=features.size(0))
         rows = inputs_embeds.view(-1, inputs_embeds.size(-1)).clone()
         rows[placeholders] = features.index_select(0, index).to(rows.dtype)
         return rows.view_as(inputs_embeds)

@@ -17,7 +17,6 @@ import pytest
 from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
 from megatron.bridge.models.glm5_next.glm5_next_bridge import Glm5NextBridge
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
-
 from tests.unit_tests.models.glm5_next.test_glm5_next_bridge import text_config  # noqa: F401
 
 
@@ -111,9 +110,7 @@ def test_registry_prefixes_from_a_fresh_bridge(text_config, vision_config):  # n
     """
     bridge = Glm5NextBridge()
     bridge.hf_config = _pretrained(text_config, vision_config).config
-    embed = bridge.mapping_registry().hf_to_megatron_lookup(
-        "model.language_model.embed_tokens.weight"
-    )
+    embed = bridge.mapping_registry().hf_to_megatron_lookup("model.language_model.embed_tokens.weight")
 
     assert embed.megatron_param == "language_model.embedding.word_embeddings.weight"
 
@@ -122,9 +119,7 @@ def test_text_only_config_keeps_bare_backbone_names(text_config):  # noqa: F811
     """No tower, no wrapper, so the text bridge's own names stand unchanged."""
     bridge = Glm5NextBridge()
     bridge.provider_bridge(_pretrained(text_config))
-    embed = bridge.mapping_registry().hf_to_megatron_lookup(
-        "model.language_model.embed_tokens.weight"
-    )
+    embed = bridge.mapping_registry().hf_to_megatron_lookup("model.language_model.embed_tokens.weight")
 
     assert embed.megatron_param == "embedding.word_embeddings.weight"
 

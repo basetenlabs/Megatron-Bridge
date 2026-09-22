@@ -63,9 +63,7 @@ class Glm5NextKPoolIndexer(DSAIndexer):
         # Pooling is deferred to prepare_topk_inputs: under CP the caller
         # allgathers keys and restores global packed order between these hooks,
         # and pool groups must be formed over that global order.
-        self._local_gate = torch.nn.functional.linear(
-            x.squeeze(1), self.index_kpool_compress_gate
-        )
+        self._local_gate = torch.nn.functional.linear(x.squeeze(1), self.index_kpool_compress_gate)
         return q, raw_k, weights
 
     def prepare_topk_inputs(
@@ -118,9 +116,7 @@ class Glm5NextKPoolIndexer(DSAIndexer):
             local_positions + self.pool_size <= lengths[raw_sequence_ids]
         )
         pool_bases = raw_positions[complete_pool_start]
-        pool_to_raw = (
-            pool_bases[:, None] + torch.arange(self.pool_size, device=k.device, dtype=torch.int64)[None, :]
-        )
+        pool_to_raw = pool_bases[:, None] + torch.arange(self.pool_size, device=k.device, dtype=torch.int64)[None, :]
 
         flat_k = k.squeeze(1)
         pool_gate = gate[pool_to_raw] + self.index_kpool_compress_ape[None, :, :]
@@ -166,14 +162,10 @@ class Glm5NextKPoolIndexer(DSAIndexer):
 
         # Compact valid selected pools into the prefix consumed by FlashMLA.
         if self._pool_to_raw.size(0) > 0:
-            safe_indices = topk_indices.to(torch.int64).clamp(
-                min=0, max=self._pool_to_raw.size(0) - 1
-            )
+            safe_indices = topk_indices.to(torch.int64).clamp(min=0, max=self._pool_to_raw.size(0) - 1)
             expanded_pools = self._pool_to_raw[safe_indices]
             pool_slots = (valid_pools.cumsum(dim=-1) - 1).clamp_min(0) * self.pool_size
-            token_offsets = torch.arange(
-                self.pool_size, device=topk_indices.device, dtype=torch.int64
-            )
+            token_offsets = torch.arange(self.pool_size, device=topk_indices.device, dtype=torch.int64)
             pool_targets = pool_slots.unsqueeze(-1) + token_offsets
             invalid_target = torch.full_like(pool_targets, expanded_width)
             pool_targets = torch.where(valid_pools.unsqueeze(-1), pool_targets, invalid_target)
@@ -188,9 +180,7 @@ class Glm5NextKPoolIndexer(DSAIndexer):
 
         # A query may always select the one-to-three raw tokens in its current
         # incomplete pool. Place that tail directly after the valid pool prefix.
-        tail_offsets = torch.arange(
-            self.pool_size - 1, device=topk_indices.device, dtype=torch.int64
-        )
+        tail_offsets = torch.arange(self.pool_size - 1, device=topk_indices.device, dtype=torch.int64)
         tail = self._tail_start[:, None] + tail_offsets
         tail = tail.masked_fill(tail_offsets >= self._tail_size[:, None], -1)
         tail = tail.unsqueeze(0).expand(batch_size, -1, -1)

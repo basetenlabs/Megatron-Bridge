@@ -24,6 +24,7 @@ import pytest
 import torch
 from torch import nn
 
+
 CP = int(os.environ.get("BT_KPOOL_CP_SIZE", "2"))
 
 requires_gpus = pytest.mark.skipif(
@@ -79,9 +80,7 @@ def _build_indexer(pgs, device):
     indexer.index_kpool_compress_ape = nn.Parameter(
         torch.randn(indexer.pool_size, INDEX_HEAD_DIM, device=device, dtype=DTYPE)
     )
-    indexer.index_kpool_compress_gate = nn.Parameter(
-        torch.randn(INDEX_HEAD_DIM, HIDDEN, device=device, dtype=DTYPE)
-    )
+    indexer.index_kpool_compress_gate = nn.Parameter(torch.randn(INDEX_HEAD_DIM, HIDDEN, device=device, dtype=DTYPE))
     indexer._pool_to_raw = None
     indexer._pool_prefix = None
     indexer._raw_cu_seqlens = None
@@ -104,17 +103,15 @@ def _drive_hooks(indexer, x, psp, cp_group, cp_rank, cp_size):
     cu_q, cu_kv = dsa_layout.get_packed_qk_cu_seqlens(psp)
     t_local = k.size(0)
     if cp_size > 1:
-        query_positions, kv_reorder = (
-            dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                cu_seqlens_q=cu_q,
-                cu_seqlens_kv=cu_kv,
-                cp_size=cp_size,
-                cp_rank=cp_rank,
-                device=k.device,
-                local_output_size=t_local,
-                key_local_output_size=t_local,
-                global_output_size=t_local * cp_size,
-            )
+        query_positions, kv_reorder = dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_kv,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            device=k.device,
+            local_output_size=t_local,
+            key_local_output_size=t_local,
+            global_output_size=t_local * cp_size,
         )
         k = gather_from_sequence_parallel_region(k, group=cp_group)
         k = k.index_select(0, kv_reorder)
@@ -147,9 +144,7 @@ def _drive_hooks(indexer, x, psp, cp_group, cp_rank, cp_size):
 
 def _run_rank(rank: int, world: int, rdv_file: str, result_file: str):
     torch.cuda.set_device(rank)
-    torch.distributed.init_process_group(
-        "nccl", init_method=f"file://{rdv_file}", world_size=world, rank=rank
-    )
+    torch.distributed.init_process_group("nccl", init_method=f"file://{rdv_file}", world_size=world, rank=rank)
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer
 
@@ -183,14 +178,10 @@ def _run_rank(rank: int, world: int, rdv_file: str, result_file: str):
     local = full.index_select(0, local_positions).contiguous()
 
     ref = _build_indexer(_PGs(tp=self_group, cp=self_group), device)
-    ref_positions, ref_pooled_k, ref_result, ref_length = _drive_hooks(
-        ref, full, psp, self_group, 0, 1
-    )
+    ref_positions, ref_pooled_k, ref_result, ref_length = _drive_hooks(ref, full, psp, self_group, 0, 1)
 
     cp = _build_indexer(_PGs(tp=self_group, cp=cp_group), device)
-    cp_positions, cp_pooled_k, cp_result, cp_length = _drive_hooks(
-        cp, local, psp, cp_group, rank, world
-    )
+    cp_positions, cp_pooled_k, cp_result, cp_length = _drive_hooks(cp, local, psp, cp_group, rank, world)
 
     pooled_err = (cp_pooled_k.float() - ref_pooled_k.float()).abs().max().item()
 

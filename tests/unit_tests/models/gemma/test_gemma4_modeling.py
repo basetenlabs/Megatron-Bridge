@@ -1015,9 +1015,7 @@ class TestGemma4DenseCoreAttention:
     def test_sdpa_prefers_is_causal_when_no_mask(self, monkeypatch):
         """No explicit mask means never allocating [sq, sk]."""
         layer, _ = self._build(monkeypatch, layer_number=2)
-        attn_mask, is_causal = layer._sdpa_attention_mask(
-            None, AttnMaskType.causal, q_len=4, kv_len=4
-        )
+        attn_mask, is_causal = layer._sdpa_attention_mask(None, AttnMaskType.causal, q_len=4, kv_len=4)
         assert attn_mask is None and is_causal is True
 
     def test_sdpa_decode_step_needs_no_causal_mask(self, monkeypatch):
@@ -1028,9 +1026,7 @@ class TestGemma4DenseCoreAttention:
     def test_sdpa_rejects_a_non_bool_mask(self, monkeypatch):
         layer, _ = self._build(monkeypatch, layer_number=2)
         with pytest.raises(TypeError, match="boolean"):
-            layer._sdpa_attention_mask(
-                torch.zeros(1, 1, 2, 2), AttnMaskType.padding_causal, 2, 2
-            )
+            layer._sdpa_attention_mask(torch.zeros(1, 1, 2, 2), AttnMaskType.padding_causal, 2, 2)
 
 
 class TestGemma4RotaryEmbeddings:

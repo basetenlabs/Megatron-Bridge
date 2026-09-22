@@ -22,6 +22,7 @@ import os
 
 import torch
 
+
 CP = int(os.environ.get("BT_VL_CP_SIZE", "2"))
 
 # Physical lengths divide 2*CP for zigzag sharding; real lengths leave padding at
@@ -42,9 +43,7 @@ def _cu_seqlens(lengths, device):
 
 
 def _run_rank(rank: int, world: int, rdv_file: str, result_file: str):
-    torch.distributed.init_process_group(
-        "gloo", init_method=f"file://{rdv_file}", world_size=world, rank=rank
-    )
+    torch.distributed.init_process_group("gloo", init_method=f"file://{rdv_file}", world_size=world, rank=rank)
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.transformer.experimental_attention_variant import dsa_layout
 
@@ -81,17 +80,13 @@ def _run_rank(rank: int, world: int, rdv_file: str, result_file: str):
     local_ids[in_range] = global_ids.index_select(0, positions[in_range])
     placeholders = local_ids == IMAGE_TOKEN
 
-    got = Glm5NextVLModel._local_feature_index(
-        None, placeholders, psp, cp_group, n_features=len(IMAGE_POSITIONS)
-    )
+    got = Glm5NextVLModel._local_feature_index(None, placeholders, psp, cp_group, n_features=len(IMAGE_POSITIONS))
 
     # A tower/token-count disagreement must raise rather than resolve to a
     # plausible-looking index.
     mismatch_raised = False
     try:
-        Glm5NextVLModel._local_feature_index(
-            None, placeholders, psp, cp_group, n_features=len(IMAGE_POSITIONS) - 1
-        )
+        Glm5NextVLModel._local_feature_index(None, placeholders, psp, cp_group, n_features=len(IMAGE_POSITIONS) - 1)
     except ValueError:
         mismatch_raised = True
 
@@ -102,9 +97,7 @@ def _run_rank(rank: int, world: int, rdv_file: str, result_file: str):
     mismatch = int((got != want).sum().item()) + (0 if mismatch_raised else 1000)
     counted = int(placeholders.sum().item())
     gathered = [torch.zeros(2, dtype=torch.int64, device=device) for _ in range(world)]
-    torch.distributed.all_gather(
-        gathered, torch.tensor([mismatch, counted], dtype=torch.int64, device=device)
-    )
+    torch.distributed.all_gather(gathered, torch.tensor([mismatch, counted], dtype=torch.int64, device=device))
     if rank == 0:
         bad = sum(int(t[0].item()) for t in gathered)
         seen = sum(int(t[1].item()) for t in gathered)

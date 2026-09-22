@@ -926,9 +926,7 @@ class Gemma4CoreAttention(TEDotProductAttention):
                 )
             self.force_flex_attention = bool(config.force_flex_attention)
             self._gemma4_window = config.window_size
-            self._sliding_softmax_scale = (
-                softmax_scale if softmax_scale is not None else config.softmax_scale
-            )
+            self._sliding_softmax_scale = softmax_scale if softmax_scale is not None else config.softmax_scale
             self._sliding_attention_dropout = (
                 config.attention_dropout if attention_dropout is None else attention_dropout
             )
@@ -1098,9 +1096,7 @@ class Gemma4CoreAttention(TEDotProductAttention):
 
         mask_type = attn_mask_type if attn_mask_type is not None else self._sliding_attn_mask_type
         if mask_type not in (AttnMaskType.causal, AttnMaskType.padding_causal):
-            raise ValueError(
-                f"Gemma 4 sliding attention expects a causal mask type; got {mask_type}."
-            )
+            raise ValueError(f"Gemma 4 sliding attention expects a causal mask type; got {mask_type}.")
         if attention_mask is not None:
             # A padding mask would have to be AND-ed into mask_mod. Dropping it would
             # silently attend to padding, so refuse instead of guessing.
@@ -1119,8 +1115,7 @@ class Gemma4CoreAttention(TEDotProductAttention):
         window = self._gemma4_window
         if not window or window[1]:
             raise ValueError(
-                "Gemma 4 sliding attention expects a left-only causal window "
-                f"(left, 0); got window_size={window!r}."
+                f"Gemma 4 sliding attention expects a left-only causal window (left, 0); got window_size={window!r}."
             )
         left = int(window[0])
 
@@ -1134,11 +1129,7 @@ class Gemma4CoreAttention(TEDotProductAttention):
         # [s, b, np, hn] -> [b, np, s, hn]; hn stays stride-1, so these are views.
         query, key, value = (tensor.permute(1, 2, 0, 3) for tensor in (query, key, value))
 
-        scale = (
-            self._sliding_softmax_scale
-            if self._sliding_softmax_scale is not None
-            else query.size(-1) ** -0.5
-        )
+        scale = self._sliding_softmax_scale if self._sliding_softmax_scale is not None else query.size(-1) ** -0.5
         block_mask = _sliding_block_mask(left, query.size(2), key.size(2), str(query.device))
 
         context = _compiled_flex_attention()(query, key, value, block_mask=block_mask, scale=scale)

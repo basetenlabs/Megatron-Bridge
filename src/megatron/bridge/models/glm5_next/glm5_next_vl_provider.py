@@ -108,9 +108,7 @@ class Glm5NextVLModelProvider(MLAModelProvider):
                 "tensor_model_parallel_size=1, or set mtp_num_layers=None."
             )
 
-        model = Glm5NextVLModel(
-            self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
-        )
+        model = Glm5NextVLModel(self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
         if self.freeze_language_model or self.freeze_vision_model or self.freeze_vision_projection:
             model.freeze(
                 freeze_language_model=self.freeze_language_model,
@@ -121,6 +119,4 @@ class Glm5NextVLModelProvider(MLAModelProvider):
 
     def provide_language_model(self, pre_process=None, post_process=None, vp_stage=None):
         """Build only the Megatron language backbone, for the VL model to wrap."""
-        return MLAModelProvider.provide(
-            self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
-        )
+        return MLAModelProvider.provide(self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
