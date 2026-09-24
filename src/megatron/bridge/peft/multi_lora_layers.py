@@ -52,6 +52,7 @@ from megatron.bridge.peft.utils import (
     ParallelLinearAdapter,
     all2all_hp2sp,
     get_adapter_attributes_from_linear,
+    rank_padding_masks,
 )
 
 
@@ -270,12 +271,6 @@ class MultiLoRALinear(AdapterWrapper):
     def _apply_rank_mask(self, idx: int) -> None:
         """Zero padded rows of A and padded cols of B for slot ``idx``.
 
-        For column-parallel base layers (``linear_qkv``, ``linear_fc1``)
-        ``linear_in.weight`` is sharded across TP — rank ``r`` owns global
-        rows ``[r*L : (r+1)*L]`` where ``L = max_rank/tp``. For row-parallel
-        base it is replicated. Map the global cutoff ``actual_rank`` into
-        the local shard before zeroing.
-
         With both sides zero in the padded region, the autograd chain through
         the two GEMMs keeps the gradient zero there too — no periodic
         re-masking needed during training.
@@ -284,17 +279,10 @@ class MultiLoRALinear(AdapterWrapper):
         if actual_rank >= self.max_rank:
             return
         adapter = self.adapters[idx]
-        local_rank_dim = adapter.linear_in.weight.shape[0]
-        if local_rank_dim < self.max_rank:
-            tp_rank = parallel_state.get_tensor_model_parallel_rank()
-            shard_start = tp_rank * local_rank_dim
-            local_start = max(0, actual_rank - shard_start)
-        else:
-            local_start = actual_rank
+        in_mask, out_mask = rank_padding_masks(adapter, actual_rank)
         with torch.no_grad():
-            if local_start < local_rank_dim:
-                adapter.linear_in.weight.data[local_start:].zero_()
-            adapter.linear_out.weight.data[:, actual_rank:].zero_()
+            adapter.linear_in.weight.data.masked_fill_(in_mask, 0)
+            adapter.linear_out.weight.data.masked_fill_(out_mask, 0)
 
     def state_dict(
         self,

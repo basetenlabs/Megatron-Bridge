@@ -47,7 +47,7 @@ class LoRALinear(AdapterWrapper):
             linear_out_weight,
             linear_in_weight,
             self.adapter.alpha,
-            self.adapter.dim,
+            self.adapter.active_dim,
             tp_group=getattr(self.adapter, "tp_group", None),
         )
         if merged_weight.shape != base_weight.shape:
@@ -287,7 +287,7 @@ class TEFusedLoRALinear(LoRALinear):
         lora_dim = linear_out_weight.size(1)
         dropout = getattr(self.adapter.dropout, "p", 0.0)
         dropout_position = self.adapter.dropout_position
-        scale = self.adapter.alpha / self.adapter.dim
+        scale = self.adapter.alpha / self.adapter.active_dim
 
         # Ops in LoRA branch
         lora_branch = te.ops.Sequential()
@@ -448,8 +448,9 @@ class LinearAdapter(nn.Module):
             base_dtype: Base weight dtype, used when ``lora_dtype`` is not provided.
         """
         self.dim = dim
+        # Rank in use; the rest of ``dim`` is zero padding (see ``peft.active_dim``).
+        self.active_dim = dim
         self.alpha = alpha
-        self.scale = alpha / dim
 
         in_features = self.in_features
         out_features = self.out_features
@@ -468,6 +469,11 @@ class LinearAdapter(nn.Module):
             self.dropout = nn.Identity()
         assert dropout_position in ["pre", "post"], dropout_position
         self.dropout_position = dropout_position
+
+    @property
+    def scale(self) -> float:
+        """The LoRA forward scale for the rank in use."""
+        return self.alpha / self.active_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Compute the scaled LoRA delta only (no base-weight term).

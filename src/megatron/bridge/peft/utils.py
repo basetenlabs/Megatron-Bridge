@@ -750,6 +750,31 @@ def align_expert_dim_for_tp(
     return ((dim + expert_tp_size - 1) // expert_tp_size) * expert_tp_size
 
 
+def rank_padding_masks(adapter: nn.Module, rank: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Mark the ``linear_in`` rows and ``linear_out`` columns past global rank ``rank``.
+
+    A column-parallel adapter shards ``linear_in`` along the rank axis across TP, so
+    this rank's local rows start at ``tp_rank * local_rows`` in the global rank space.
+    ``linear_out`` always holds the full rank axis.
+    """
+    linear_in = adapter.linear_in.weight
+    linear_out = adapter.linear_out.weight
+    local_rows = linear_in.shape[-2]
+    if local_rows == adapter.dim:
+        start = 0
+    else:
+        tp_size = _process_group_size(adapter.tp_group)
+        if local_rows * tp_size != adapter.dim:
+            raise ValueError(
+                f"{adapter.base_linear_name}: linear_in holds {local_rows} rank rows, "
+                f"which is neither dim={adapter.dim} nor dim/tp={adapter.dim}/{tp_size}"
+            )
+        start = _process_group_rank(adapter.tp_group) * local_rows
+    rows = torch.arange(start, start + local_rows, device=linear_in.device) >= rank
+    cols = torch.arange(linear_out.shape[-1], device=linear_out.device) >= rank
+    return rows.unsqueeze(-1).expand_as(linear_in), cols.expand_as(linear_out)
+
+
 def wildcard_match(pattern: str, key: Optional[str]) -> Optional[bool]:
     """Return whether the pattern (target module to add LoRA) matches the key (model weight name).
 
@@ -1005,6 +1030,8 @@ class ParallelLinearAdapter(nn.Module):
         self.base_linear_name = base_linear_name
         self.activation = self._get_activation_fn(activation)
         self.dim = dim
+        # Rank in use; the rest of ``dim`` is zero padding (see ``peft.active_dim``).
+        self.active_dim = dim
         self.alpha = alpha if alpha is not None else self.dim
         self.input_is_parallel = input_is_parallel
         self.dropout_position = dropout_position
@@ -1309,7 +1336,7 @@ class ParallelLinearAdapter(nn.Module):
         if self.dropout_position == "post":
             x = self.dropout(x)
 
-        x = x * (self.alpha / self.dim)
+        x = x * (self.alpha / self.active_dim)
 
         if pad_len > 0:
             # Remove MoE padding.
@@ -1861,6 +1888,8 @@ class GroupedExpertLinearAdapter(nn.Module):
         self.base_linear_name = base_linear_name
         self.activation = ParallelLinearAdapter._get_activation_fn(self, activation)
         self.dim = dim
+        # Rank in use; the rest of ``dim`` is zero padding (see ``peft.active_dim``).
+        self.active_dim = dim
         self.alpha = alpha if alpha is not None else self.dim
         self.input_is_parallel = input_is_parallel
         self.dropout_position = dropout_position
@@ -2318,14 +2347,14 @@ class GroupedExpertLinearAdapter(nn.Module):
             linear_in_weight = self.linear_in()
             linear_out_weight = self.linear_out()
             grad_anchor = linear_in_weight.reshape(-1)[0] + linear_out_weight.reshape(-1)[0]
-            return (x.new_empty((0, output_features)) + grad_anchor * 0.0) * (self.alpha / self.dim)
+            return (x.new_empty((0, output_features)) + grad_anchor * 0.0) * (self.alpha / self.active_dim)
 
         fp8_enabled = self._is_te_fp8_enabled()
         use_te_fp8 = fp8_enabled and self._can_use_te_grouped_linear_fp8(x)
         use_grouped_mm = not fp8_enabled and self._can_use_grouped_mm(x)
         if not use_te_fp8 and not use_grouped_mm:
             return self._forward_per_expert(x, expert_splits=expert_splits, expert_tp_size=expert_tp_size) * (
-                self.alpha / self.dim
+                self.alpha / self.active_dim
             )
 
         active_expert_indices = []
@@ -2385,7 +2414,7 @@ class GroupedExpertLinearAdapter(nn.Module):
             expert_output = self.dropout(expert_output)
 
         if all(pad_len == 0 for pad_len in pad_lengths):
-            return expert_output * (self.alpha / self.dim)
+            return expert_output * (self.alpha / self.active_dim)
 
         outputs = []
         start = 0
@@ -2394,7 +2423,7 @@ class GroupedExpertLinearAdapter(nn.Module):
             outputs.append(unpad_seq_to_mult(output_chunk, pad_len) if pad_len > 0 else output_chunk)
             start += padded_size
 
-        return torch.cat(outputs, dim=0) * (self.alpha / self.dim)
+        return torch.cat(outputs, dim=0) * (self.alpha / self.active_dim)
 
     def sharded_state_dict(
         self,
@@ -2609,6 +2638,8 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         self.base_linear_name = base_linear_name
         self.activation = ParallelLinearAdapter._get_activation_fn(self, activation)
         self.dim = dim
+        # Rank in use; the rest of ``dim`` is zero padding (see ``peft.active_dim``).
+        self.active_dim = dim
         self.alpha = alpha if alpha is not None else self.dim
         self.dropout_position = dropout_position
         self.num_local_experts = num_local_experts
@@ -2703,7 +2734,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         if self.dropout_position == "post":
             x = self.dropout(x)
 
-        return x * (self.alpha / self.dim)
+        return x * (self.alpha / self.active_dim)
 
     def sharded_state_dict(
         self,

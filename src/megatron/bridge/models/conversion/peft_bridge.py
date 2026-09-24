@@ -615,7 +615,7 @@ class MegatronPeftBridge:
                         base_linear_is_parallel,
                         requires_expert_splits,
                         adapter.alpha,
-                        adapter.dim,
+                        adapter.active_dim,
                         pp_rank,
                         vp_stage,
                     )
@@ -1428,7 +1428,7 @@ class MegatronPeftBridge:
             merged_weight = self._merge_single_adapter_weight(
                 base_weight,
                 target_adapter.alpha,
-                target_adapter.dim,
+                target_adapter.active_dim,
                 linear_in_weight,
                 linear_out_weight,
             )
