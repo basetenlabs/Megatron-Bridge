@@ -83,6 +83,7 @@ class MockLoRAAdapter(nn.Module):
         """Initialize mock LoRA adapter."""
         super().__init__()
         self.dim = dim
+        self.active_dim = dim
         self.alpha = alpha
         self.scale = alpha / dim
         self.linear_in = nn.Linear(in_features, dim, bias=False)
