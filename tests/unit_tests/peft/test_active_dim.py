@@ -113,6 +113,19 @@ def test_rejects_unknown_adapters_and_out_of_range_ranks():
         set_lora_active_dim(_lora(base, DIM), DIM + 1)
 
 
+def test_rejects_an_activation_between_the_factors():
+    """SiLU is zero at zero but sigmoid is not; any non-identity activation is refused."""
+    lora = _lora(nn.Linear(8, 8), DIM)
+    lora.adapter.activation = nn.Sigmoid()
+    lora.adapter.base_linear_name = "linear_fc1"
+    with pytest.raises(NotImplementedError, match="identity activation"):
+        set_lora_active_dim(lora, RANK)
+    with pytest.raises(NotImplementedError, match="identity activation"):
+        lora_padding_masks(lora, RANK)
+    lora.adapter.activation = nn.Identity()
+    set_lora_active_dim(lora, RANK)
+
+
 class _Group:
     def __init__(self, size: int, rank: int) -> None:
         self._size, self._rank = size, rank

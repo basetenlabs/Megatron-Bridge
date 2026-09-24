@@ -48,6 +48,13 @@ def _check_paddable(adapter: nn.Module, active_dim: int) -> None:
         return
     if type(adapter) not in _PADDABLE_ADAPTERS:
         raise NotImplementedError(f"{type(adapter).__name__} cannot run below its allocated dim={adapter.dim}")
+    # An activation f between the factors with f(0) != 0 makes the padded rows of
+    # linear_in's output nonzero, so linear_out's padded columns would train.
+    if not isinstance(getattr(adapter, "activation", nn.Identity()), nn.Identity):
+        raise NotImplementedError(
+            f"{adapter.base_linear_name}: zero padding needs an identity activation, "
+            f"not {type(adapter.activation).__name__}"
+        )
     if not 0 < active_dim < adapter.dim:
         raise ValueError(f"active_dim={active_dim} must be in (0, {adapter.dim}]")
 
