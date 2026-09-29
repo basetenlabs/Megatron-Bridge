@@ -897,27 +897,26 @@ def test_mamba_adapter_export_preserves_merge(monkeypatch: pytest.MonkeyPatch, t
     alpha, dim = 2, 4
     base_prefix = "decoder.layers.0.mixer.in_proj"
     hf_name = "backbone.layers.0.mixer.in_proj.weight"
-    component_sizes = [8, 8, 4, 4, 4]  # z, x, B, C, dt in HF order
-    local_component_sizes = [size // tp_size for size in component_sizes]
+    local_component_sizes = [size // tp_size for size in [8, 8, 4, 4, 4]]  # z, x, B, C, dt
+    local_rows = sum(local_component_sizes)
     # Distinct row/column values expose permutations; alpha / dim != 1 checks scaling.
-    base_weight = (torch.arange(84, dtype=torch.float32).reshape(28, 3) - 40) / 8
-    linear_in_weight = (torch.arange(12, dtype=torch.float32).reshape(dim, 3) - 5) / 4
-    linear_out_weight = (torch.arange(112, dtype=torch.float32).reshape(28, dim) - 55) / 16
+    base_local = (torch.arange(local_rows * 3, dtype=torch.float32).reshape(local_rows, 3) - 40) / 8
+    linear_in_local = (torch.arange(dim // tp_size * 3, dtype=torch.float32).reshape(-1, 3) - 5) / 4
+    linear_out_local = (torch.arange(local_rows * dim, dtype=torch.float32).reshape(local_rows, dim) - 55) / 16
 
-    def split_into_mamba_tp_shards(hf_weight: torch.Tensor) -> list[torch.Tensor]:
-        # Each rank owns a slice of every component, in local z/x/B/C/dt order.
-        hf_components = hf_weight.split(component_sizes, dim=0)
-        component_shards = [component.chunk(tp_size, dim=0) for component in hf_components]
-        return [torch.cat([shards[rank] for shards in component_shards]) for rank in range(tp_size)]
+    def expected_hf_order(local_weight: torch.Tensor) -> torch.Tensor:
+        # Rank 1 holds twice rank 0's values; HF groups z0,z1,x0,x1,... rather than whole ranks.
+        components = local_weight.split(local_component_sizes, dim=0)
+        return torch.cat([component * (rank + 1) for component in components for rank in range(tp_size)])
 
-    base_shards = split_into_mamba_tp_shards(base_weight)
-    linear_in_shards = list(linear_in_weight.chunk(tp_size, dim=0))
-    linear_out_shards = split_into_mamba_tp_shards(linear_out_weight)
+    base_weight = expected_hf_order(base_local)
+    linear_in_weight = torch.cat([linear_in_local * (rank + 1) for rank in range(tp_size)])
+    linear_out_weight = expected_hf_order(linear_out_local)
 
     # Build real conversion tasks for rank 0, replacing distributed communication below.
     adapter = SimpleNamespace(
-        linear_in=SimpleNamespace(weight=linear_in_shards[0], config=config),
-        linear_out=SimpleNamespace(weight=linear_out_shards[0], config=config),
+        linear_in=SimpleNamespace(weight=linear_in_local, config=config),
+        linear_out=SimpleNamespace(weight=linear_out_local, config=config),
     )
     adapters_info = [(f"{base_prefix}.adapter", base_prefix, False, True, False, alpha, dim, 0, 0)]
     monkeypatch.setattr(bridge, "_megatron_global_adapters_info_all_pp_ranks", lambda *_: adapters_info)
@@ -933,26 +932,11 @@ def test_mamba_adapter_export_preserves_merge(monkeypatch: pytest.MonkeyPatch, t
         monkeypatch.setattr(mapping_cls, "broadcast_from_pp_rank", lambda self, tensor, cache_key=None: tensor)
         monkeypatch.setattr(mapping_cls, "broadcast_obj_from_pp_rank", lambda self, obj, cache_key=None: obj)
         monkeypatch.setattr(mapping_cls, "tp_size", property(lambda self: tp_size))
-
-    def mock_tp_gather(mapping: ColumnParallelMapping | MambaInProjMapping, shards: list[torch.Tensor]) -> None:
-        if isinstance(mapping, MambaInProjMapping):
-            # Mamba gathers each component separately; ordinary column mappings gather once.
-            components_by_rank = [shard.split(local_component_sizes, dim=0) for shard in shards]
-            gathered = [list(rank_components) for rank_components in zip(*components_by_rank)]
-        else:
-            gathered = [shards]
-        responses = iter(gathered)
-
-        def gather(local_tensor: torch.Tensor) -> list[torch.Tensor]:
-            rank_tensors = list(next(responses))
-            torch.testing.assert_close(local_tensor, rank_tensors[0])
-            return rank_tensors
-
-        monkeypatch.setattr(mapping, "gather_from_tp_ranks", gather)
+        monkeypatch.setattr(
+            mapping_cls, "gather_from_tp_ranks", lambda self, tensor: [tensor * (rank + 1) for rank in range(tp_size)]
+        )
 
     task = bridge.build_adapter_conversion_tasks([Mock()])[base_prefix][0]
-    mock_tp_gather(task.linear_in_task.mapping, linear_in_shards)
-    mock_tp_gather(task.linear_out_task.mapping, linear_out_shards)
 
     # Adapter export must reconstruct A and B in HF order before any merge.
     exported_adapter = bridge.materialize_adapter_weights([task])[0]
@@ -965,14 +949,8 @@ def test_mamba_adapter_export_preserves_merge(monkeypatch: pytest.MonkeyPatch, t
     )[hf_name]
 
     # Merge then export: each local B multiplies the full A gathered across TP.
-    locally_merged_shards = [
-        base + (alpha / dim) * (linear_out @ linear_in_weight)
-        for base, linear_out in zip(base_shards, linear_out_shards)
-    ]
-    mock_tp_gather(base_mapping, locally_merged_shards)
-    exported_after_merge = base_mapping.megatron_to_hf(
-        locally_merged_shards[0], SimpleNamespace(config=config)
-    )[hf_name]
+    merged_local = base_local + (alpha / dim) * (linear_out_local @ linear_in_weight)
+    exported_after_merge = base_mapping.megatron_to_hf(merged_local, SimpleNamespace(config=config))[hf_name]
 
     expected = base_weight + (alpha / dim) * (linear_out_weight @ linear_in_weight)
     torch.testing.assert_close(merged_after_export, expected)
