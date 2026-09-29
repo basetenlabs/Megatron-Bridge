@@ -21,7 +21,12 @@ import pytest
 import torch
 import torch.nn as nn
 
-from megatron.bridge.peft.active_dim import get_lora_active_dim, lora_padding_masks, set_lora_active_dim
+from megatron.bridge.peft.active_dim import (
+    get_lora_active_dim,
+    lora_padding_masks,
+    lora_rank_index,
+    set_lora_active_dim,
+)
 from megatron.bridge.peft.dora_layers import ParallelLinearDoRAAdapter
 from megatron.bridge.peft.lora_layers import LinearAdapter, LoRALinear
 from megatron.bridge.peft.lora_merge import LoRAMerge
@@ -254,3 +259,19 @@ def test_a_pipeline_stage_without_adapters_is_a_no_op():
     set_lora_active_dim(stage, RANK, lora_dim=DIM)
     assert lora_padding_masks(stage, RANK, lora_dim=DIM) == {}
     assert get_lora_active_dim(stage, lora_dim=DIM) == DIM
+
+
+@pytest.mark.parametrize("rank", [1, RANK, DIM - 1])
+def test_rank_index_gives_every_ranks_padding_mask(rank):
+    lora = _lora(nn.Linear(8, 8), DIM)
+    index = lora_rank_index(lora, lora_dim=DIM)
+    masks = lora_padding_masks(lora, rank, lora_dim=DIM)
+    assert index.keys() == masks.keys()
+    for weight, mask in masks.items():
+        assert torch.equal(index[weight] >= rank, mask)
+
+
+def test_rank_index_refuses_unpaddable_adapters():
+    base = nn.Linear(8, 8)
+    with pytest.raises(NotImplementedError):
+        lora_rank_index(LoRALinear(base, _Unpaddable(base, dim=DIM)), lora_dim=DIM)

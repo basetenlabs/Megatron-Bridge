@@ -750,8 +750,8 @@ def align_expert_dim_for_tp(
     return ((dim + expert_tp_size - 1) // expert_tp_size) * expert_tp_size
 
 
-def rank_padding_masks(adapter: nn.Module, rank: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Mark the ``linear_in`` rows and ``linear_out`` columns past global rank ``rank``.
+def rank_indices(adapter: nn.Module) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Give each local ``linear_in`` row and ``linear_out`` column its global rank index.
 
     A column-parallel adapter shards ``linear_in`` along the rank axis across TP, so
     this rank's local rows start at ``tp_rank * local_rows`` in the global rank space.
@@ -759,10 +759,10 @@ def rank_padding_masks(adapter: nn.Module, rank: int) -> Tuple[torch.Tensor, tor
 
     Args:
         adapter: A LoRA adapter with ``linear_in``/``linear_out`` weights, ``dim`` and ``tp_group``.
-        rank: The global rank index where padding starts.
 
     Returns:
-        Boolean masks shaped like this rank's local ``linear_in`` and ``linear_out`` weights.
+        Integer tensors broadcast to this rank's local ``linear_in`` and ``linear_out``
+        weight shapes (expanded views, so they hold one row or column of storage).
     """
     linear_in = adapter.linear_in.weight
     linear_out = adapter.linear_out.weight
@@ -777,9 +777,23 @@ def rank_padding_masks(adapter: nn.Module, rank: int) -> Tuple[torch.Tensor, tor
                 f"which is neither dim={adapter.dim} nor dim/tp={adapter.dim}/{tp_size}"
             )
         start = _process_group_rank(adapter.tp_group) * local_rows
-    rows = torch.arange(start, start + local_rows, device=linear_in.device) >= rank
-    cols = torch.arange(linear_out.shape[-1], device=linear_out.device) >= rank
+    rows = torch.arange(start, start + local_rows, device=linear_in.device)
+    cols = torch.arange(linear_out.shape[-1], device=linear_out.device)
     return rows.unsqueeze(-1).expand_as(linear_in), cols.expand_as(linear_out)
+
+
+def rank_padding_masks(adapter: nn.Module, rank: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Mark the ``linear_in`` rows and ``linear_out`` columns past global rank ``rank``.
+
+    Args:
+        adapter: A LoRA adapter with ``linear_in``/``linear_out`` weights, ``dim`` and ``tp_group``.
+        rank: The global rank index where padding starts.
+
+    Returns:
+        Boolean masks shaped like this rank's local ``linear_in`` and ``linear_out`` weights.
+    """
+    in_index, out_index = rank_indices(adapter)
+    return in_index >= rank, out_index >= rank
 
 
 def wildcard_match(pattern: str, key: Optional[str]) -> Optional[bool]:

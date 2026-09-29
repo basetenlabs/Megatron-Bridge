@@ -43,7 +43,7 @@ from megatron.bridge.models.transformer_config import cuda_graphs_are_enabled
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
 from megatron.bridge.peft.lora_layers import TEFusedLoRALinear
 from megatron.bridge.peft.multi_lora_layers import _MULTI_LORA_TYPES
-from megatron.bridge.peft.utils import rank_padding_masks
+from megatron.bridge.peft.utils import rank_indices, rank_padding_masks
 
 
 def _iter_adapters(model: nn.Module | Sequence[nn.Module]) -> Iterator[tuple[AdapterWrapper, nn.Module]]:
@@ -164,3 +164,31 @@ def lora_padding_masks(
         masks[adapter.linear_in.weight] = in_mask
         masks[adapter.linear_out.weight] = out_mask
     return masks
+
+
+def lora_rank_index(model: nn.Module | Sequence[nn.Module], *, lora_dim: int) -> dict[torch.Tensor, torch.Tensor]:
+    """Map each local LoRA weight to the global rank index of each of its entries.
+
+    ``index >= r`` is then the padding mask for any run rank ``r``, so a caller that
+    serves several ranks builds this once instead of one mask per rank.
+
+    Args:
+        model: The model, or its list of chunks, holding the LoRA adapters.
+        lora_dim: The LoRA's allocated rank (the PEFT config's ``dim``).
+
+    Returns:
+        ``{weight: index}`` for this rank's local ``linear_in`` and ``linear_out``
+        weights, as expanded integer views; empty when ``lora_dim == 1``.
+
+    Raises:
+        NotImplementedError: An adapter cannot run below its ``dim``.
+    """
+    if lora_dim == 1:
+        return {}
+    index: dict[torch.Tensor, torch.Tensor] = {}
+    # Validate as if padding by one rank: the checks do not depend on how far.
+    for _, adapter in _paddable_pairs(model, lora_dim - 1, lora_dim):
+        in_index, out_index = rank_indices(adapter)
+        index[adapter.linear_in.weight] = in_index
+        index[adapter.linear_out.weight] = out_index
+    return index
