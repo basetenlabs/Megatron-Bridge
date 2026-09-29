@@ -881,7 +881,7 @@ class TestExportAdapterCkpt:
         with patch("megatron.bridge.peft.active_dim.set_lora_active_dim") as set_active_dim:
             bridge.export_adapter_ckpt(str(ckpt_dir), tmp_path / "out", active_dim=4)
         model = bridge.to_megatron_provider.return_value.provide_distributed_model.return_value
-        set_active_dim.assert_called_once_with(model, 4)
+        set_active_dim.assert_called_once_with(model, 4, lora_dim=16)
         assert bridge.save_hf_adapter.call_args.kwargs["rank"] == 4
 
     def test_active_dim_is_left_alone_by_default(self, bridge, ckpt_dir, tmp_path):
@@ -1205,6 +1205,7 @@ class TestExportAdapterScript:
             sequence_parallel=False,
             dtype=torch.bfloat16,
             exclude_adapter_base_prefix=[],
+            active_dim=None,
         )
 
         with (
@@ -1231,6 +1232,7 @@ class TestExportAdapterScript:
             sequence_parallel=False,
             dtype=torch.float32,
             exclude_adapter_base_prefix=["mtp.layers"],
+            active_dim=None,
         )
         bridge = MagicMock()
 
@@ -1248,6 +1250,7 @@ class TestExportAdapterScript:
             peft_checkpoint=str(tmp_path),
             output_path=tmp_path / "out",
             exclude_adapter_base_prefixes=("mtp.layers",),
+            active_dim=None,
         )
 
     def test_configure_cuda_device_requires_cuda(self):
@@ -1287,6 +1290,7 @@ class TestExportAdapterScript:
             sequence_parallel=False,
             dtype=torch.float32,
             exclude_adapter_base_prefix=[],
+            active_dim=None,
         )
 
         with (
@@ -1317,6 +1321,7 @@ class TestExportAdapterScript:
             sequence_parallel=False,
             dtype=torch.float32,
             exclude_adapter_base_prefix=[],
+            active_dim=None,
         )
         model_chunks = [MagicMock(), MagicMock()]
         for chunk in model_chunks:
@@ -1368,6 +1373,7 @@ class TestExportAdapterScript:
             sequence_parallel=False,
             dtype=torch.float32,
             exclude_adapter_base_prefix=[],
+            active_dim=None,
         )
         model_chunk = MagicMock()
         model_chunk.to.return_value = model_chunk
@@ -1424,6 +1430,7 @@ class TestExportAdapterScript:
             sequence_parallel=False,
             dtype=torch.float32,
             exclude_adapter_base_prefix=[],
+            active_dim=None,
         )
         model_chunk = MagicMock()
         model_chunk.to.return_value = model_chunk

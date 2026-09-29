@@ -756,6 +756,13 @@ def rank_padding_masks(adapter: nn.Module, rank: int) -> Tuple[torch.Tensor, tor
     A column-parallel adapter shards ``linear_in`` along the rank axis across TP, so
     this rank's local rows start at ``tp_rank * local_rows`` in the global rank space.
     ``linear_out`` always holds the full rank axis.
+
+    Args:
+        adapter: A LoRA adapter with ``linear_in``/``linear_out`` weights, ``dim`` and ``tp_group``.
+        rank: The global rank index where padding starts.
+
+    Returns:
+        Boolean masks shaped like this rank's local ``linear_in`` and ``linear_out`` weights.
     """
     linear_in = adapter.linear_in.weight
     linear_out = adapter.linear_out.weight

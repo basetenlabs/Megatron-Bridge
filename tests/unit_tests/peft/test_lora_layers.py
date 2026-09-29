@@ -553,7 +553,7 @@ class TestTEFusedLoRALinear:
         fused_lora = TEFusedLoRALinear(te_linear, parallel_linear_adapter)
         with torch.no_grad():
             parallel_linear_adapter.linear_out.weight.normal_()
-            for weight, mask in lora_padding_masks(fused_lora, 2).items():
+            for weight, mask in lora_padding_masks(fused_lora, 2, lora_dim=4).items():
                 weight.masked_fill_(mask, 0)
         reference = LoRALinear(te_linear, parallel_linear_adapter)
         x = torch.randn(3, 10, device="cuda")
@@ -565,10 +565,10 @@ class TestTEFusedLoRALinear:
         # TE's fused ops differ from the unfused path at ~1e-3; a stale scale would be off by 2x.
         tolerance = {"rtol": 1e-2, "atol": 1e-2}
         for rank in (4, 2, 4):
-            set_lora_active_dim(fused_lora, rank)
+            set_lora_active_dim(fused_lora, rank, lora_dim=4)
             torch.testing.assert_close(_output(fused_lora), _output(reference), **tolerance)
         delta_at_4 = _output(reference) - _output(te_linear)
-        set_lora_active_dim(fused_lora, 2)
+        set_lora_active_dim(fused_lora, 2, lora_dim=4)
         torch.testing.assert_close(_output(fused_lora) - _output(te_linear), 2 * delta_at_4, **tolerance)
 
     def test_fused_lora_linear_unsupported_normalization(self, te_linear, parallel_linear_adapter):

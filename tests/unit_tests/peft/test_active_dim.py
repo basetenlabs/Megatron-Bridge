@@ -52,13 +52,13 @@ def _trained_pair():
     base = nn.Linear(24, 20)
     native = _lora(base, RANK)
     padded = _lora(base, DIM)
-    masks = lora_padding_masks(padded, RANK)
+    masks = lora_padding_masks(padded, RANK, lora_dim=DIM)
     with torch.no_grad():
         for weight, mask in masks.items():
             weight.masked_fill_(mask, 0)
         padded.adapter.linear_in.weight[:RANK] = native.adapter.linear_in.weight
         padded.adapter.linear_out.weight[:, :RANK] = native.adapter.linear_out.weight
-    set_lora_active_dim(padded, RANK)
+    set_lora_active_dim(padded, RANK, lora_dim=DIM)
 
     optimizers = [
         torch.optim.AdamW([p for p in m.parameters() if p.requires_grad], lr=1e-2, weight_decay=0.1)
@@ -103,10 +103,10 @@ def test_padding_stays_exactly_zero_in_weights_grads_and_moments():
 def test_active_dim_sets_the_scale():
     base = nn.Linear(8, 8)
     lora = _lora(base, DIM)
-    set_lora_active_dim(lora, RANK)
+    set_lora_active_dim(lora, RANK, lora_dim=DIM)
     assert lora.adapter.scale == 32 / RANK
-    assert get_lora_active_dim(lora) == RANK
-    set_lora_active_dim(lora, DIM)
+    assert get_lora_active_dim(lora, lora_dim=DIM) == RANK
+    set_lora_active_dim(lora, DIM, lora_dim=DIM)
     assert lora.adapter.scale == 32 / DIM
 
 
@@ -117,9 +117,9 @@ class _Unpaddable(LinearAdapter):
 def test_rejects_unpaddable_adapters_and_out_of_range_ranks():
     base = nn.Linear(8, 8)
     with pytest.raises(NotImplementedError):
-        set_lora_active_dim(LoRALinear(base, _Unpaddable(base, dim=DIM)), RANK)
+        set_lora_active_dim(LoRALinear(base, _Unpaddable(base, dim=DIM)), RANK, lora_dim=DIM)
     with pytest.raises(ValueError):
-        set_lora_active_dim(_lora(base, DIM), DIM + 1)
+        set_lora_active_dim(_lora(base, DIM), DIM + 1, lora_dim=DIM)
 
 
 def test_only_adapters_with_a_known_padding_layout_are_paddable():
@@ -134,7 +134,7 @@ def test_a_refusal_leaves_every_adapter_untouched():
     base = nn.Linear(8, 8)
     model = nn.Sequential(_lora(base, DIM), LoRALinear(base, _Unpaddable(base, dim=DIM)))
     with pytest.raises(NotImplementedError):
-        set_lora_active_dim(model, RANK)
+        set_lora_active_dim(model, RANK, lora_dim=DIM)
     assert model[0].adapter.active_dim == DIM
 
 
@@ -143,16 +143,20 @@ def test_canonical_lora_dicts_run_every_projection_at_the_rank():
     lora = LoRALinear(
         base, nn.ModuleDict({"adapter_q": LinearAdapter(base, dim=DIM), "adapter_k": LinearAdapter(base, dim=DIM)})
     )
-    set_lora_active_dim(lora, RANK)
+    set_lora_active_dim(lora, RANK, lora_dim=DIM)
     assert [adapter.active_dim for adapter in lora.adapter.values()] == [RANK, RANK]
-    assert get_lora_active_dim(lora) == RANK
-    assert len(lora_padding_masks(lora, RANK)) == 4
+    assert get_lora_active_dim(lora, lora_dim=DIM) == RANK
+    assert len(lora_padding_masks(lora, RANK, lora_dim=DIM)) == 4
 
 
 def test_multi_lora_wrappers_are_refused():
     wrapper = MultiLoRALinear.__new__(MultiLoRALinear)
     nn.Module.__init__(wrapper)
-    for call in (get_lora_active_dim, lambda m: set_lora_active_dim(m, RANK), lambda m: lora_padding_masks(m, RANK)):
+    for call in (
+        lambda m: get_lora_active_dim(m, lora_dim=DIM),
+        lambda m: set_lora_active_dim(m, RANK, lora_dim=DIM),
+        lambda m: lora_padding_masks(m, RANK, lora_dim=DIM),
+    ):
         with pytest.raises(NotImplementedError, match="rank_values"):
             call(nn.Sequential(wrapper))
 
@@ -165,7 +169,7 @@ def test_effective_weight_uses_the_active_rank_scale():
 def test_effective_weight_keeps_the_allocated_dim_for_the_tp_layout(monkeypatch):
     """LoRAMerge detects the TP layout from ``dim``; the scale is passed separately."""
     lora = _lora(nn.Linear(8, 8), DIM)
-    set_lora_active_dim(lora, RANK)
+    set_lora_active_dim(lora, RANK, lora_dim=DIM)
     calls = []
 
     def _merge(self, base_weight, linear_out, linear_in, alpha, dim, *, tp_group, scale=None):
@@ -183,11 +187,11 @@ def test_rejects_an_activation_between_the_factors():
     lora.adapter.activation = nn.Sigmoid()
     lora.adapter.base_linear_name = "linear_fc1"
     with pytest.raises(NotImplementedError, match="identity activation"):
-        set_lora_active_dim(lora, RANK)
+        set_lora_active_dim(lora, RANK, lora_dim=DIM)
     with pytest.raises(NotImplementedError, match="identity activation"):
-        lora_padding_masks(lora, RANK)
+        lora_padding_masks(lora, RANK, lora_dim=DIM)
     lora.adapter.activation = nn.Identity()
-    set_lora_active_dim(lora, RANK)
+    set_lora_active_dim(lora, RANK, lora_dim=DIM)
 
 
 class _Group:
@@ -223,13 +227,13 @@ def test_reduced_dim_adapters_keep_their_own_dim_and_refuse_padding():
     """normalize_moe_lora gives expert adapters dim / topk; the LoRA rank is the largest dim."""
     base = nn.Linear(8, 8)
     model = nn.Sequential(_lora(base, DIM), _lora(base, RANK))
-    assert get_lora_active_dim(model) == DIM
-    set_lora_active_dim(model, DIM)
-    assert lora_padding_masks(model, DIM) == {}
+    assert get_lora_active_dim(model, lora_dim=DIM) == DIM
+    set_lora_active_dim(model, DIM, lora_dim=DIM)
+    assert lora_padding_masks(model, DIM, lora_dim=DIM) == {}
     with pytest.raises(NotImplementedError, match="reduced dim"):
-        set_lora_active_dim(model, RANK)
+        set_lora_active_dim(model, RANK, lora_dim=DIM)
     with pytest.raises(NotImplementedError, match="reduced dim"):
-        lora_padding_masks(model, RANK)
+        lora_padding_masks(model, RANK, lora_dim=DIM)
     assert [m.adapter.active_dim for m in model] == [DIM, RANK]
 
 
@@ -237,6 +241,16 @@ def test_captured_cuda_graphs_are_refused():
     lora = _lora(nn.Linear(8, 8), DIM)
     lora.to_wrap.config = SimpleNamespace(cuda_graph_impl="local")
     with pytest.raises(NotImplementedError, match="CUDA graph"):
-        set_lora_active_dim(lora, RANK)
+        set_lora_active_dim(lora, RANK, lora_dim=DIM)
+    lora.to_wrap.config = SimpleNamespace(cuda_graph_impl="none", enable_cuda_graph=True)
+    with pytest.raises(NotImplementedError, match="CUDA graph"):
+        set_lora_active_dim(lora, RANK, lora_dim=DIM)
     lora.to_wrap.config = SimpleNamespace(cuda_graph_impl="none")
-    set_lora_active_dim(lora, RANK)
+    set_lora_active_dim(lora, RANK, lora_dim=DIM)
+
+
+def test_a_pipeline_stage_without_adapters_is_a_no_op():
+    stage = nn.Sequential(nn.Linear(8, 8))
+    set_lora_active_dim(stage, RANK, lora_dim=DIM)
+    assert lora_padding_masks(stage, RANK, lora_dim=DIM) == {}
+    assert get_lora_active_dim(stage, lora_dim=DIM) == DIM

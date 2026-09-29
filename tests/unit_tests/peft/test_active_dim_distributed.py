@@ -80,9 +80,9 @@ def _padded_adapter(pg_collection, base_linear_name: str, *, input_is_parallel: 
     with torch.no_grad():
         for parameter in adapter.parameters():
             parameter.normal_()
-        for weight, mask in lora_padding_masks(model, _RANK).items():
+        for weight, mask in lora_padding_masks(model, _RANK, lora_dim=_DIM).items():
             weight.masked_fill_(mask, 0)
-    set_lora_active_dim(model, _RANK)
+    set_lora_active_dim(model, _RANK, lora_dim=_DIM)
     return model
 
 
@@ -158,7 +158,7 @@ def test_forward_scales_by_the_active_dim_and_padding_gets_no_gradient(
     torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
 
     output.square().sum().backward()
-    for weight, mask in lora_padding_masks(model, _RANK).items():
+    for weight, mask in lora_padding_masks(model, _RANK, lora_dim=_DIM).items():
         assert weight.grad is not None
         assert torch.all(weight.grad[mask] == 0)
         # At TP=2 a column-parallel linear_in shard on rank 1 holds only padding rows.

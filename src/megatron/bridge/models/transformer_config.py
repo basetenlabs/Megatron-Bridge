@@ -88,14 +88,14 @@ def _set_moe_expert_tensor_parallel_default(config: MCoreTransformerConfig) -> N
         config.expert_tensor_parallel_size = 1
 
 
-def _enable_safe_hybridep_dispatch(config: MCoreTransformerConfig) -> None:
-    """Ensure eager HybridEP can dispatch different token counts across ranks.
+def cuda_graphs_are_enabled(config: object) -> bool:
+    """Whether a Megatron config captures CUDA graphs, through any current or legacy field.
 
-    Bridge model configs are finalized before runtime batches expose whether their
-    THD token counts differ by rank. HybridEP requires equal dispatch shapes, so use
-    Megatron Core's padding path for eager Bridge-configured HybridEP dispatchers.
-    CUDA-graph configs retain their explicit setting because the padding path's host
-    scalar synchronization is not capture-safe; those configs require equal inputs.
+    Args:
+        config: A Megatron ``TransformerConfig`` (or anything with its CUDA-graph fields).
+
+    Returns:
+        True when any CUDA-graph capture mode is on.
     """
 
     def _uses_legacy_full_iteration(value: object) -> bool:
@@ -107,14 +107,26 @@ def _enable_safe_hybridep_dispatch(config: MCoreTransformerConfig) -> None:
             for item in values
         )
 
-    cuda_graph_impl = getattr(config, "cuda_graph_impl", "none")
-    cuda_graphs_enabled = (
-        cuda_graph_impl not in (None, "none")
+    return bool(
+        getattr(config, "cuda_graph_impl", "none") not in (None, "none")
         or getattr(config, "enable_cuda_graph", False)
         or getattr(config, "external_cuda_graph", False)
         or _uses_legacy_full_iteration(getattr(config, "cuda_graph_modules", None))
         or _uses_legacy_full_iteration(getattr(config, "cuda_graph_scope", None))
     )
+
+
+def _enable_safe_hybridep_dispatch(config: MCoreTransformerConfig) -> None:
+    """Ensure eager HybridEP can dispatch different token counts across ranks.
+
+    Bridge model configs are finalized before runtime batches expose whether their
+    THD token counts differ by rank. HybridEP requires equal dispatch shapes, so use
+    Megatron Core's padding path for eager Bridge-configured HybridEP dispatchers.
+    CUDA-graph configs retain their explicit setting because the padding path's host
+    scalar synchronization is not capture-safe; those configs require equal inputs.
+    """
+
+    cuda_graphs_enabled = cuda_graphs_are_enabled(config)
     if (
         config.moe_token_dispatcher_type != "flex"
         or config.moe_flex_dispatcher_backend != "hybridep"

@@ -1687,7 +1687,7 @@ class AutoBridge(Generic[MegatronModelT]):
             model_key = "model" if "model" in loaded_sd else next(k for k in loaded_sd if k.startswith("model"))
             model[0].load_state_dict(loaded_sd[model_key], strict=False)
             if active_dim is not None:
-                set_lora_active_dim(model, active_dim)
+                set_lora_active_dim(model, active_dim, lora_dim=lora.dim)
 
             # Export
             base_model_name = str(

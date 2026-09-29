@@ -51,6 +51,7 @@ from megatron.core import dist_checkpointing, parallel_state
 from transformers import AutoConfig
 
 from megatron.bridge import AutoBridge
+from megatron.bridge.peft.active_dim import set_lora_active_dim
 from megatron.bridge.peft.lora import LoRA, VLMLoRA
 from megatron.bridge.peft.utils import enable_legacy_shared_expert_adapter_loading
 from megatron.bridge.training.checkpointing import (
@@ -97,6 +98,12 @@ def parse_args() -> argparse.Namespace:
         help="Megatron-Bridge distributed checkpoint containing LoRA adapter weights.",
     )
     parser.add_argument("--output", type=Path, default=Path("./my_adapter"))
+    parser.add_argument(
+        "--active-dim",
+        type=int,
+        default=None,
+        help="Rank the LoRA was trained at when it ran below its allocated dim (the checkpoint does not record it).",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument(
         "--dtype",
@@ -224,6 +231,8 @@ def _export_adapter_distributed(args: argparse.Namespace) -> None:
         )
         model_key = _get_loaded_model_key(loaded_sd, ckpt_path)
         model[0].load_state_dict(loaded_sd[model_key], strict=False)
+        if args.active_dim is not None:
+            set_lora_active_dim(model, args.active_dim, lora_dim=lora.dim)
 
         bridge.save_hf_adapter(
             model,
@@ -231,6 +240,7 @@ def _export_adapter_distributed(args: argparse.Namespace) -> None:
             peft_config=lora,
             base_model_name_or_path=args.hf_model_path,
             exclude_adapter_base_prefixes=tuple(args.exclude_adapter_base_prefix),
+            rank=args.active_dim,
         )
     finally:
         if parallel_state.is_initialized():
@@ -253,6 +263,7 @@ def main() -> None:
             peft_checkpoint=args.lora_checkpoint,
             output_path=args.output,
             exclude_adapter_base_prefixes=tuple(args.exclude_adapter_base_prefix),
+            active_dim=args.active_dim,
         )
 
 

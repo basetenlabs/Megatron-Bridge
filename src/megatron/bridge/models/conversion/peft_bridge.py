@@ -583,8 +583,9 @@ class MegatronPeftBridge:
           requires_expert_splits, alpha, dim, pp_rank, vp_stage)
         across all pipeline parallel ranks.
 
-        Cached after the first call, so it holds only what cannot change at runtime;
-        see :meth:`_gather_adapter_active_dims` for ``active_dim``."""
+        Cached after the first call, so ``alpha`` here is only a placeholder that keeps
+        the tuples identical across ranks; see :meth:`_gather_adapter_runtime_attrs`
+        for the values that change at runtime."""
         # Cache the result after first call
         if hasattr(self, "_cached_param_objects_adapter"):
             return self._cached_param_objects_adapter
@@ -667,32 +668,33 @@ class MegatronPeftBridge:
 
         return gathered_global_param_objects
 
-    def _gather_adapter_active_dims(
+    def _gather_adapter_runtime_attrs(
         self,
         megatron_model: List[MegatronModel],
         adapters_info: List[tuple[str, str, bool, bool, bool, int, int, int, int]],
-    ) -> Dict[str, int]:
-        """Read every adapter's current ``active_dim``, keyed by global adapter name.
+    ) -> Dict[str, tuple[float, int]]:
+        """Read every adapter's current ``(alpha, active_dim)``, keyed by global adapter name.
 
-        ``active_dim`` changes at runtime (``peft.active_dim.set_lora_active_dim``), so
-        unlike the adapter info it is read on each call. Each pipeline rank reads the
-        adapters it owns, and the ranks exchange them so every rank can cut padding.
+        Both change at runtime (``peft.active_dim.set_lora_active_dim``, and multi-LoRA's
+        ``expose_adapter_slot`` for ``alpha``), so unlike the adapter info they are read on
+        each call. Each pipeline rank reads the adapters it owns, and the ranks exchange
+        them so every rank can cut padding and scale merges.
         """
         pp_group = parallel_state.get_pipeline_model_parallel_group()
         pp_rank = get_pg_rank(pp_group)
-        local: Dict[str, int] = {}
+        local: Dict[str, tuple[float, int]] = {}
         for global_base_name, local_base_prefix, *_, owner_pp_rank, vp_stage in adapters_info:
             if owner_pp_rank != pp_rank:
                 continue
             adapter, _ = self._get_adapter_wrap_module(local_base_prefix, megatron_model, vp_stage)
             if isinstance(adapter, ModuleDict):
                 adapter = adapter[global_base_name.rpartition(".")[2]]
-            local[global_base_name] = adapter.active_dim
+            local[global_base_name] = (adapter.alpha, adapter.active_dim)
         if pp_group.size() == 1:
             return local
-        gathered: List[Dict[str, int]] = [{} for _ in range(pp_group.size())]
+        gathered: List[Dict[str, tuple[float, int]]] = [{} for _ in range(pp_group.size())]
         torch.distributed.all_gather_object(gathered, local, group=pp_group)
-        return {name: active_dim for part in gathered for name, active_dim in part.items()}
+        return {name: attrs for part in gathered for name, attrs in part.items()}
 
     def _construct_adapters_names(self, prefix: str, adapter_key: Optional[str]) -> tuple[str, str]:
         """Build linear_in/linear_out parameter names for an adapter.
@@ -731,7 +733,7 @@ class MegatronPeftBridge:
             megatron_model = [megatron_model]
 
         adapters_info = self._megatron_global_adapters_info_all_pp_ranks(megatron_model)
-        active_dims = self._gather_adapter_active_dims(megatron_model, adapters_info)
+        runtime_attrs = self._gather_adapter_runtime_attrs(megatron_model, adapters_info)
         tasks_by_base: Dict[str, List[AdapterWeightConversionTask]] = defaultdict(list)  # type: ignore[name-defined]
         excluded_prefixes = tuple(exclude_adapter_base_prefixes or ())
 
@@ -831,9 +833,9 @@ class MegatronPeftBridge:
                 AdapterWeightConversionTask(
                     global_base_prefix=global_base_prefix,
                     adapter_key=adapter_key,
-                    alpha=alpha,
+                    alpha=runtime_attrs[global_base_name][0],
                     dim=dim,
-                    active_dim=active_dims[global_base_name],
+                    active_dim=runtime_attrs[global_base_name][1],
                     requires_expert_splits=requires_expert_splits,
                     linear_in_task=linear_in_task,
                     linear_out_task=linear_out_task,

@@ -35,6 +35,8 @@ from megatron.bridge.models.conversion.param_mapping import (
     merge_qkv_weights,
 )
 from megatron.bridge.models.conversion.peft_bridge import AdapterWeight
+from megatron.bridge.peft.canonical_lora import ModuleDict
+from megatron.bridge.peft.lora_layers import LinearAdapter
 
 
 class _SingleRankGroup:
@@ -2719,3 +2721,68 @@ def test_materialize_refuses_padded_grouped_expert_adapters(monkeypatch):
     monkeypatch.setattr(bridge, "_materialize_grouped_expert_adapter_tensor", lambda *_a, **_k: torch.zeros(2, 4, 3))
     with pytest.raises(NotImplementedError, match="grouped expert"):
         bridge.materialize_adapter_weights([task])
+
+
+class _TwoStageGroup:
+    def size(self) -> int:
+        return 2
+
+    def rank(self) -> int:
+        return 0
+
+
+def test_runtime_attrs_are_exchanged_across_pipeline_stages(monkeypatch):
+    """Stage 0 reads its own canonical adapter; stage 1's adapter arrives through the gather."""
+    bridge = DummyBridge()
+    adapters_info = [
+        (
+            "decoder.layers.0.self_attention.linear_qkv.adapter.adapter_q",
+            "decoder.layers.0.self_attention.linear_qkv",
+            False,
+            False,
+            False,
+            8,
+            16,
+            0,
+            0,
+        ),
+        (
+            "decoder.layers.9.mlp.linear_fc1.adapter",
+            "decoder.layers.1.mlp.linear_fc1",
+            False,
+            False,
+            False,
+            8,
+            16,
+            1,
+            0,
+        ),
+    ]
+    base = torch.nn.Linear(4, 4)
+    canonical = ModuleDict({key: LinearAdapter(base, dim=16, alpha=8) for key in ("adapter_q", "adapter_k")})
+    canonical["adapter_q"].active_dim = 4
+    lookups = []
+
+    def wrap_module(local_base_prefix, megatron_model, vp_stage):
+        lookups.append(local_base_prefix)
+        return canonical, None
+
+    def all_gather_object(output, obj, group=None):
+        output[0] = obj
+        output[1] = {"decoder.layers.9.mlp.linear_fc1.adapter": (8, 4)}
+
+    monkeypatch.setattr(
+        "megatron.bridge.models.conversion.peft_bridge.parallel_state.get_pipeline_model_parallel_group",
+        lambda: _TwoStageGroup(),
+    )
+    monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
+    monkeypatch.setattr("torch.distributed.all_gather_object", all_gather_object)
+    monkeypatch.setattr(bridge, "_get_adapter_wrap_module", wrap_module)
+
+    attrs = bridge._gather_adapter_runtime_attrs([Mock()], adapters_info)
+
+    assert lookups == ["decoder.layers.0.self_attention.linear_qkv"]
+    assert attrs == {
+        "decoder.layers.0.self_attention.linear_qkv.adapter.adapter_q": (8, 4),
+        "decoder.layers.9.mlp.linear_fc1.adapter": (8, 4),
+    }
