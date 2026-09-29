@@ -446,6 +446,38 @@ class TestSaveHfAdapter:
         assert "target_parameters" not in cfg
         assert cfg["base_model_name_or_path"] == "test/model"
 
+    @pytest.mark.parametrize(
+        ("rank", "expected_r", "expected_pattern"),
+        [(4, 4, {}), (None, 8, {"model.layers.0.self_attn.q_proj": 4, "model.layers.0.self_attn.v_proj": 4})],
+    )
+    def test_save_writes_the_rank_of_an_adapter_run_below_its_dim(self, tmp_path, rank, expected_r, expected_pattern):
+        """An adapter padded to dim=8 but trained at rank 4 exports rank-4 tensors; either config scales by alpha/4."""
+        from megatron.bridge.peft.lora import LoRA
+
+        output_dir = tmp_path / "adapter_out"
+        mock_bridge = MagicMock()
+        mock_bridge.export_adapter_weights.return_value = iter(
+            [
+                _adapter_export("model.layers.0.self_attn.q_proj.lora_A.weight", torch.randn(4, 64)),
+                _adapter_export("model.layers.0.self_attn.q_proj.lora_B.weight", torch.randn(64, 4)),
+                _adapter_export("model.layers.0.self_attn.v_proj.lora_A.weight", torch.randn(4, 64)),
+                _adapter_export("model.layers.0.self_attn.v_proj.lora_B.weight", torch.randn(64, 4)),
+            ]
+        )
+        mock_bridge.hf_pretrained = _ToyAdapterModel(model_name_or_path="test/model")
+
+        with patch("torch.distributed.is_initialized", return_value=False):
+            from megatron.bridge.models.conversion.auto_bridge import AutoBridge
+
+            AutoBridge.save_hf_adapter(
+                mock_bridge, model=[MagicMock()], path=output_dir, peft_config=LoRA(dim=8, alpha=16), rank=rank
+            )
+
+        cfg = json.loads((output_dir / "adapter_config.json").read_text())
+        assert cfg["r"] == expected_r
+        assert cfg["rank_pattern"] == expected_pattern
+        assert cfg["lora_alpha"] == 16
+
     def test_save_preserves_adapter_dtype_and_detaches(self, tmp_path):
         """save_hf_adapter should write detached adapter tensors in their exported dtype."""
         from safetensors.torch import load_file
@@ -843,6 +875,19 @@ class TestExportAdapterCkpt:
         assert Path(kw.kwargs.get("path", kw.args[1] if len(kw.args) > 1 else None)) == output
         assert kw.kwargs.get("base_model_name_or_path") == "test-org/test-model"
         assert kw.kwargs.get("show_progress") is False
+
+    def test_active_dim_is_set_before_export(self, bridge, ckpt_dir, tmp_path):
+        """The checkpoint does not record active_dim, so the caller's value is applied before export."""
+        with patch("megatron.bridge.peft.active_dim.set_lora_active_dim") as set_active_dim:
+            bridge.export_adapter_ckpt(str(ckpt_dir), tmp_path / "out", active_dim=4)
+        model = bridge.to_megatron_provider.return_value.provide_distributed_model.return_value
+        set_active_dim.assert_called_once_with(model, 4)
+        assert bridge.save_hf_adapter.call_args.kwargs["rank"] == 4
+
+    def test_active_dim_is_left_alone_by_default(self, bridge, ckpt_dir, tmp_path):
+        with patch("megatron.bridge.peft.active_dim.set_lora_active_dim") as set_active_dim:
+            bridge.export_adapter_ckpt(str(ckpt_dir), tmp_path / "out")
+        set_active_dim.assert_not_called()
 
     def test_lora_config_parsed_from_run_config(self, bridge, ckpt_dir, tmp_path):
         """LoRA dim/alpha/dropout read from run_config.yaml; extra keys filtered out."""

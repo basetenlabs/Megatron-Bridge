@@ -690,6 +690,7 @@ def test_megatron_global_adapters_info_all_pp_ranks(monkeypatch):
             self.base_linear_is_parallel = False
             self.alpha = 8
             self.dim = 2
+            self.active_dim = 2
 
     class FakeModel:
         def __init__(self):
@@ -749,6 +750,7 @@ def test_megatron_global_adapters_info_all_pp_ranks(monkeypatch):
         requires_expert_splits,
         alpha,
         dim,
+        active_dim,
         pp_rank,
         vp_stage,
     ) = info[0]
@@ -756,7 +758,7 @@ def test_megatron_global_adapters_info_all_pp_ranks(monkeypatch):
     assert local_base_prefix == "decoder.layers.0.mlp.linear_fc1"
     assert input_is_parallel is True and base_linear_is_parallel is False
     assert requires_expert_splits is False
-    assert alpha == 8 and dim == 2 and pp_rank == 0 and vp_stage == 0
+    assert alpha == 8 and dim == 2 and active_dim == 2 and pp_rank == 0 and vp_stage == 0
 
 
 def test_construct_adapters_names():
@@ -810,6 +812,7 @@ def test_build_adapter_conversion_tasks(monkeypatch):
             False,
             4,
             8,
+            8,
             0,
             0,
         )
@@ -862,6 +865,7 @@ def test_build_adapter_conversion_tasks_excludes_base_prefix_before_mapping(monk
             False,
             4,
             8,
+            8,
             0,
             0,
         )
@@ -894,6 +898,7 @@ def test_materialize_adapter_weights(monkeypatch):
             adapter_key=None,
             alpha=2,
             dim=4,
+            active_dim=4,
             linear_in_task=WeightConversionTask(
                 param_name="in_name",
                 global_param_name="in_name",
@@ -950,6 +955,7 @@ def test_materialize_adapter_weights_grouped_expert_fc1_uses_expert_tp_axis(monk
             adapter_key=None,
             alpha=2,
             dim=4,
+            active_dim=4,
             linear_in_task=WeightConversionTask(
                 param_name="in_name",
                 global_param_name="decoder.layers.0.mlp.experts.linear_fc1.adapter.linear_in.weight",
@@ -1025,6 +1031,7 @@ def test_materialize_adapter_weights_grouped_expert_fc2_uses_expert_tp_axis(monk
             adapter_key=None,
             alpha=2,
             dim=4,
+            active_dim=4,
             linear_in_task=WeightConversionTask(
                 param_name="in_name",
                 global_param_name="decoder.layers.0.mlp.experts.linear_fc2.adapter.linear_in.weight",
@@ -1069,6 +1076,7 @@ def test_materialize_adapter_weights_shared_expert_adapter_uses_regular_mapping(
             adapter_key=None,
             alpha=2,
             dim=4,
+            active_dim=4,
             linear_in_task=WeightConversionTask(
                 param_name="in_name",
                 global_param_name="decoder.layers.0.mlp.experts.linear_fc2.adapter.linear_in.weight",
@@ -1110,6 +1118,7 @@ def test_stream_adapter_weights_megatron_to_hf(monkeypatch):
         adapter_key=None,
         alpha=2,
         dim=4,
+        active_dim=4,
         linear_in_task=WeightConversionTask(
             param_name="local_in",
             global_param_name="decoder.layers.0.mlp.linear_fc1.adapter.linear_in.weight",
@@ -1175,6 +1184,7 @@ def test_stream_adapter_weights_megatron_to_hf_qkv(monkeypatch):
         adapter_key=None,
         alpha=2,
         dim=4,
+        active_dim=4,
         linear_in_task=WeightConversionTask(
             param_name="local_in",
             global_param_name="decoder.layers.0.self_attn.linear_qkv.adapter.linear_in.weight",
@@ -1251,6 +1261,7 @@ def test_stream_adapter_weights_megatron_to_hf_fused_fc1(monkeypatch):
         adapter_key=None,
         alpha=2,
         dim=4,
+        active_dim=4,
         linear_in_task=WeightConversionTask(
             param_name="local_in",
             global_param_name="decoder.layers.0.mlp.linear_fc1.adapter.linear_in.weight",
@@ -1323,6 +1334,7 @@ def test_stream_adapter_weights_megatron_to_hf_fused_fc1_minimax_w13(monkeypatch
         adapter_key=None,
         alpha=2,
         dim=4,
+        active_dim=4,
         linear_in_task=WeightConversionTask(
             param_name="local_in",
             global_param_name="decoder.layers.0.mlp.experts.linear_fc1.adapter.linear_in.weight",
@@ -1397,6 +1409,7 @@ def test_stream_adapter_weights_megatron_to_hf_packed_expert_stacks(monkeypatch)
         adapter_key=None,
         alpha=2,
         dim=4,
+        active_dim=4,
         linear_in_task=WeightConversionTask(
             param_name="local_in",
             global_param_name="decoder.layers.0.mlp.experts.linear_fc2.adapter.linear_in.weight",
@@ -1465,6 +1478,7 @@ def test_stream_adapter_weights_megatron_to_hf_grouped_expert_exports_per_expert
         adapter_key=None,
         alpha=2,
         dim=4,
+        active_dim=4,
         linear_in_task=WeightConversionTask(
             param_name="local_in",
             global_param_name="decoder.layers.0.mlp.experts.linear_fc2.adapter.linear_in.weight",
@@ -1529,6 +1543,7 @@ def test_stream_adapter_weights_megatron_to_hf_shared_outer_fc1_gate_up(monkeypa
         adapter_key=None,
         alpha=2,
         dim=4,
+        active_dim=4,
         linear_in_task=WeightConversionTask(
             param_name="local_in",
             global_param_name="decoder.layers.0.mlp.experts.linear_fc1.adapter.linear_in.weight",
@@ -1619,6 +1634,7 @@ def test_stream_adapter_weights_megatron_to_hf_shared_outer_fc2_down(monkeypatch
         adapter_key=None,
         alpha=2,
         dim=4,
+        active_dim=4,
         linear_in_task=WeightConversionTask(
             param_name="local_in",
             global_param_name="decoder.layers.0.mlp.experts.linear_fc2.adapter.linear_in.weight",
@@ -2023,6 +2039,7 @@ def test_stream_weights_megatron_to_hf_merges_grouped_expert_adapters(monkeypatc
         adapter_key=None,
         alpha=2,
         dim=2,
+        active_dim=2,
         linear_in_task=WeightConversionTask(
             param_name="local_in",
             global_param_name="decoder.layers.0.mlp.experts.linear_fc2.adapter.linear_in.weight",
@@ -2107,6 +2124,7 @@ def test_stream_weights_megatron_to_hf_merges_grouped_expert_adapters_before_tra
         adapter_key=None,
         alpha=1,
         dim=1,
+        active_dim=1,
         linear_in_task=WeightConversionTask(
             param_name="local_in",
             global_param_name="decoder.layers.0.mlp.experts.linear_fc2.adapter.linear_in.weight",
@@ -2259,6 +2277,7 @@ def test_stream_weights_megatron_to_hf_merges_shared_expert_fc1_adapters(monkeyp
         adapter_key=None,
         alpha=1,
         dim=1,
+        active_dim=1,
         linear_in_task=WeightConversionTask(
             param_name="local_in",
             global_param_name="language_model.decoder.layers.0.mlp.shared_experts.linear_fc1.adapter.linear_in.weight",
@@ -2340,6 +2359,7 @@ def test_stream_weights_megatron_to_hf_merges_shared_expert_fc2_adapters(monkeyp
         adapter_key=None,
         alpha=1,
         dim=1,
+        active_dim=1,
         linear_in_task=WeightConversionTask(
             param_name="local_in",
             global_param_name="language_model.decoder.layers.0.mlp.shared_experts.linear_fc2.adapter.linear_in.weight",
@@ -2419,6 +2439,7 @@ def test_stream_weights_megatron_to_hf_merges_router_adapters(monkeypatch):
         adapter_key=None,
         alpha=1,
         dim=1,
+        active_dim=1,
         linear_in_task=WeightConversionTask(
             param_name="local_in",
             global_param_name="language_model.decoder.layers.0.mlp.router.adapter.linear_in.weight",
@@ -2510,6 +2531,7 @@ def test_stream_weights_megatron_to_hf_merges_lora_before_quantization(monkeypat
         adapter_key=None,
         alpha=2,
         dim=2,
+        active_dim=2,
         linear_in_task=WeightConversionTask(
             param_name="local_in",
             global_param_name="language_model.decoder.layers.0.mlp.fc1.adapter.linear_in.weight",
@@ -2601,3 +2623,78 @@ def test_column_parallel_mapping_skips_ep_gather_for_adapters(monkeypatch):
 
     result = mapping.megatron_to_hf(torch.ones(2, 2), None)
     torch.testing.assert_close(result["hf_param"], torch.ones(2, 2))
+
+
+def _padded_task(active_dim, *, requires_expert_splits=False):
+    return AdapterWeightConversionTask(
+        global_base_prefix="decoder.layers.0.mlp.linear_fc1",
+        adapter_key=None,
+        alpha=8,
+        dim=4,
+        active_dim=active_dim,
+        requires_expert_splits=requires_expert_splits,
+        linear_in_task=WeightConversionTask(param_name="local_in", global_param_name="in", mapping=Mock()),
+        linear_out_task=WeightConversionTask(param_name="local_out", global_param_name="out", mapping=Mock()),
+    )
+
+
+def _padded_factors(rank, dim=4):
+    linear_in = torch.zeros(dim, 3)
+    linear_out = torch.zeros(5, dim)
+    linear_in[:rank] = torch.arange(1, 3 * rank + 1, dtype=torch.float32).reshape(rank, 3)
+    linear_out[:, :rank] = 2.0
+    return linear_in, linear_out
+
+
+def test_materialize_cuts_rank_padding_to_the_active_dim():
+    bridge = DummyBridge()
+    task = _padded_task(active_dim=2)
+    linear_in, linear_out = _padded_factors(2)
+    task.linear_in_task.mapping.megatron_to_hf.return_value = {"in": linear_in}
+    task.linear_out_task.mapping.megatron_to_hf.return_value = {"out": linear_out}
+
+    (weight,) = bridge.materialize_adapter_weights([task])
+
+    assert weight.dim == 2
+    torch.testing.assert_close(weight.linear_in_weight.weight, linear_in[:2])
+    torch.testing.assert_close(weight.linear_out_weight.weight, linear_out[:, :2])
+    assert weight.linear_in_weight.weight.untyped_storage().nbytes() == 2 * 3 * 4
+
+
+def test_merge_of_a_padded_adapter_matches_the_native_merge():
+    bridge = DummyBridge()
+    padded_task, native_task = _padded_task(active_dim=2), _padded_task(active_dim=2)
+    native_task = AdapterWeightConversionTask(**{**native_task.__dict__, "dim": 2})
+    for task, dim in ((padded_task, 4), (native_task, 2)):
+        linear_in, linear_out = _padded_factors(2, dim)
+        task.linear_in_task.mapping.megatron_to_hf.return_value = {"in": linear_in}
+        task.linear_out_task.mapping.megatron_to_hf.return_value = {"out": linear_out}
+    padded, native = bridge.materialize_adapter_weights([padded_task, native_task])
+    base = torch.zeros(5, 3)
+    merged = [
+        bridge._merge_single_adapter_weight(
+            base, w.alpha, w.dim, w.linear_in_weight.weight, w.linear_out_weight.weight
+        )
+        for w in (padded, native)
+    ]
+    torch.testing.assert_close(merged[0], merged[1])
+    torch.testing.assert_close(merged[0], (8 / 2) * torch.full((5, 2), 2.0) @ _padded_factors(2, 2)[0])
+
+
+def test_materialize_refuses_nonzero_rank_padding():
+    bridge = DummyBridge()
+    task = _padded_task(active_dim=2)
+    linear_in, linear_out = _padded_factors(2)
+    linear_out[0, 3] = 1e-3
+    task.linear_in_task.mapping.megatron_to_hf.return_value = {"in": linear_in}
+    task.linear_out_task.mapping.megatron_to_hf.return_value = {"out": linear_out}
+    with pytest.raises(ValueError, match="nonzero past active_dim=2"):
+        bridge.materialize_adapter_weights([task])
+
+
+def test_materialize_refuses_padded_grouped_expert_adapters(monkeypatch):
+    bridge = DummyBridge()
+    task = _padded_task(active_dim=2, requires_expert_splits=True)
+    monkeypatch.setattr(bridge, "_materialize_grouped_expert_adapter_tensor", lambda *_a, **_k: torch.zeros(2, 4, 3))
+    with pytest.raises(NotImplementedError, match="grouped expert"):
+        bridge.materialize_adapter_weights([task])

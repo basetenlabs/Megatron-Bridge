@@ -891,6 +891,7 @@ class AutoBridge(Generic[MegatronModelT]):
         base_model_name_or_path: Optional[str] = None,
         show_progress: bool = True,
         exclude_adapter_base_prefixes: Iterable[str] | None = None,
+        rank: int | None = None,
     ) -> None:
         """Save LoRA adapter weights as a HuggingFace PEFT-compatible directory.
 
@@ -909,6 +910,10 @@ class AutoBridge(Generic[MegatronModelT]):
             show_progress: Display progress bar during export.
             exclude_adapter_base_prefixes: Megatron adapter base prefixes to
                 skip before resolving HuggingFace parameter mappings.
+            rank: The ``r`` to write, for a LoRA run below its allocated ``dim``
+                (see ``megatron.bridge.peft.active_dim``). Its exported tensors are
+                already cut to that rank. ``None`` means ``peft_config.dim``;
+                targets at any other rank are listed in ``rank_pattern``.
 
         Example:
             >>> bridge.save_hf_adapter(
@@ -959,10 +964,9 @@ class AutoBridge(Generic[MegatronModelT]):
         adapter_state, module_adapter_keys, target_parameters = convert_adapter_weights_to_peft_state(
             raw_adapter_weights,
         )
-        rank_pattern = infer_rank_pattern_from_adapter_weights(
-            raw_adapter_weights,
-            default_rank=getattr(peft_config, "dim", 32),
-        )
+        if rank is None:
+            rank = getattr(peft_config, "dim", 32)
+        rank_pattern = infer_rank_pattern_from_adapter_weights(raw_adapter_weights, default_rank=rank)
 
         is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
         if is_rank0:
@@ -982,6 +986,7 @@ class AutoBridge(Generic[MegatronModelT]):
                 target_parameters=target_parameters,
                 base_model_name_or_path=base_model_name_or_path,
                 rank_pattern=rank_pattern,
+                rank=rank,
             )
 
             config_path = save_dir / "adapter_config.json"
@@ -1561,6 +1566,7 @@ class AutoBridge(Generic[MegatronModelT]):
         output_path: str | Path,
         show_progress: bool = True,
         exclude_adapter_base_prefixes: Iterable[str] | None = None,
+        active_dim: int | None = None,
     ) -> None:
         """Export LoRA adapter weights from a Megatron PEFT checkpoint to HuggingFace PEFT format.
 
@@ -1582,6 +1588,9 @@ class AutoBridge(Generic[MegatronModelT]):
             show_progress: Display progress bar during export.
             exclude_adapter_base_prefixes: Megatron adapter base prefixes to
                 skip before resolving HuggingFace parameter mappings.
+            active_dim: Rank the LoRA was trained at, when it ran below the
+                allocated ``dim`` (see ``megatron.bridge.peft.active_dim``). The
+                checkpoint does not record it. ``None`` means the full ``dim``.
 
         Example:
             >>> bridge = AutoBridge.from_hf_pretrained("meta-llama/Llama-3.2-1B")
@@ -1599,6 +1608,7 @@ class AutoBridge(Generic[MegatronModelT]):
 
         from megatron.core import dist_checkpointing
 
+        from megatron.bridge.peft.active_dim import set_lora_active_dim
         from megatron.bridge.peft.lora import LoRA, VLMLoRA
         from megatron.bridge.peft.utils import enable_legacy_shared_expert_adapter_loading
         from megatron.bridge.training.checkpointing import (
@@ -1676,6 +1686,8 @@ class AutoBridge(Generic[MegatronModelT]):
             )
             model_key = "model" if "model" in loaded_sd else next(k for k in loaded_sd if k.startswith("model"))
             model[0].load_state_dict(loaded_sd[model_key], strict=False)
+            if active_dim is not None:
+                set_lora_active_dim(model, active_dim)
 
             # Export
             base_model_name = str(
@@ -1689,6 +1701,7 @@ class AutoBridge(Generic[MegatronModelT]):
                 base_model_name_or_path=base_model_name,
                 show_progress=show_progress,
                 exclude_adapter_base_prefixes=exclude_adapter_base_prefixes,
+                rank=active_dim,
             )
 
         model_context = (

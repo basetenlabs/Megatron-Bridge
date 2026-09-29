@@ -106,6 +106,8 @@ class AdapterWeightConversionTask:
     adapter_key: Optional[str]
     alpha: int
     dim: int
+    # Rank the LoRA runs at (``<= dim``); rank indices past it are zero padding.
+    active_dim: int
     linear_in_task: "WeightConversionTask"
     linear_out_task: "WeightConversionTask"
     requires_expert_splits: bool = False
@@ -113,7 +115,11 @@ class AdapterWeightConversionTask:
 
 @dataclass(frozen=True)
 class AdapterWeight:
-    """Materialized adapter weights ready for merge."""
+    """Materialized adapter weights ready for merge.
+
+    ``dim`` is the rank of the materialized tensors: rank padding past the adapter's
+    ``active_dim`` is cut off when the weights are materialized.
+    """
 
     global_base_prefix: str
     adapter_key: Optional[str]
@@ -121,6 +127,28 @@ class AdapterWeight:
     dim: int
     linear_in_weight: "MegatronWeightTuple"
     linear_out_weight: "MegatronWeightTuple"
+
+
+def _cut_rank_padding(
+    adapter_task: AdapterWeightConversionTask, linear_in: torch.Tensor, linear_out: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cut gathered LoRA factors down to the adapter's ``active_dim``.
+
+    ``linear_in`` is ``[dim, in]`` and ``linear_out`` is ``[out, dim]`` once gathered over TP.
+    The cut entries are rank padding, so a nonzero there means the padding was not kept zero.
+    """
+    if adapter_task.requires_expert_splits:
+        raise NotImplementedError(f"{adapter_task.global_base_prefix}: grouped expert adapters cannot be rank padded")
+    rank, dim = adapter_task.active_dim, adapter_task.dim
+    if linear_in.shape[0] != dim or linear_out.shape[-1] != dim:
+        raise ValueError(
+            f"{adapter_task.global_base_prefix}: expected LoRA factors with rank {dim}, got "
+            f"linear_in {tuple(linear_in.shape)} and linear_out {tuple(linear_out.shape)}"
+        )
+    if torch.count_nonzero(linear_in[rank:]) or torch.count_nonzero(linear_out[:, rank:]):
+        raise ValueError(f"{adapter_task.global_base_prefix}: LoRA weights are nonzero past active_dim={rank}")
+    # Clone so the padded buffers are not kept alive by views.
+    return linear_in[:rank].clone(), linear_out[:, :rank].clone()
 
 
 def _select_hf_base_param_name(base_mapping, adapter_key: Optional[str], expected_suffix: str) -> Optional[str]:
@@ -549,10 +577,10 @@ class MegatronPeftBridge:
 
     def _megatron_global_adapters_info_all_pp_ranks(
         self, megatron_model: Union[MegatronModel, List[MegatronModel]]
-    ) -> List[tuple[str, str, bool, bool, bool, int, int, int, int]]:
+    ) -> List[tuple[str, str, bool, bool, bool, int, int, int, int, int]]:
         """Get all adapters' information tuple:
          (global_base_name, local_base_prefix, input_is_parallel, base_linear_is_parallel,
-          requires_expert_splits, alpha, dim, pp_rank, vp_stage)
+          requires_expert_splits, alpha, dim, active_dim, pp_rank, vp_stage)
         across all pipeline parallel ranks."""
         # Cache the result after first call
         if hasattr(self, "_cached_param_objects_adapter"):
@@ -615,6 +643,7 @@ class MegatronPeftBridge:
                         base_linear_is_parallel,
                         requires_expert_splits,
                         adapter.alpha,
+                        adapter.dim,
                         adapter.active_dim,
                         pp_rank,
                         vp_stage,
@@ -690,6 +719,7 @@ class MegatronPeftBridge:
             requires_expert_splits,
             alpha,
             dim,
+            active_dim,
             pp_rank,
             vp_stage,
         ) in adapters_info:
@@ -774,6 +804,7 @@ class MegatronPeftBridge:
                     adapter_key=adapter_key,
                     alpha=alpha,
                     dim=dim,
+                    active_dim=active_dim,
                     requires_expert_splits=requires_expert_splits,
                     linear_in_task=linear_in_task,
                     linear_out_task=linear_out_task,
@@ -810,12 +841,17 @@ class MegatronPeftBridge:
                 )
                 linear_out_tensor = next(iter(linear_out_dict.values()))
 
+            if adapter_task.active_dim != adapter_task.dim:
+                linear_in_tensor, linear_out_tensor = _cut_rank_padding(
+                    adapter_task, linear_in_tensor, linear_out_tensor
+                )
+
             materialized.append(
                 AdapterWeight(
                     global_base_prefix=adapter_task.global_base_prefix,
                     adapter_key=adapter_task.adapter_key,
                     alpha=adapter_task.alpha,
-                    dim=adapter_task.dim,
+                    dim=adapter_task.active_dim,
                     linear_in_weight=MegatronWeightTuple(
                         adapter_task.linear_in_task.param_name,
                         linear_in_tensor,
@@ -1428,7 +1464,7 @@ class MegatronPeftBridge:
             merged_weight = self._merge_single_adapter_weight(
                 base_weight,
                 target_adapter.alpha,
-                target_adapter.active_dim,
+                target_adapter.dim,
                 linear_in_weight,
                 linear_out_weight,
             )
@@ -1604,12 +1640,16 @@ def build_adapter_config_dict(
     target_parameters: Optional[List[str]] = None,
     base_model_name_or_path: Optional[str] = None,
     rank_pattern: Optional[Dict[str, int]] = None,
+    rank: int | None = None,
 ) -> Dict[str, object]:
     """Build an HF PEFT-compatible ``adapter_config.json`` dictionary.
 
     The returned dict can be serialised directly with ``json.dump`` and is
     loadable by ``peft.PeftModel.from_pretrained`` without any runtime
     dependency on the ``peft`` pip package.
+
+    ``rank`` is the exported ``r``; it defaults to ``peft_config.dim`` and differs
+    from it when the LoRA ran below its allocated dim.
     """
 
     from megatron.bridge.peft.dora import DoRA
@@ -1625,7 +1665,7 @@ def build_adapter_config_dict(
         "lora_alpha": getattr(peft_config, "alpha", 32),
         "lora_dropout": 0.0 if target_parameters else getattr(peft_config, "dropout", 0.0),
         "modules_to_save": None,
-        "r": getattr(peft_config, "dim", 32),
+        "r": getattr(peft_config, "dim", 32) if rank is None else rank,
         "rank_pattern": rank_pattern or {},
         "alpha_pattern": {},
         "target_modules": target_modules,
