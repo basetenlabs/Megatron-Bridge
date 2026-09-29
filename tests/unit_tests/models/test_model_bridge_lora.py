@@ -37,6 +37,21 @@ from megatron.bridge.models.conversion.param_mapping import (
 from megatron.bridge.models.conversion.peft_bridge import AdapterWeight
 
 
+class _SingleRankGroup:
+    def size(self) -> int:
+        return 1
+
+    def rank(self) -> int:
+        return 0
+
+
+def _single_pipeline_rank(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "megatron.bridge.models.conversion.peft_bridge.parallel_state.get_pipeline_model_parallel_group",
+        lambda: _SingleRankGroup(),
+    )
+
+
 class DummyBridge(MegatronModelBridge):
     def provider_bridge(self, hf_pretrained):  # pragma: no cover - not used in tests
         return None
@@ -750,7 +765,6 @@ def test_megatron_global_adapters_info_all_pp_ranks(monkeypatch):
         requires_expert_splits,
         alpha,
         dim,
-        active_dim,
         pp_rank,
         vp_stage,
     ) = info[0]
@@ -758,7 +772,7 @@ def test_megatron_global_adapters_info_all_pp_ranks(monkeypatch):
     assert local_base_prefix == "decoder.layers.0.mlp.linear_fc1"
     assert input_is_parallel is True and base_linear_is_parallel is False
     assert requires_expert_splits is False
-    assert alpha == 8 and dim == 2 and active_dim == 2 and pp_rank == 0 and vp_stage == 0
+    assert alpha == 8 and dim == 2 and pp_rank == 0 and vp_stage == 0
 
 
 def test_construct_adapters_names():
@@ -812,7 +826,6 @@ def test_build_adapter_conversion_tasks(monkeypatch):
             False,
             4,
             8,
-            8,
             0,
             0,
         )
@@ -823,8 +836,10 @@ def test_build_adapter_conversion_tasks(monkeypatch):
         linear_out=SimpleNamespace(weight=torch.ones(2, 2)),
         alpha=4,
         dim=8,
+        active_dim=8,
     )
 
+    _single_pipeline_rank(monkeypatch)
     monkeypatch.setattr(bridge, "_megatron_global_adapters_info_all_pp_ranks", lambda *_: adapters_info)
     monkeypatch.setattr(bridge, "_get_adapter_wrap_module", lambda *_: (adapter, None))
     monkeypatch.setattr(
@@ -846,6 +861,12 @@ def test_build_adapter_conversion_tasks(monkeypatch):
     tasks = tasks_by_base["decoder.layers.0.mlp.linear_fc1"]
     assert len(tasks) == 1
     task = tasks[0]
+    assert task.active_dim == 8
+
+    # The adapter info is cached for the bridge's lifetime; active_dim must still be read live.
+    adapter.active_dim = 3
+    (task,) = bridge.build_adapter_conversion_tasks([Mock()])["decoder.layers.0.mlp.linear_fc1"]
+    assert task.dim == 8 and task.active_dim == 3
     assert task.adapter_key is None
     assert task.linear_in_task.param_weight.shape == torch.Size([2, 2])
     assert task.linear_out_task.param_weight.shape == torch.Size([2, 2])
@@ -865,12 +886,12 @@ def test_build_adapter_conversion_tasks_excludes_base_prefix_before_mapping(monk
             False,
             4,
             8,
-            8,
             0,
             0,
         )
     ]
 
+    _single_pipeline_rank(monkeypatch)
     monkeypatch.setattr(bridge, "_megatron_global_adapters_info_all_pp_ranks", lambda *_: adapters_info)
     monkeypatch.setattr(bridge, "mapping_registry", lambda: MegatronMappingRegistry())
 

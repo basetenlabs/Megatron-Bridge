@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -217,3 +217,26 @@ def test_rank_sharded_linear_in_maps_local_rows_to_global_rank(tp_rank, padded_r
     assert in_mask[:, 0].nonzero().flatten().tolist() == padded_rows
     assert in_mask.all(dim=1).tolist() == in_mask.any(dim=1).tolist()
     assert out_mask[0].nonzero().flatten().tolist() == list(range(20, 32))
+
+
+def test_reduced_dim_adapters_keep_their_own_dim_and_refuse_padding():
+    """normalize_moe_lora gives expert adapters dim / topk; the LoRA rank is the largest dim."""
+    base = nn.Linear(8, 8)
+    model = nn.Sequential(_lora(base, DIM), _lora(base, RANK))
+    assert get_lora_active_dim(model) == DIM
+    set_lora_active_dim(model, DIM)
+    assert lora_padding_masks(model, DIM) == {}
+    with pytest.raises(NotImplementedError, match="reduced dim"):
+        set_lora_active_dim(model, RANK)
+    with pytest.raises(NotImplementedError, match="reduced dim"):
+        lora_padding_masks(model, RANK)
+    assert [m.adapter.active_dim for m in model] == [DIM, RANK]
+
+
+def test_captured_cuda_graphs_are_refused():
+    lora = _lora(nn.Linear(8, 8), DIM)
+    lora.to_wrap.config = SimpleNamespace(cuda_graph_impl="local")
+    with pytest.raises(NotImplementedError, match="CUDA graph"):
+        set_lora_active_dim(lora, RANK)
+    lora.to_wrap.config = SimpleNamespace(cuda_graph_impl="none")
+    set_lora_active_dim(lora, RANK)
