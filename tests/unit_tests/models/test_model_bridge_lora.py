@@ -765,7 +765,6 @@ def test_megatron_global_adapters_info_all_pp_ranks(monkeypatch):
         input_is_parallel,
         base_linear_is_parallel,
         requires_expert_splits,
-        alpha,
         dim,
         pp_rank,
         vp_stage,
@@ -774,7 +773,7 @@ def test_megatron_global_adapters_info_all_pp_ranks(monkeypatch):
     assert local_base_prefix == "decoder.layers.0.mlp.linear_fc1"
     assert input_is_parallel is True and base_linear_is_parallel is False
     assert requires_expert_splits is False
-    assert alpha == 8 and dim == 2 and pp_rank == 0 and vp_stage == 0
+    assert dim == 2 and pp_rank == 0 and vp_stage == 0
 
 
 def test_construct_adapters_names():
@@ -826,7 +825,6 @@ def test_build_adapter_conversion_tasks(monkeypatch):
             False,
             False,
             False,
-            4,
             8,
             0,
             0,
@@ -886,7 +884,6 @@ def test_build_adapter_conversion_tasks_excludes_base_prefix_before_mapping(monk
             False,
             False,
             False,
-            4,
             8,
             0,
             0,
@@ -2741,7 +2738,6 @@ def test_runtime_attrs_are_exchanged_across_pipeline_stages(monkeypatch):
             False,
             False,
             False,
-            8,
             16,
             0,
             0,
@@ -2752,7 +2748,6 @@ def test_runtime_attrs_are_exchanged_across_pipeline_stages(monkeypatch):
             False,
             False,
             False,
-            8,
             16,
             1,
             0,

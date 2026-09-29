@@ -69,15 +69,14 @@ def _paddable_pairs(
     if not 0 < active_dim <= lora_dim:
         raise ValueError(f"active_dim={active_dim} must be in (0, {lora_dim}]")
     pairs = list(_iter_adapters(model))
+    if active_dim == lora_dim:
+        return pairs
     for wrapper, adapter in pairs:
-        if adapter.dim > lora_dim:
-            raise ValueError(f"{type(adapter).__name__} has dim={adapter.dim} above lora_dim={lora_dim}")
-        if active_dim == lora_dim:
-            continue
         if adapter.dim != lora_dim:
+            # normalize_moe_lora experts run at dim / topk, rounded to expert-TP granularity.
             raise NotImplementedError(
-                f"{type(adapter).__name__} has dim={adapter.dim} below lora_dim={lora_dim}; "
-                "adapters with a reduced dim (normalize_moe_lora) cannot be rank padded"
+                f"{type(adapter).__name__} has dim={adapter.dim}, not lora_dim={lora_dim}; "
+                "adapters with a normalized dim (normalize_moe_lora) cannot be rank padded"
             )
         if not adapter.supports_rank_padding:
             raise NotImplementedError(f"{type(adapter).__name__} cannot run below its allocated dim={adapter.dim}")
@@ -96,7 +95,7 @@ def _paddable_pairs(
     return pairs
 
 
-def get_lora_active_dim(model: nn.Module | Sequence[nn.Module], *, lora_dim: int) -> int:
+def get_lora_active_dim(model: nn.Module | Sequence[nn.Module], *, lora_dim: int) -> int | None:
     """Return the rank the LoRA currently runs at.
 
     Args:
@@ -104,13 +103,13 @@ def get_lora_active_dim(model: nn.Module | Sequence[nn.Module], *, lora_dim: int
         lora_dim: The LoRA's allocated rank (the PEFT config's ``dim``).
 
     Returns:
-        The ``active_dim`` shared by every adapter allocated at ``lora_dim``, or
-        ``lora_dim`` when this pipeline stage has none.
+        The ``active_dim`` shared by every adapter allocated at ``lora_dim``, or ``None``
+        when this pipeline stage has none (it cannot tell which rank the LoRA runs at).
     """
     dims = {adapter.active_dim for _, adapter in _iter_adapters(model) if adapter.dim == lora_dim}
     if len(dims) > 1:
         raise ValueError(f"LoRA adapters run at {sorted(dims)}; expected one shared rank")
-    return dims.pop() if dims else lora_dim
+    return dims.pop() if dims else None
 
 
 def set_lora_active_dim(model: nn.Module | Sequence[nn.Module], active_dim: int, *, lora_dim: int) -> None:
@@ -129,7 +128,9 @@ def set_lora_active_dim(model: nn.Module | Sequence[nn.Module], active_dim: int,
         NotImplementedError: An adapter cannot run below its ``dim``.
     """
     for wrapper, adapter in _paddable_pairs(model, active_dim, lora_dim):
-        target = min(active_dim, adapter.dim)
+        # Restoring puts every adapter back at its own dim, which differs from lora_dim
+        # for normalized experts; padding only reaches adapters allocated at lora_dim.
+        target = adapter.dim if active_dim == lora_dim else active_dim
         if adapter.active_dim == target:
             continue
         adapter.active_dim = target
@@ -157,9 +158,10 @@ def lora_padding_masks(
         NotImplementedError: An adapter cannot run below its ``dim``.
     """
     masks: dict[torch.Tensor, torch.Tensor] = {}
-    for _, adapter in _paddable_pairs(model, active_dim, lora_dim):
-        if active_dim >= adapter.dim:
-            continue
+    pairs = _paddable_pairs(model, active_dim, lora_dim)
+    if active_dim == lora_dim:
+        return masks
+    for _, adapter in pairs:
         in_mask, out_mask = rank_padding_masks(adapter, active_dim)
         masks[adapter.linear_in.weight] = in_mask
         masks[adapter.linear_out.weight] = out_mask

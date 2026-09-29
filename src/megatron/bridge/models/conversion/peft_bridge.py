@@ -106,11 +106,12 @@ class AdapterWeightConversionTask:
     adapter_key: Optional[str]
     alpha: int
     dim: int
-    # Rank the LoRA runs at (``<= dim``); rank indices past it are zero padding.
-    active_dim: int
     linear_in_task: "WeightConversionTask"
     linear_out_task: "WeightConversionTask"
     requires_expert_splits: bool = False
+    # Rank the LoRA runs at (``<= dim``); rank indices past it are zero padding.
+    # ``None`` means ``dim``.
+    active_dim: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -129,8 +130,17 @@ class AdapterWeight:
     linear_out_weight: "MegatronWeightTuple"
 
 
+def _adapter_key(global_base_name: str) -> Optional[str]:
+    """CanonicalLoRA's per-projection key (e.g. ``adapter_q``) in an adapter name, or ``None``.
+
+    ``decoder.layers.0.self_attention.linear_qkv.adapter.adapter_q`` -> ``adapter_q``.
+    """
+    key_token = global_base_name.partition(".adapter")[2].split(".")[-1]
+    return key_token if key_token.startswith("adapter_") else None
+
+
 def _cut_rank_padding(
-    adapter_task: AdapterWeightConversionTask, linear_in: torch.Tensor, linear_out: torch.Tensor
+    adapter_task: AdapterWeightConversionTask, rank: int, linear_in: torch.Tensor, linear_out: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Cut gathered LoRA factors down to the adapter's ``active_dim``.
 
@@ -139,7 +149,7 @@ def _cut_rank_padding(
     """
     if adapter_task.requires_expert_splits:
         raise NotImplementedError(f"{adapter_task.global_base_prefix}: grouped expert adapters cannot be rank padded")
-    rank, dim = adapter_task.active_dim, adapter_task.dim
+    dim = adapter_task.dim
     if linear_in.shape[0] != dim or linear_out.shape[-1] != dim:
         raise ValueError(
             f"{adapter_task.global_base_prefix}: expected LoRA factors with rank {dim}, got "
@@ -577,15 +587,14 @@ class MegatronPeftBridge:
 
     def _megatron_global_adapters_info_all_pp_ranks(
         self, megatron_model: Union[MegatronModel, List[MegatronModel]]
-    ) -> List[tuple[str, str, bool, bool, bool, int, int, int, int]]:
+    ) -> List[tuple[str, str, bool, bool, bool, int, int, int]]:
         """Get all adapters' information tuple:
          (global_base_name, local_base_prefix, input_is_parallel, base_linear_is_parallel,
-          requires_expert_splits, alpha, dim, pp_rank, vp_stage)
+          requires_expert_splits, dim, pp_rank, vp_stage)
         across all pipeline parallel ranks.
 
-        Cached after the first call, so ``alpha`` here is only a placeholder that keeps
-        the tuples identical across ranks; see :meth:`_gather_adapter_runtime_attrs`
-        for the values that change at runtime."""
+        Cached after the first call, so it holds only what cannot change at runtime;
+        see :meth:`_gather_adapter_runtime_attrs` for ``alpha`` and ``active_dim``."""
         # Cache the result after first call
         if hasattr(self, "_cached_param_objects_adapter"):
             return self._cached_param_objects_adapter
@@ -598,7 +607,7 @@ class MegatronPeftBridge:
         pp_group = parallel_state.get_pipeline_model_parallel_group()
         pp_rank = get_pg_rank(pp_group)
         model_config = unwrap_model(megatron_model)[0].config
-        global_param_objects: List[tuple[str, str, bool, bool, bool, int, int, int, int]] = []
+        global_param_objects: List[tuple[str, str, bool, bool, bool, int, int, int]] = []
 
         for vp_stage, model in enumerate(megatron_model):
             for local_param_name, _ in itertools.chain(model.named_parameters(), persistent_buffers(model)):  # type: ignore[name-defined]
@@ -646,7 +655,6 @@ class MegatronPeftBridge:
                         input_is_parallel,
                         base_linear_is_parallel,
                         requires_expert_splits,
-                        adapter.alpha,
                         adapter.dim,
                         pp_rank,
                         vp_stage,
@@ -668,10 +676,23 @@ class MegatronPeftBridge:
 
         return gathered_global_param_objects
 
+    def _resolve_adapter(
+        self,
+        local_base_prefix: str,
+        adapter_key: Optional[str],
+        megatron_model: List[MegatronModel],
+        vp_stage: int,
+    ) -> torch.nn.Module:
+        """The local adapter module, indexing canonical LoRA's per-projection dict by ``adapter_key``."""
+        adapter, _ = self._get_adapter_wrap_module(local_base_prefix, megatron_model, vp_stage)
+        if isinstance(adapter, ModuleDict):
+            adapter = adapter[adapter_key]
+        return adapter
+
     def _gather_adapter_runtime_attrs(
         self,
         megatron_model: List[MegatronModel],
-        adapters_info: List[tuple[str, str, bool, bool, bool, int, int, int, int]],
+        adapters_info: List[tuple[str, str, bool, bool, bool, int, int, int]],
     ) -> Dict[str, tuple[float, int]]:
         """Read every adapter's current ``(alpha, active_dim)``, keyed by global adapter name.
 
@@ -686,9 +707,9 @@ class MegatronPeftBridge:
         for global_base_name, local_base_prefix, *_, owner_pp_rank, vp_stage in adapters_info:
             if owner_pp_rank != pp_rank:
                 continue
-            adapter, _ = self._get_adapter_wrap_module(local_base_prefix, megatron_model, vp_stage)
-            if isinstance(adapter, ModuleDict):
-                adapter = adapter[global_base_name.rpartition(".")[2]]
+            adapter = self._resolve_adapter(
+                local_base_prefix, _adapter_key(global_base_name), megatron_model, vp_stage
+            )
             local[global_base_name] = (adapter.alpha, adapter.active_dim)
         if pp_group.size() == 1:
             return local
@@ -749,21 +770,16 @@ class MegatronPeftBridge:
             input_is_parallel,
             base_linear_is_parallel,
             requires_expert_splits,
-            alpha,
             dim,
             pp_rank,
             vp_stage,
         ) in adapters_info:
             # global_base_name example: decoder.layers.0.mlp.linear_fc1.adapter.adapter_q
-            global_base_prefix, _, adapter_suffix = global_base_name.partition(".adapter")
+            global_base_prefix = global_base_name.partition(".adapter")[0]
             if excluded_prefixes and global_base_prefix.startswith(excluded_prefixes):
                 continue
 
-            adapter_key = None
-            if adapter_suffix:
-                key_token = adapter_suffix.split(".")[-1]
-                if key_token.startswith("adapter_"):
-                    adapter_key = key_token
+            adapter_key = _adapter_key(global_base_name)
 
             global_linear_in_name, global_linear_out_name = self._construct_adapters_names(
                 global_base_prefix, adapter_key
@@ -786,9 +802,7 @@ class MegatronPeftBridge:
             linear_in_module, linear_in_weight = None, None
             linear_out_module, linear_out_weight = None, None
             if parallel_state.get_pipeline_model_parallel_rank() == pp_rank:
-                adapter, _ = self._get_adapter_wrap_module(local_base_prefix, megatron_model, vp_stage)
-                if isinstance(adapter, ModuleDict):
-                    adapter = adapter[adapter_key]
+                adapter = self._resolve_adapter(local_base_prefix, adapter_key, megatron_model, vp_stage)
                 linear_in_module, linear_in_weight = adapter.linear_in, adapter.linear_in.weight
                 linear_out_module, linear_out_weight = adapter.linear_out, adapter.linear_out.weight
                 local_linear_in_name, local_linear_out_name = self._construct_adapters_names(
@@ -872,9 +886,10 @@ class MegatronPeftBridge:
                 )
                 linear_out_tensor = next(iter(linear_out_dict.values()))
 
-            if adapter_task.active_dim != adapter_task.dim:
+            active_dim = adapter_task.dim if adapter_task.active_dim is None else adapter_task.active_dim
+            if active_dim != adapter_task.dim:
                 linear_in_tensor, linear_out_tensor = _cut_rank_padding(
-                    adapter_task, linear_in_tensor, linear_out_tensor
+                    adapter_task, active_dim, linear_in_tensor, linear_out_tensor
                 )
 
             materialized.append(
@@ -882,7 +897,7 @@ class MegatronPeftBridge:
                     global_base_prefix=adapter_task.global_base_prefix,
                     adapter_key=adapter_task.adapter_key,
                     alpha=adapter_task.alpha,
-                    dim=adapter_task.active_dim,
+                    dim=active_dim,
                     linear_in_weight=MegatronWeightTuple(
                         adapter_task.linear_in_task.param_name,
                         linear_in_tensor,

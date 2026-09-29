@@ -30,6 +30,9 @@ from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
+from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
+from megatron.bridge.models.conversion.param_mapping import ColumnParallelMapping, RowParallelMapping
+from megatron.bridge.models.conversion.peft_bridge import AdapterWeightConversionTask, MegatronPeftBridge
 from megatron.bridge.peft.active_dim import lora_padding_masks, set_lora_active_dim
 from megatron.bridge.peft.lora_merge import LoRAMerge
 from megatron.bridge.peft.utils import ParallelLinearAdapter
@@ -189,3 +192,44 @@ def test_merge_at_tp2_detects_the_layout_from_the_allocated_dim(pg_collection):
     rows = slice(tp_rank * base.shape[0], (tp_rank + 1) * base.shape[0])
     expected = (16 / _RANK) * linear_out[rows, :_RANK] @ linear_in[:_RANK]
     torch.testing.assert_close(merged, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(("base_linear_name", "input_is_parallel"), _LAYOUTS)
+def test_export_gathers_over_tp_then_cuts_to_the_active_dim(pg_collection, base_linear_name, input_is_parallel):
+    """The bridge's real TP gather followed by the cut gives the rank-active_dim factors."""
+    adapter = _padded_adapter(pg_collection, base_linear_name, input_is_parallel=input_is_parallel).adapter
+    linear_in, linear_out = _global_factors(adapter)
+    # The mappings the bridge picks for a parallel base (build_adapter_conversion_tasks).
+    in_mapping_cls = RowParallelMapping if input_is_parallel else ColumnParallelMapping
+    prefix = f"{base_linear_name}.adapter"
+    tasks = []
+    for suffix, mapping_cls, module in (
+        ("linear_in", in_mapping_cls, adapter.linear_in),
+        ("linear_out", ColumnParallelMapping, adapter.linear_out),
+    ):
+        name = f"{prefix}.{suffix}.weight"
+        tasks.append(
+            WeightConversionTask(
+                param_name=name,
+                global_param_name=name,
+                mapping=mapping_cls(megatron_param=name, hf_param=f"hf.{suffix}"),
+                megatron_module=module,
+                param_weight=module.weight.detach(),
+            )
+        )
+    task = AdapterWeightConversionTask(
+        global_base_prefix=base_linear_name,
+        adapter_key=None,
+        alpha=adapter.alpha,
+        dim=adapter.dim,
+        active_dim=adapter.active_dim,
+        linear_in_task=tasks[0],
+        linear_out_task=tasks[1],
+    )
+
+    (weight,) = object.__new__(MegatronPeftBridge).materialize_adapter_weights([task])
+
+    assert weight.dim == _RANK
+    torch.testing.assert_close(weight.linear_in_weight.weight, linear_in[:_RANK])
+    torch.testing.assert_close(weight.linear_out_weight.weight, linear_out[:, :_RANK])

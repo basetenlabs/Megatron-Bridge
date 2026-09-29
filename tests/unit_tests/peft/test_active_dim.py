@@ -235,9 +235,9 @@ def test_reduced_dim_adapters_keep_their_own_dim_and_refuse_padding():
     assert get_lora_active_dim(model, lora_dim=DIM) == DIM
     set_lora_active_dim(model, DIM, lora_dim=DIM)
     assert lora_padding_masks(model, DIM, lora_dim=DIM) == {}
-    with pytest.raises(NotImplementedError, match="reduced dim"):
+    with pytest.raises(NotImplementedError, match="normalized dim"):
         set_lora_active_dim(model, RANK, lora_dim=DIM)
-    with pytest.raises(NotImplementedError, match="reduced dim"):
+    with pytest.raises(NotImplementedError, match="normalized dim"):
         lora_padding_masks(model, RANK, lora_dim=DIM)
     assert [m.adapter.active_dim for m in model] == [DIM, RANK]
 
@@ -258,7 +258,7 @@ def test_a_pipeline_stage_without_adapters_is_a_no_op():
     stage = nn.Sequential(nn.Linear(8, 8))
     set_lora_active_dim(stage, RANK, lora_dim=DIM)
     assert lora_padding_masks(stage, RANK, lora_dim=DIM) == {}
-    assert get_lora_active_dim(stage, lora_dim=DIM) == DIM
+    assert get_lora_active_dim(stage, lora_dim=DIM) is None
 
 
 @pytest.mark.parametrize("rank", [1, RANK, DIM - 1])
@@ -275,3 +275,14 @@ def test_rank_index_refuses_unpaddable_adapters():
     base = nn.Linear(8, 8)
     with pytest.raises(NotImplementedError):
         lora_rank_index(LoRALinear(base, _Unpaddable(base, dim=DIM)), lora_dim=DIM)
+
+
+def test_an_expert_dim_rounded_above_the_lora_dim_still_restores_to_full_rank():
+    """align_expert_dim_for_tp can round a normalized expert dim up past the LoRA dim."""
+    base = nn.Linear(8, 8)
+    model = nn.Sequential(_lora(base, RANK), _lora(base, DIM))
+    set_lora_active_dim(model, RANK, lora_dim=RANK)
+    assert lora_padding_masks(model, RANK, lora_dim=RANK) == {}
+    assert [m.adapter.active_dim for m in model] == [RANK, DIM]
+    with pytest.raises(NotImplementedError, match="normalized dim"):
+        set_lora_active_dim(model, RANK - 1, lora_dim=RANK)
