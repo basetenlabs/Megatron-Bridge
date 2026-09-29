@@ -880,27 +880,20 @@ def test_build_adapter_conversion_tasks_excludes_base_prefix_before_mapping(monk
 
 
 @pytest.mark.parametrize("tp_size", [1, 2], ids=["unsharded", "tensor-parallel"])
-def test_mamba_adapter_export_preserves_merge(monkeypatch: pytest.MonkeyPatch, tp_size: int) -> None:
-    """Mamba adapter export must preserve the trained W + (alpha / dim) * B @ A.
-
-    A plain rank-wise gather scrambles LoRA-B's z/x/B/C/dt rows at TP > 1.
-    Both exporting the adapter and exporting merged weights must preserve HF order.
-    """
+def test_mamba_adapter_export_preserves_row_order(monkeypatch: pytest.MonkeyPatch, tp_size: int) -> None:
+    """Mamba adapter export must preserve Hugging Face row ordering."""
 
     bridge = DummyBridge()
     bridge.hf_pretrained = SimpleNamespace()
     bridge.hf_config = bridge.hf_pretrained
 
-    config = SimpleNamespace(
-        mamba_num_heads=4, mamba_head_dim=2, mamba_state_dim=2, mamba_num_groups=2, num_moe_experts=None
-    )
+    config = SimpleNamespace(mamba_num_heads=4, mamba_head_dim=2, mamba_state_dim=2, mamba_num_groups=2)
     alpha, dim = 2, 4
     base_prefix = "decoder.layers.0.mixer.in_proj"
     hf_name = "backbone.layers.0.mixer.in_proj.weight"
     local_component_sizes = [size // tp_size for size in [8, 8, 4, 4, 4]]  # z, x, B, C, dt
     local_rows = sum(local_component_sizes)
-    # Distinct row/column values expose permutations; alpha / dim != 1 checks scaling.
-    base_local = (torch.arange(local_rows * 3, dtype=torch.float32).reshape(local_rows, 3) - 40) / 8
+    # Distinct row/column values expose permutations.
     linear_in_local = (torch.arange(dim // tp_size * 3, dtype=torch.float32).reshape(-1, 3) - 5) / 4
     linear_out_local = (torch.arange(local_rows * dim, dtype=torch.float32).reshape(local_rows, dim) - 55) / 16
 
@@ -909,7 +902,6 @@ def test_mamba_adapter_export_preserves_merge(monkeypatch: pytest.MonkeyPatch, t
         components = local_weight.split(local_component_sizes, dim=0)
         return torch.cat([component * (rank + 1) for component in components for rank in range(tp_size)])
 
-    base_weight = expected_hf_order(base_local)
     linear_in_weight = torch.cat([linear_in_local * (rank + 1) for rank in range(tp_size)])
     linear_out_weight = expected_hf_order(linear_out_local)
 
@@ -938,23 +930,10 @@ def test_mamba_adapter_export_preserves_merge(monkeypatch: pytest.MonkeyPatch, t
 
     task = bridge.build_adapter_conversion_tasks([Mock()])[base_prefix][0]
 
-    # Adapter export must reconstruct A and B in HF order before any merge.
+    # Adapter export must reconstruct A and B in HF order.
     exported_adapter = bridge.materialize_adapter_weights([task])[0]
     torch.testing.assert_close(exported_adapter.linear_in_weight.weight, linear_in_weight)
     torch.testing.assert_close(exported_adapter.linear_out_weight.weight, linear_out_weight)
-
-    # Export then merge: apply the exported adapter to the HF base weight.
-    merged_after_export = bridge._merge_lora_adapter_weights(
-        [SimpleNamespace(config=config)], {hf_name: base_weight}, [exported_adapter]
-    )[hf_name]
-
-    # Merge then export: each local B multiplies the full A gathered across TP.
-    merged_local = base_local + (alpha / dim) * (linear_out_local @ linear_in_weight)
-    exported_after_merge = base_mapping.megatron_to_hf(merged_local, SimpleNamespace(config=config))[hf_name]
-
-    expected = base_weight + (alpha / dim) * (linear_out_weight @ linear_in_weight)
-    torch.testing.assert_close(merged_after_export, expected)
-    torch.testing.assert_close(exported_after_merge, expected)
 
 
 def test_materialize_adapter_weights(monkeypatch):

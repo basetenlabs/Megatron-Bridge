@@ -743,7 +743,7 @@ class MegatronPeftBridge:
                 if isinstance(base_mapping, MambaInProjMapping):
                     # Each TensorParallel rank holds [z, x, B, C, dt] rows of the fused Mamba in_proj, so LoRA-B must be
                     # gathered per component rather than concatenated rank by rank
-                    # e.g. [z0z1..., x0x1..., ...] rather than [z0x0..., z1x1..., ...]
+                    # e.g. [z0, z1..., x0, x1..., ...] rather than [z0, x0..., z1, x1..., ...]
                     linear_out_mapping_cls = MambaInProjMapping
             else:
                 linear_in_mapping_cls = ReplicatedMapping
