@@ -47,8 +47,9 @@ class LoRALinear(AdapterWrapper):
             linear_out_weight,
             linear_in_weight,
             self.adapter.alpha,
-            self.adapter.active_dim,
+            self.adapter.dim,
             tp_group=getattr(self.adapter, "tp_group", None),
+            scale=self.adapter.scale,
         )
         if merged_weight.shape != base_weight.shape:
             raise RuntimeError(
@@ -287,7 +288,7 @@ class TEFusedLoRALinear(LoRALinear):
         lora_dim = linear_out_weight.size(1)
         dropout = getattr(self.adapter.dropout, "p", 0.0)
         dropout_position = self.adapter.dropout_position
-        scale = self.adapter.alpha / self.adapter.active_dim
+        scale = self.adapter.scale
 
         # Ops in LoRA branch
         lora_branch = te.ops.Sequential()
@@ -387,6 +388,9 @@ class LinearAdapter(nn.Module):
         lora_dtype: Adapter weight dtype. Defaults to the original linear's weight dtype.
     """
 
+    # Whether ``peft.active_dim`` may run this adapter below ``dim`` (its padding layout is known).
+    supports_rank_padding = True
+
     def __init__(
         self,
         orig_linear: nn.Linear,
@@ -448,7 +452,8 @@ class LinearAdapter(nn.Module):
             base_dtype: Base weight dtype, used when ``lora_dtype`` is not provided.
         """
         self.dim = dim
-        # Rank in use; the rest of ``dim`` is zero padding (see ``peft.active_dim``).
+        # ``dim`` sizes the weights; ``active_dim <= dim`` is the rank the LoRA runs at and sets the
+        # scale. Rank indices past ``active_dim`` are zero padding (see ``peft.active_dim``).
         self.active_dim = dim
         self.alpha = alpha
 

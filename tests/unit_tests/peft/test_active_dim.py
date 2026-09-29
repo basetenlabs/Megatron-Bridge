@@ -22,8 +22,16 @@ import torch
 import torch.nn as nn
 
 from megatron.bridge.peft.active_dim import get_lora_active_dim, lora_padding_masks, set_lora_active_dim
+from megatron.bridge.peft.dora_layers import ParallelLinearDoRAAdapter
 from megatron.bridge.peft.lora_layers import LinearAdapter, LoRALinear
-from megatron.bridge.peft.utils import rank_padding_masks
+from megatron.bridge.peft.lora_merge import LoRAMerge
+from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear
+from megatron.bridge.peft.utils import (
+    GroupedExpertLinearAdapter,
+    ParallelLinearAdapter,
+    SharedOuterGroupedExpertAdapter,
+    rank_padding_masks,
+)
 
 
 RANK = 4
@@ -102,15 +110,71 @@ def test_active_dim_sets_the_scale():
     assert lora.adapter.scale == 32 / DIM
 
 
-def test_rejects_unknown_adapters_and_out_of_range_ranks():
-    class _Subclass(LinearAdapter):
-        pass
+class _Unpaddable(LinearAdapter):
+    supports_rank_padding = False
 
+
+def test_rejects_unpaddable_adapters_and_out_of_range_ranks():
     base = nn.Linear(8, 8)
     with pytest.raises(NotImplementedError):
-        set_lora_active_dim(LoRALinear(base, _Subclass(base, dim=DIM)), RANK)
+        set_lora_active_dim(LoRALinear(base, _Unpaddable(base, dim=DIM)), RANK)
     with pytest.raises(ValueError):
         set_lora_active_dim(_lora(base, DIM), DIM + 1)
+
+
+def test_only_adapters_with_a_known_padding_layout_are_paddable():
+    assert ParallelLinearAdapter.supports_rank_padding
+    assert LinearAdapter.supports_rank_padding
+    assert not ParallelLinearDoRAAdapter.supports_rank_padding
+    assert not GroupedExpertLinearAdapter.supports_rank_padding
+    assert not SharedOuterGroupedExpertAdapter.supports_rank_padding
+
+
+def test_a_refusal_leaves_every_adapter_untouched():
+    base = nn.Linear(8, 8)
+    model = nn.Sequential(_lora(base, DIM), LoRALinear(base, _Unpaddable(base, dim=DIM)))
+    with pytest.raises(NotImplementedError):
+        set_lora_active_dim(model, RANK)
+    assert model[0].adapter.active_dim == DIM
+
+
+def test_canonical_lora_dicts_run_every_projection_at_the_rank():
+    base = nn.Linear(8, 8)
+    lora = LoRALinear(
+        base, nn.ModuleDict({"adapter_q": LinearAdapter(base, dim=DIM), "adapter_k": LinearAdapter(base, dim=DIM)})
+    )
+    set_lora_active_dim(lora, RANK)
+    assert [adapter.active_dim for adapter in lora.adapter.values()] == [RANK, RANK]
+    assert get_lora_active_dim(lora) == RANK
+    assert len(lora_padding_masks(lora, RANK)) == 4
+
+
+def test_multi_lora_wrappers_are_refused():
+    wrapper = MultiLoRALinear.__new__(MultiLoRALinear)
+    nn.Module.__init__(wrapper)
+    for call in (get_lora_active_dim, lambda m: set_lora_active_dim(m, RANK), lambda m: lora_padding_masks(m, RANK)):
+        with pytest.raises(NotImplementedError, match="rank_values"):
+            call(nn.Sequential(wrapper))
+
+
+def test_effective_weight_uses_the_active_rank_scale():
+    native, padded, _, _ = _trained_pair()
+    torch.testing.assert_close(padded.weight, native.weight)
+
+
+def test_effective_weight_keeps_the_allocated_dim_for_the_tp_layout(monkeypatch):
+    """LoRAMerge detects the TP layout from ``dim``; the scale is passed separately."""
+    lora = _lora(nn.Linear(8, 8), DIM)
+    set_lora_active_dim(lora, RANK)
+    calls = []
+
+    def _merge(self, base_weight, linear_out, linear_in, alpha, dim, *, tp_group, scale=None):
+        calls.append((dim, scale))
+        return base_weight
+
+    monkeypatch.setattr(LoRAMerge, "merge", _merge)
+    lora.weight
+    assert calls == [(DIM, 32 / RANK)]
 
 
 def test_rejects_an_activation_between_the_factors():

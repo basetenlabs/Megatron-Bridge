@@ -32,6 +32,9 @@ class ParallelLinearDoRAAdapter(ParallelLinearAdapter):
     including weight magnitude tracking and sharded state dict support for distributed training.
     """
 
+    # DoRA's magnitude and scaling are computed from the full ``dim``.
+    supports_rank_padding = False
+
     def init_weight_magnitude(self, value: torch.Tensor) -> None:
         """
         Initialize weight_magnitude with shape (d,), where d is the output dim of the linear layer.

@@ -981,6 +981,9 @@ class ParallelLinearAdapter(nn.Module):
             re-gather it in backward using MCore's sequence-parallel linear path (default: False).
     """
 
+    # Whether ``peft.active_dim`` may run this adapter below ``dim`` (its padding layout is known).
+    supports_rank_padding = True
+
     def __init__(
         self,
         in_features: int,
@@ -1030,7 +1033,8 @@ class ParallelLinearAdapter(nn.Module):
         self.base_linear_name = base_linear_name
         self.activation = self._get_activation_fn(activation)
         self.dim = dim
-        # Rank in use; the rest of ``dim`` is zero padding (see ``peft.active_dim``).
+        # ``dim`` sizes the weights; ``active_dim <= dim`` is the rank the LoRA runs at and sets the
+        # scale. Rank indices past ``active_dim`` are zero padding (see ``peft.active_dim``).
         self.active_dim = dim
         self.alpha = alpha if alpha is not None else self.dim
         self.input_is_parallel = input_is_parallel
@@ -1271,6 +1275,11 @@ class ParallelLinearAdapter(nn.Module):
             raise NotImplementedError("out_init_method should be zero, normal, kaiming or xavier")
         return init_fn
 
+    @property
+    def scale(self) -> float:
+        """The LoRA forward scale for the rank in use."""
+        return self.alpha / self.active_dim
+
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         """Forward pass of the parallel linear adapter.
 
@@ -1336,7 +1345,7 @@ class ParallelLinearAdapter(nn.Module):
         if self.dropout_position == "post":
             x = self.dropout(x)
 
-        x = x * (self.alpha / self.active_dim)
+        x = x * self.scale
 
         if pad_len > 0:
             # Remove MoE padding.
@@ -1860,6 +1869,9 @@ class _GroupedExpertAdapterWeight(nn.Module):
 class GroupedExpertLinearAdapter(nn.Module):
     """LoRA adapter with one low-rank pair per local grouped MoE expert."""
 
+    # Grouped expert weights have no known padding layout; see ``peft.active_dim``.
+    supports_rank_padding = False
+
     def __init__(
         self,
         in_features: int,
@@ -1888,7 +1900,8 @@ class GroupedExpertLinearAdapter(nn.Module):
         self.base_linear_name = base_linear_name
         self.activation = ParallelLinearAdapter._get_activation_fn(self, activation)
         self.dim = dim
-        # Rank in use; the rest of ``dim`` is zero padding (see ``peft.active_dim``).
+        # ``dim`` sizes the weights; ``active_dim <= dim`` is the rank the LoRA runs at and sets the
+        # scale. Rank indices past ``active_dim`` are zero padding (see ``peft.active_dim``).
         self.active_dim = dim
         self.alpha = alpha if alpha is not None else self.dim
         self.input_is_parallel = input_is_parallel
@@ -2327,6 +2340,11 @@ class GroupedExpertLinearAdapter(nn.Module):
 
         return torch.cat(outputs, dim=0)
 
+    @property
+    def scale(self) -> float:
+        """The LoRA forward scale for the rank in use."""
+        return self.alpha / self.active_dim
+
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         """Apply the local expert-specific LoRA update to grouped expert inputs."""
 
@@ -2347,15 +2365,13 @@ class GroupedExpertLinearAdapter(nn.Module):
             linear_in_weight = self.linear_in()
             linear_out_weight = self.linear_out()
             grad_anchor = linear_in_weight.reshape(-1)[0] + linear_out_weight.reshape(-1)[0]
-            return (x.new_empty((0, output_features)) + grad_anchor * 0.0) * (self.alpha / self.active_dim)
+            return (x.new_empty((0, output_features)) + grad_anchor * 0.0) * self.scale
 
         fp8_enabled = self._is_te_fp8_enabled()
         use_te_fp8 = fp8_enabled and self._can_use_te_grouped_linear_fp8(x)
         use_grouped_mm = not fp8_enabled and self._can_use_grouped_mm(x)
         if not use_te_fp8 and not use_grouped_mm:
-            return self._forward_per_expert(x, expert_splits=expert_splits, expert_tp_size=expert_tp_size) * (
-                self.alpha / self.active_dim
-            )
+            return self._forward_per_expert(x, expert_splits=expert_splits, expert_tp_size=expert_tp_size) * self.scale
 
         active_expert_indices = []
         grouped_inputs = []
@@ -2414,7 +2430,7 @@ class GroupedExpertLinearAdapter(nn.Module):
             expert_output = self.dropout(expert_output)
 
         if all(pad_len == 0 for pad_len in pad_lengths):
-            return expert_output * (self.alpha / self.active_dim)
+            return expert_output * self.scale
 
         outputs = []
         start = 0
@@ -2423,7 +2439,7 @@ class GroupedExpertLinearAdapter(nn.Module):
             outputs.append(unpad_seq_to_mult(output_chunk, pad_len) if pad_len > 0 else output_chunk)
             start += padded_size
 
-        return torch.cat(outputs, dim=0) * (self.alpha / self.active_dim)
+        return torch.cat(outputs, dim=0) * self.scale
 
     def sharded_state_dict(
         self,
@@ -2612,6 +2628,9 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
     ``sharded_state_dict`` is specialized for the packed 3D per-expert side.
     """
 
+    # Grouped expert weights have no known padding layout; see ``peft.active_dim``.
+    supports_rank_padding = False
+
     def __init__(
         self,
         in_features: int,
@@ -2638,7 +2657,8 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         self.base_linear_name = base_linear_name
         self.activation = ParallelLinearAdapter._get_activation_fn(self, activation)
         self.dim = dim
-        # Rank in use; the rest of ``dim`` is zero padding (see ``peft.active_dim``).
+        # ``dim`` sizes the weights; ``active_dim <= dim`` is the rank the LoRA runs at and sets the
+        # scale. Rank indices past ``active_dim`` are zero padding (see ``peft.active_dim``).
         self.active_dim = dim
         self.alpha = alpha if alpha is not None else self.dim
         self.dropout_position = dropout_position
@@ -2713,6 +2733,11 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         shared_weight = self.linear_in.weight if self._is_fc1 else self.linear_out.weight
         _make_cross_ep_replicated(shared_weight)
 
+    @property
+    def scale(self) -> float:
+        """The LoRA forward scale for the rank in use."""
+        return self.alpha / self.active_dim
+
     def forward(self, x: torch.Tensor, m_splits=None) -> torch.Tensor:
         """Forward. ``m_splits`` is the tokens-per-expert split passed through
         from the base TEGroupedLinear; required for the per-expert side.
@@ -2734,7 +2759,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         if self.dropout_position == "post":
             x = self.dropout(x)
 
-        return x * (self.alpha / self.active_dim)
+        return x * self.scale
 
     def sharded_state_dict(
         self,
