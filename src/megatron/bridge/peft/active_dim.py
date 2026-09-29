@@ -25,7 +25,7 @@ and persisting ``active_dim``. It is not part of the model's state dict, so a mo
 restored from a checkpoint comes back at ``active_dim == dim`` until the caller sets it.
 """
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 import torch
 import torch.nn as nn
@@ -36,9 +36,9 @@ from megatron.bridge.peft.multi_lora_layers import _MULTI_LORA_TYPES
 from megatron.bridge.peft.utils import rank_padding_masks
 
 
-def _iter_adapters(model: nn.Module | list[nn.Module]) -> Iterator[tuple[AdapterWrapper, nn.Module]]:
+def _iter_adapters(model: nn.Module | Sequence[nn.Module]) -> Iterator[tuple[AdapterWrapper, nn.Module]]:
     """Yield ``(wrapper, adapter)`` for every LoRA adapter, expanding canonical LoRA's per-projection dicts."""
-    for chunk in model if isinstance(model, list) else [model]:
+    for chunk in [model] if isinstance(model, nn.Module) else model:
         for module in chunk.modules():
             if not isinstance(module, AdapterWrapper):
                 continue
@@ -69,7 +69,7 @@ def _check_paddable(adapter: nn.Module, active_dim: int) -> None:
         raise ValueError(f"active_dim={active_dim} must be in (0, {adapter.dim}]")
 
 
-def get_lora_active_dim(model: nn.Module | list[nn.Module]) -> int:
+def get_lora_active_dim(model: nn.Module | Sequence[nn.Module]) -> int:
     """The rank every LoRA adapter currently runs at."""
     dims = {adapter.active_dim for _, adapter in _iter_adapters(model)}
     if len(dims) != 1:
@@ -77,7 +77,7 @@ def get_lora_active_dim(model: nn.Module | list[nn.Module]) -> int:
     return dims.pop()
 
 
-def set_lora_active_dim(model: nn.Module | list[nn.Module], active_dim: int) -> None:
+def set_lora_active_dim(model: nn.Module | Sequence[nn.Module], active_dim: int) -> None:
     """Scale every LoRA adapter's delta by ``alpha / active_dim``.
 
     Every adapter is checked before any changes, so a refusal leaves the model untouched.
@@ -92,7 +92,7 @@ def set_lora_active_dim(model: nn.Module | list[nn.Module], active_dim: int) -> 
             wrapper._fused_branches = None
 
 
-def lora_padding_masks(model: nn.Module | list[nn.Module], active_dim: int) -> dict[torch.Tensor, torch.Tensor]:
+def lora_padding_masks(model: nn.Module | Sequence[nn.Module], active_dim: int) -> dict[torch.Tensor, torch.Tensor]:
     """Map each padded local LoRA weight to the mask of its entries past ``active_dim``."""
     masks: dict[torch.Tensor, torch.Tensor] = {}
     for _, adapter in _iter_adapters(model):
