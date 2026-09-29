@@ -22,6 +22,7 @@ from megatron.core.transformer.moe.moe_utils import apply_random_logits
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
 from megatron.bridge.peft.lora_merge import LoRAMerge
+from megatron.bridge.peft.utils import ActiveDimScale
 
 
 class LoRALinear(AdapterWrapper):
@@ -368,7 +369,7 @@ class TEFusedLoRALinear(LoRALinear):
         return out, None
 
 
-class LinearAdapter(nn.Module):
+class LinearAdapter(ActiveDimScale, nn.Module):
     """Delta-only LoRA adapter for a plain ``nn.Linear``, mirroring :class:`ParallelLinearAdapter`'s role.
 
     This adapter holds *only* the low-rank LoRA delta (``linear_in`` -> ``linear_out``) and
@@ -452,8 +453,7 @@ class LinearAdapter(nn.Module):
             base_dtype: Base weight dtype, used when ``lora_dtype`` is not provided.
         """
         self.dim = dim
-        # ``dim`` sizes the weights; ``active_dim <= dim`` is the rank the LoRA runs at and sets the
-        # scale. Rank indices past ``active_dim`` are zero padding (see ``peft.active_dim``).
+        # Rank in use; see ``ActiveDimScale``.
         self.active_dim = dim
         self.alpha = alpha
 
@@ -474,11 +474,6 @@ class LinearAdapter(nn.Module):
             self.dropout = nn.Identity()
         assert dropout_position in ["pre", "post"], dropout_position
         self.dropout_position = dropout_position
-
-    @property
-    def scale(self) -> float:
-        """The LoRA forward scale for the rank in use."""
-        return self.alpha / self.active_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Compute the scaled LoRA delta only (no base-weight term).

@@ -27,7 +27,9 @@ own full ``dim`` and cannot be padded.
 
 The caller owns three things:
 
-- zeroing the padding once, using :func:`lora_padding_masks`;
+- zeroing the padding once, using :func:`lora_padding_masks`, in the weights and in
+  any copy the optimizer keeps (fp32 main params, moments). The masks are keyed by
+  the model's weights only;
 - persisting ``active_dim``: it is not in the model's state dict, so a restored model
   comes back at ``active_dim == dim`` until the caller sets it;
 - applying the same call on every rank. Refusals are checked per rank, so a pipeline
@@ -46,20 +48,31 @@ from megatron.bridge.peft.multi_lora_layers import _MULTI_LORA_TYPES
 from megatron.bridge.peft.utils import rank_indices, rank_padding_masks
 
 
-def _iter_adapters(model: nn.Module | Sequence[nn.Module]) -> Iterator[tuple[AdapterWrapper, nn.Module]]:
-    """Yield ``(wrapper, adapter)`` for every LoRA adapter, expanding canonical LoRA's per-projection dicts."""
-    for chunk in [model] if isinstance(model, nn.Module) else model:
+def _chunks(model: nn.Module | Sequence[nn.Module]) -> list[nn.Module]:
+    return [model] if isinstance(model, nn.Module) else list(model)
+
+
+def _iter_adapters(
+    model: nn.Module | Sequence[nn.Module], *, skip_multi_lora: bool = False
+) -> Iterator[tuple[AdapterWrapper, nn.Module]]:
+    """Yield ``(wrapper, adapter)`` for every LoRA adapter, expanding canonical LoRA's per-projection dicts.
+
+    Multi-LoRA wrappers rank each slot through their ``rank_values``; they raise unless
+    ``skip_multi_lora``, which a full-rank restore uses since it changes nothing.
+    """
+    for chunk in _chunks(model):
         for module in chunk.modules():
             if not isinstance(module, AdapterWrapper):
                 continue
             if isinstance(module, _MULTI_LORA_TYPES):
+                if skip_multi_lora:
+                    continue
                 raise NotImplementedError(f"{type(module).__name__} sets each slot's rank through its rank_values")
-            adapters = module.adapter
-            if isinstance(adapters, (nn.ModuleDict, nn.ModuleList)):
-                for adapter in adapters.children():
+            if isinstance(module.adapter, nn.ModuleDict):
+                for adapter in module.adapter.values():
                     yield module, adapter
             else:
-                yield module, adapters
+                yield module, module.adapter
 
 
 def _paddable_pairs(
@@ -68,9 +81,12 @@ def _paddable_pairs(
     """Every adapter, after checking that all of them can run at ``active_dim``."""
     if not 0 < active_dim <= lora_dim:
         raise ValueError(f"active_dim={active_dim} must be in (0, {lora_dim}]")
-    pairs = list(_iter_adapters(model))
     if active_dim == lora_dim:
-        return pairs
+        return list(_iter_adapters(model, skip_multi_lora=True))
+    # Megatron model chunks carry the TransformerConfig a whole-model capture is set on.
+    if any(cuda_graphs_are_enabled(getattr(chunk, "config", None)) for chunk in _chunks(model)):
+        raise NotImplementedError("a captured CUDA graph bakes in the LoRA scale; padding needs it to change")
+    pairs = list(_iter_adapters(model))
     for wrapper, adapter in pairs:
         if adapter.dim != lora_dim:
             # normalize_moe_lora experts run at dim / topk, rounded to expert-TP granularity.
@@ -92,6 +108,13 @@ def _paddable_pairs(
         # Megatron linears carry the TransformerConfig; a plain nn.Linear has none.
         if cuda_graphs_are_enabled(getattr(wrapper.to_wrap, "config", None)):
             raise NotImplementedError("a captured CUDA graph bakes in the LoRA scale; padding needs it to change")
+        # A TP-sharded adapter on a non-parallel base (e.g. the MoE router) is exported
+        # without gathering its shards, so its padding could not be cut on export.
+        # LinearAdapter wraps a plain nn.Linear and is never sharded.
+        if not getattr(adapter, "base_linear_is_parallel", True) and adapter.linear_in.weight.shape[-2] != adapter.dim:
+            raise NotImplementedError(
+                f"{adapter.base_linear_name}: a TP-sharded adapter on a non-parallel base cannot be rank padded"
+            )
     return pairs
 
 

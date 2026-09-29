@@ -750,6 +750,22 @@ def align_expert_dim_for_tp(
     return ((dim + expert_tp_size - 1) // expert_tp_size) * expert_tp_size
 
 
+class ActiveDimScale:
+    """Scale for adapters that may run below their allocated ``dim`` (see ``peft.active_dim``).
+
+    ``dim`` sizes the weights and never changes; ``active_dim <= dim`` is the rank the LoRA
+    runs at. Rank indices past ``active_dim`` are zero padding.
+    """
+
+    alpha: float
+    active_dim: int
+
+    @property
+    def scale(self) -> float:
+        """The LoRA forward scale for the rank in use."""
+        return self.alpha / self.active_dim
+
+
 def rank_indices(adapter: nn.Module) -> Tuple[torch.Tensor, torch.Tensor]:
     """Give each local ``linear_in`` row and ``linear_out`` column its global rank index.
 
@@ -970,7 +986,7 @@ def all2all_hp2sp(input_: torch.Tensor, tensor_parallel_group: object | None = N
     return _All2AllHp2Sp.apply(input_, tensor_parallel_group)
 
 
-class ParallelLinearAdapter(nn.Module):
+class ParallelLinearAdapter(ActiveDimScale, nn.Module):
     """Parallel Linear Adapter for Parameter-Efficient Fine-Tuning (PEFT) in distributed settings.
 
     This adapter implements a low-rank adaptation pattern using two linear layers with configurable
@@ -1054,8 +1070,7 @@ class ParallelLinearAdapter(nn.Module):
         self.base_linear_name = base_linear_name
         self.activation = self._get_activation_fn(activation)
         self.dim = dim
-        # ``dim`` sizes the weights; ``active_dim <= dim`` is the rank the LoRA runs at and sets the
-        # scale. Rank indices past ``active_dim`` are zero padding (see ``peft.active_dim``).
+        # Rank in use; see ``ActiveDimScale``.
         self.active_dim = dim
         self.alpha = alpha if alpha is not None else self.dim
         self.input_is_parallel = input_is_parallel
@@ -1295,11 +1310,6 @@ class ParallelLinearAdapter(nn.Module):
         else:
             raise NotImplementedError("out_init_method should be zero, normal, kaiming or xavier")
         return init_fn
-
-    @property
-    def scale(self) -> float:
-        """The LoRA forward scale for the rank in use."""
-        return self.alpha / self.active_dim
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         """Forward pass of the parallel linear adapter.
@@ -1887,7 +1897,7 @@ class _GroupedExpertAdapterWeight(nn.Module):
         return self.weight[indices]
 
 
-class GroupedExpertLinearAdapter(nn.Module):
+class GroupedExpertLinearAdapter(ActiveDimScale, nn.Module):
     """LoRA adapter with one low-rank pair per local grouped MoE expert."""
 
     # Grouped expert weights have no known padding layout; see ``peft.active_dim``.
@@ -1921,8 +1931,7 @@ class GroupedExpertLinearAdapter(nn.Module):
         self.base_linear_name = base_linear_name
         self.activation = ParallelLinearAdapter._get_activation_fn(self, activation)
         self.dim = dim
-        # ``dim`` sizes the weights; ``active_dim <= dim`` is the rank the LoRA runs at and sets the
-        # scale. Rank indices past ``active_dim`` are zero padding (see ``peft.active_dim``).
+        # Rank in use; see ``ActiveDimScale``.
         self.active_dim = dim
         self.alpha = alpha if alpha is not None else self.dim
         self.input_is_parallel = input_is_parallel
@@ -2361,11 +2370,6 @@ class GroupedExpertLinearAdapter(nn.Module):
 
         return torch.cat(outputs, dim=0)
 
-    @property
-    def scale(self) -> float:
-        """The LoRA forward scale for the rank in use."""
-        return self.alpha / self.active_dim
-
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         """Apply the local expert-specific LoRA update to grouped expert inputs."""
 
@@ -2624,7 +2628,7 @@ class PackedPerExpertLinear(nn.Module):
         }
 
 
-class SharedOuterGroupedExpertAdapter(nn.Module):
+class SharedOuterGroupedExpertAdapter(ActiveDimScale, nn.Module):
     """LoRA adapter for grouped expert MLP with shared-outer semantics.
 
     Matches SGLang PR #21466's ``experts_shared_outer_loras=True`` contract:
@@ -2678,8 +2682,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         self.base_linear_name = base_linear_name
         self.activation = ParallelLinearAdapter._get_activation_fn(self, activation)
         self.dim = dim
-        # ``dim`` sizes the weights; ``active_dim <= dim`` is the rank the LoRA runs at and sets the
-        # scale. Rank indices past ``active_dim`` are zero padding (see ``peft.active_dim``).
+        # Rank in use; see ``ActiveDimScale``.
         self.active_dim = dim
         self.alpha = alpha if alpha is not None else self.dim
         self.dropout_position = dropout_position
@@ -2753,11 +2756,6 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         # that Megatron's expert-DDP routing leaves open.
         shared_weight = self.linear_in.weight if self._is_fc1 else self.linear_out.weight
         _make_cross_ep_replicated(shared_weight)
-
-    @property
-    def scale(self) -> float:
-        """The LoRA forward scale for the rank in use."""
-        return self.alpha / self.active_dim
 
     def forward(self, x: torch.Tensor, m_splits=None) -> torch.Tensor:
         """Forward. ``m_splits`` is the tokens-per-expert split passed through

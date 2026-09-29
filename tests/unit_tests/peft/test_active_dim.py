@@ -164,6 +164,9 @@ def test_multi_lora_wrappers_are_refused():
     ):
         with pytest.raises(NotImplementedError, match="rank_values"):
             call(nn.Sequential(wrapper))
+    # A full-rank restore changes nothing, so it passes over multi-LoRA wrappers.
+    set_lora_active_dim(nn.Sequential(wrapper), DIM, lora_dim=DIM)
+    assert lora_padding_masks(nn.Sequential(wrapper), DIM, lora_dim=DIM) == {}
 
 
 def test_effective_weight_uses_the_active_rank_scale():
@@ -286,3 +289,21 @@ def test_an_expert_dim_rounded_above_the_lora_dim_still_restores_to_full_rank():
     assert [m.adapter.active_dim for m in model] == [RANK, DIM]
     with pytest.raises(NotImplementedError, match="normalized dim"):
         set_lora_active_dim(model, RANK - 1, lora_dim=RANK)
+
+
+def test_a_whole_model_cuda_graph_is_refused():
+    """A plain nn.Linear adapter has no config; the model chunk's config still counts."""
+    chunk = nn.Sequential(_lora(nn.Linear(8, 8), DIM))
+    chunk.config = SimpleNamespace(cuda_graph_impl="full_iteration")
+    with pytest.raises(NotImplementedError, match="CUDA graph"):
+        set_lora_active_dim([chunk], RANK, lora_dim=DIM)
+
+
+def test_a_tp_sharded_adapter_on_a_non_parallel_base_is_refused():
+    """The MoE router's adapter is sharded over TP but exported without a gather."""
+    lora = _lora(nn.Linear(8, 8), DIM)
+    lora.adapter.base_linear_is_parallel = False
+    lora.adapter.base_linear_name = "router"
+    lora.adapter.linear_in = nn.Linear(8, DIM // 2, bias=False)
+    with pytest.raises(NotImplementedError, match="non-parallel base"):
+        set_lora_active_dim(lora, RANK, lora_dim=DIM)
