@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, Mock, mock_open, patch
 import numpy as np
 import pytest
 import torch
-from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
@@ -77,7 +77,6 @@ from megatron.bridge.training.checkpointing import (
     maybe_load_dataloader_state,
     maybe_save_dataloader_state,
     read_metadata,
-    resolve_state_to_load,
     save_checkpoint,
     schedule_async_save,
 )
@@ -472,15 +471,6 @@ class TestRNGState:
 
         assert _select_rng_state(states, False, pg_collection) == {"rank": 0}
         assert _select_rng_state(states, True, pg_collection) == {"rank": 2}
-
-    def test_select_rng_state_returns_none_for_dp_cp_rank_without_saved_state(self):
-        """A DP/CP rank beyond the saved payload keeps fresh RNG instead of raising."""
-        pg_collection = Mock()
-        pg_collection.dp_cp.rank.return_value = 3
-        states = [{"rank": 0}, {"rank": 1}]
-
-        assert _select_rng_state(states, True, pg_collection) is None
-        assert _select_rng_state(states, False, pg_collection) == {"rank": 0}
 
     @patch("megatron.bridge.training.checkpointing.get_pg_size")
     @patch("megatron.bridge.training.checkpointing.tensor_parallel")
@@ -6495,84 +6485,3 @@ def test_checkpoint_minor_version_changes_are_compatible(monkeypatch, versions):
     assert checkpointing.get_checkpoint_version() == versions[-1]
     with pytest.raises(AssertionError, match="checkpoint versions do not match"):
         checkpointing.set_checkpoint_version(2.0)
-
-
-class TestResolveStateToLoad:
-    """Tests for resolve_state_to_load.
-
-    Guards resuming at a different replica count. RNG state is sharded by
-    (PP, TP, DP/CP), so its storage key embeds the data-parallel size; rerun
-    state is sharded by world size. Neither can be read back once that
-    dimension changes.
-    """
-
-    @staticmethod
-    def _rng_state(pp_size: int, tp_size: int, dp_size: int, dp_rank: int = 0) -> ShardedObject:
-        """An RNG ShardedObject shaped the way get_rng_state builds it."""
-        return ShardedObject("rng_state", [None], (pp_size, tp_size, dp_size), (0, 0, dp_rank), replica_id=0)
-
-    def test_loads_when_layout_matches(self):
-        rng_state = self._rng_state(pp_size=1, tp_size=8, dp_size=8)
-        metadata = {"rng_state/shard_0.0.0_1.8.8": object()}
-
-        decision = resolve_state_to_load("RNG", rng_state, metadata)
-
-        assert decision.ignore is False
-        assert decision.state is rng_state
-        assert decision == (False, rng_state)  # still unpacks at the call sites
-
-    def test_ignored_when_data_parallel_size_changed(self):
-        """DP 8 -> 12 with TP/PP unchanged: the exact production failure."""
-        rng_state = self._rng_state(pp_size=1, tp_size=8, dp_size=12)
-        metadata = {f"rng_state/shard_0.{tp}.{dp}_1.8.8": object() for tp in range(8) for dp in range(8)}
-
-        assert rng_state.unique_key == "rng_state/shard_0.0.0_1.8.12"
-        assert resolve_state_to_load("RNG", rng_state, metadata) == (True, None)
-
-    def test_ignored_for_every_rank_not_just_the_new_ones(self):
-        """The global shape lives in the key suffix, so even dp_rank 0 misses."""
-        metadata = {f"rng_state/shard_0.0.{dp}_1.8.8": object() for dp in range(8)}
-
-        for dp_rank in range(12):
-            rng_state = self._rng_state(pp_size=1, tp_size=8, dp_size=12, dp_rank=dp_rank)
-            assert resolve_state_to_load("RNG", rng_state, metadata) == (True, None)
-
-    def test_nested_sharded_object_is_found(self):
-        """Rerun state nests its ShardedObject under a "sharded" key."""
-        rerun_state = {
-            "mode": "disabled",
-            "sharded": ShardedObject("rerun_state_machine_state", {}, (96,), (0,)),
-        }
-        matching = {"rerun_state_machine_state/shard_0_96": object()}
-        stale = {"rerun_state_machine_state/shard_0_64": object()}
-
-        assert resolve_state_to_load("Rerun", rerun_state, matching) == (False, rerun_state)
-        assert resolve_state_to_load("Rerun", rerun_state, stale) == (True, None)
-
-    def test_no_candidate_passes_through(self):
-        """None means the caller already decided not to load."""
-        assert resolve_state_to_load("RNG", None, {"anything": object()}) == (True, None)
-
-    def test_no_candidate_still_joins_the_vote_without_vetoing(self):
-        """A rank that skips its own RNG must not hang or veto ranks that can load."""
-        with (
-            patch("torch.distributed.is_initialized", return_value=True),
-            patch("torch.distributed.get_backend", return_value="gloo"),
-            patch("torch.distributed.all_reduce") as all_reduce,
-        ):
-            assert resolve_state_to_load("RNG", None, {"anything": object()}) == (True, None)
-
-        all_reduce.assert_called_once()
-        assert all_reduce.call_args.args[0].item() == 1
-
-    def test_empty_metadata_preserves_existing_behavior(self):
-        """Unreadable or absent metadata must not silently disable loading."""
-        rng_state = self._rng_state(pp_size=1, tp_size=8, dp_size=12)
-
-        assert resolve_state_to_load("RNG", rng_state, {}) == (False, rng_state)
-
-    def test_state_without_sharded_objects_loads(self):
-        """Nothing to verify is not the same as something missing."""
-        metadata = {"rng_state/shard_0.0.0_1.8.8": object()}
-
-        assert resolve_state_to_load("Rerun", {"mode": "disabled"}, metadata) == (False, {"mode": "disabled"})
