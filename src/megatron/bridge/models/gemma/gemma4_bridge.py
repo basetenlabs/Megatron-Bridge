@@ -56,6 +56,8 @@ from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 
 
 # Register Gemma4 custom module types for AutoMapping
+AutoMapping.register_module_type("Gemma4MoEAttention", "replicated")
+# Legacy MoE core attention, selectable via Gemma4ModelProvider.legacy_moe_core_attention.
 AutoMapping.register_module_type("Gemma4TEDotProductAttention", "replicated")
 AutoMapping.register_module_type("Gemma4SelfAttention", "replicated")
 AutoMapping.register_module_type("Gemma4TransformerLayer", "replicated")
@@ -302,6 +304,7 @@ class Gemma4Bridge(MegatronModelBridge):
 
     def _build_moe_provider(self, hf_config) -> Gemma4ModelProvider:
         """Build a Gemma4ModelProvider from HF config (MoE path)."""
+<<<<<<< HEAD
         provider_kwargs = self.hf_config_to_provider_kwargs(hf_config)
         provider_kwargs["num_query_groups"] = _attention_config_value(
             hf_config,
@@ -309,6 +312,17 @@ class Gemma4Bridge(MegatronModelBridge):
             "num_key_value_heads",
             getattr(hf_config, "__dict__", {}).get("num_key_value_heads", 4),
         )
+=======
+        # transformers >= 5.15 guards the per-layer attributes (num_key_value_heads, head_dim)
+        # behind this flag. The global values are the sliding-layer geometry, which is what
+        # the provider wants; the global layers get theirs below.
+        _prev_global_access = getattr(hf_config, "allow_global_per_layer_attribute_access", False)
+        hf_config.allow_global_per_layer_attribute_access = True
+        try:
+            provider_kwargs = self.hf_config_to_provider_kwargs(hf_config)
+        finally:
+            hf_config.allow_global_per_layer_attribute_access = _prev_global_access
+>>>>>>> 6646e5f7e (feat(gemma4): Gemma 4 26B-A4B (MoE) support (#79))
         provider = Gemma4ModelProvider(**provider_kwargs)
 
         provider.window_size = getattr(hf_config, "sliding_window", 1024)
