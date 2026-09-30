@@ -101,6 +101,16 @@ HAVE_TE = all(
 )
 
 
+class _ReplicatedLinear(TELinear):
+    """Duplicated TELinear metadata with a lightweight native linear forward."""
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return nn.functional.linear(x, self.weight), None
+
+    def backward_dw(self) -> None:
+        """Weight gradients are computed by the native autograd graph."""
+
+
 @cache
 def _te_grouped_linear_uses_explicit_m_splits(
     autograd_function: type[torch.autograd.Function],
@@ -1232,7 +1242,11 @@ class ParallelLinearAdapter(nn.Module):
                 raise ValueError("Replicated adapters are only supported for non-expert linears")
             if not HAVE_TE:
                 raise RuntimeError("Replicated adapters require Transformer Engine")
+<<<<<<< HEAD
             self.linear_in = TELinear(
+=======
+            self.linear_in = _ReplicatedLinear(
+>>>>>>> 64f2ba0da (fix(peft): replicate LoRA for duplicated linears)
                 in_features,
                 dim,
                 parallel_mode="duplicated",
@@ -1243,7 +1257,11 @@ class ParallelLinearAdapter(nn.Module):
                 skip_weight_param_allocation=False,
                 tp_group=None,
             )
+<<<<<<< HEAD
             self.linear_out = TELinear(
+=======
+            self.linear_out = _ReplicatedLinear(
+>>>>>>> 64f2ba0da (fix(peft): replicate LoRA for duplicated linears)
                 dim,
                 out_features,
                 parallel_mode="duplicated",
@@ -1305,7 +1323,11 @@ class ParallelLinearAdapter(nn.Module):
                 config=model_parallel_config,
                 bias=False,
                 gather_output=lin_out_gather_output,
+<<<<<<< HEAD
                 init_method=self._get_init_fn(row_init_method, fan_in=dim, fan_out=out_features),
+=======
+                init_method=self._get_init_fn(row_init_method),
+>>>>>>> 64f2ba0da (fix(peft): replicate LoRA for duplicated linears)
                 is_expert=is_expert,
                 tp_group=self.tp_group,
             )
