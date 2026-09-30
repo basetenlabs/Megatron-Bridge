@@ -20,9 +20,15 @@ an O(seq^2) eager mask. Submodule names match the checkpoint one for one, so the
 tower maps with a single wildcard.
 """
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
 
 
 # The released K3 tower. Other values are rejected rather than half-supported.
@@ -37,7 +43,7 @@ _ROPE_MAX_GRID = 512
 _ROPE_THETA = 10000.0
 
 
-def _check_supported(vision_config) -> None:
+def _check_supported(vision_config: "PretrainedConfig") -> None:
     for field, expected in _SUPPORTED.items():
         actual = getattr(vision_config, field)
         if actual != expected:
@@ -89,7 +95,7 @@ class _DividedPosEmb(nn.Module):
 
 
 class _PatchEmbed(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config: "PretrainedConfig") -> None:
         super().__init__()
         self.proj = nn.Conv2d(
             3,
@@ -146,7 +152,7 @@ class _MLP2(nn.Module):
 
 
 class _EncoderLayer(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config: "PretrainedConfig") -> None:
         super().__init__()
         hidden = config.vt_hidden_size
         qkv_hidden = config.qkv_hidden_size or hidden
@@ -176,7 +182,7 @@ class _EncoderLayer(nn.Module):
 
 
 class _Encoder(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config: "PretrainedConfig") -> None:
         super().__init__()
         self.blocks = nn.ModuleList(_EncoderLayer(config) for _ in range(config.vt_num_hidden_layers))
         self.final_layernorm = nn.RMSNorm(config.vt_hidden_size)
@@ -194,7 +200,7 @@ class _Encoder(nn.Module):
 class KimiK3VisionTower(nn.Module):
     """MoonViT3d: patch embedding, bidirectional encoder, 2x2 spatial merge with temporal mean."""
 
-    def __init__(self, vision_config) -> None:
+    def __init__(self, vision_config: "PretrainedConfig") -> None:
         super().__init__()
         _check_supported(vision_config)
         self.merge_kernel_size = tuple(vision_config.merge_kernel_size)
@@ -218,7 +224,7 @@ class KimiK3VisionTower(nn.Module):
 class KimiK3VisionProjector(nn.Module):
     """Patch merger v2: concat each 2x2 group, two-layer MLP, then RMSNorm into the text width."""
 
-    def __init__(self, vision_config) -> None:
+    def __init__(self, vision_config: "PretrainedConfig") -> None:
         super().__init__()
         _check_supported(vision_config)
         kh, kw = vision_config.merge_kernel_size
