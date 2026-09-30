@@ -3,7 +3,7 @@
 [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) is a large sparse MoE model from Moonshot AI. Megatron Bridge supports the published multimodal checkpoint through the `KimiK3Bridge`: the language backbone plus the MoonViT3d vision tower and projector.
 
 ```{note}
-Support for this model is in progress. Conversion (HF → Megatron) and Megatron greedy inference are verified; strict full-checkpoint export, exact round-trip parity, and every training workflow are not. See [Known Limitations](#known-limitations) and the machine-readable [verification card](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/examples/model_verification_cards/kimi-k3/card.yaml) before relying on this path.
+Support for this model is in progress. For the language backbone, conversion (HF → Megatron) and Megatron greedy inference are verified; the vision-layout import (tower mappings, `language_model.` keys) is not yet re-verified through the card's commands. Strict full-checkpoint export, exact round-trip parity, and every training workflow are not verified. See [Known Limitations](#known-limitations) and the machine-readable [verification card](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/examples/model_verification_cards/kimi-k3/card.yaml) before relying on this path.
 ```
 
 ## Supported Variants

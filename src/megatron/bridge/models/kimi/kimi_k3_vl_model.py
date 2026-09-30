@@ -94,7 +94,9 @@ class KimiK3VLModel(MegatronModule):
         per image.
         """
         decoder_input = None
-        if self.pre_process and pixel_values is not None:
+        # One-token steps are cached decoding: the images were spliced at prefill.
+        has_images = pixel_values is not None and pixel_values.size(0) > 0 and input_ids.size(1) > 1
+        if self.pre_process and has_images:
             decoder_input, padding_mask = self._embed_with_images(
                 input_ids, pixel_values, image_grid_thw, packed_seq_params, padding_mask
             )

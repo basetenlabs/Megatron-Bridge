@@ -70,3 +70,18 @@ def test_image_batch_splices_features_into_decoder_input() -> None:
     assert decoder_input.shape == (4, 1, HIDDEN)
     torch.testing.assert_close(decoder_input[1:3, 0], features)
     assert torch.count_nonzero(decoder_input[[0, 3]]) == 0
+
+
+def test_cached_decode_step_skips_the_tower() -> None:
+    """Decoding keeps pixel_values attached; one-token steps must not re-splice."""
+    model = _model()
+    features = torch.ones(2, HIDDEN)
+
+    KimiK3VLModel.forward(
+        model, input_ids=torch.tensor([[5]]), pixel_values=features, image_grid_thw=torch.tensor([[1, 2, 2]])
+    )
+    KimiK3VLModel.forward(model, input_ids=torch.tensor([[1, 2]]), pixel_values=torch.empty(0, HIDDEN))
+
+    for call in model.language_model.forward.call_args_list:
+        assert call.kwargs["decoder_input"] is None
+    model.language_model.embedding.assert_not_called()
