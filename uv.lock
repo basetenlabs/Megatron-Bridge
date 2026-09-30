@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = "==3.12.*"
 resolution-markers = [
     "sys_platform == 'win32'",
@@ -2226,10 +2226,17 @@ requires-dist = [
     { name = "diffusers", specifier = ">=0.36.0" },
     { name = "einops" },
     { name = "fast-hadamard-transform", specifier = ">=1.1.0" },
+<<<<<<< HEAD
     { name = "flash-linear-attention" },
     { name = "flashinfer-cubin", specifier = "==0.6.18.post1", index = "https://flashinfer.ai/whl/" },
     { name = "flashinfer-python", specifier = "==0.6.18.post1", index = "https://flashinfer.ai/whl/" },
     { name = "hydra-core", specifier = ">=1.3.4,<1.4" },
+=======
+    { name = "flash-linear-attention", specifier = ">=0.5.2" },
+    { name = "flashinfer-cubin", specifier = "==0.6.8.post1" },
+    { name = "flashinfer-python", specifier = "==0.6.8.post1" },
+    { name = "hydra-core", specifier = ">1.3,<=1.3.2" },
+>>>>>>> 4a9ccd0c4 (feat(glm5-next): GLM-5.3-Flash support)
     { name = "librosa", marker = "extra == 'audio'" },
     { name = "mamba-ssm", marker = "extra == 'ssm'", specifier = "==2.3.1" },
     { name = "megatron-core", extras = ["dev", "inference", "mlm", "te"], editable = "3rdparty/Megatron-LM" },
@@ -2256,7 +2263,11 @@ requires-dist = [
     { name = "timm" },
     { name = "torch", specifier = ">=2.6.0" },
     { name = "tqdm", specifier = ">=4.67.1" },
+<<<<<<< HEAD
     { name = "transformers", specifier = ">=5.12.1,<=5.15.0" },
+=======
+    { name = "transformers", specifier = ">=5.15.1,<6" },
+>>>>>>> 4a9ccd0c4 (feat(glm5-next): GLM-5.3-Flash support)
     { name = "typing-extensions" },
     { name = "wandb", specifier = ">=0.25.0" },
 ]
@@ -2367,10 +2378,17 @@ requires-dist = [
     { name = "causal-conv1d", marker = "extra == 'ssm'", specifier = "~=1.5" },
     { name = "datasets", marker = "extra == 'dev'" },
     { name = "einops", marker = "extra == 'dev'", specifier = "~=0.8" },
+<<<<<<< HEAD
     { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.3.0" },
     { name = "fast-hadamard-transform", marker = "extra == 'dev'", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = "~=0.50" },
     { name = "flash-linear-attention", marker = "extra == 'ssm'", specifier = "==0.5.1" },
+=======
+    { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.2.0" },
+    { name = "fast-hadamard-transform", marker = "extra == 'dev'" },
+    { name = "fastapi", marker = "extra == 'dev'", specifier = "~=0.50" },
+    { name = "flash-linear-attention", marker = "extra == 'dev'", specifier = ">=0.5.2,<0.6" },
+>>>>>>> 4a9ccd0c4 (feat(glm5-next): GLM-5.3-Flash support)
     { name = "flashinfer-python", marker = "extra == 'dev'", specifier = ">=0.5.0,<0.7.0" },
     { name = "flask-restful", marker = "extra == 'mlm'" },
     { name = "flask-restful", marker = "extra == 'training'" },
@@ -2383,7 +2401,11 @@ requires-dist = [
     { name = "nemo-lens", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
     { name = "nemo-lens", extras = ["sdk"], marker = "extra == 'otel'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
     { name = "numpy" },
+<<<<<<< HEAD
     { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", specifier = "==1.28.0" },
+=======
+    { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", specifier = ">=1.26.0" },
+>>>>>>> 4a9ccd0c4 (feat(glm5-next): GLM-5.3-Flash support)
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = ">=0.44" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", specifier = "==0.7.0" },
     { name = "omegaconf", marker = "extra == 'mlm'" },
@@ -2403,7 +2425,11 @@ requires-dist = [
     { name = "torch", specifier = ">=2.6.0" },
     { name = "torch-memory-saver", marker = "extra == 'inference'", git = "https://github.com/fzyzcjy/torch_memory_saver.git?rev=9bc9a442e6d108c7b7903def199896a005143aaf" },
     { name = "tqdm", marker = "extra == 'dev'" },
+<<<<<<< HEAD
     { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=5e52befd5262c06289106338c308079d6adb391f" },
+=======
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=4329ff84bfbdaa778a33cba02a15fb0807c64689" },
+>>>>>>> 4a9ccd0c4 (feat(glm5-next): GLM-5.3-Flash support)
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "transformers", marker = "extra == 'training'" },
     { name = "wandb", marker = "extra == 'mlm'" },
@@ -2411,7 +2437,11 @@ requires-dist = [
     { name = "wget", marker = "extra == 'dev'" },
     { name = "zstandard", marker = "extra == 'dev'" },
 ]
+<<<<<<< HEAD
 provides-extras = ["training", "mlm", "dev", "inference", "otel", "lts", "te", "ssm"]
+=======
+provides-extras = ["training", "mlm", "dev", "otel", "lts", "te", "ssm"]
+>>>>>>> 4a9ccd0c4 (feat(glm5-next): GLM-5.3-Flash support)
 
 [package.metadata.requires-dev]
 batch-invariant = [{ name = "deep-gemm", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=714dd1a4a980f7937a74343d19a8eba4fe321480" }]
@@ -2790,6 +2820,14 @@ dependencies = [
 wheels = [
     { url = "https://pypi.nvidia.com/nccl4py/nccl4py-0.5.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c746674a3ec0a46492efd98ffcb641f48b42313ca6347c8e4944eb0030dedd5a" },
     { url = "https://pypi.nvidia.com/nccl4py/nccl4py-0.5.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:51156cbc35eb9122b870aa7ba1244d0c4781266442036c2bb3e1abb7e88d9376" },
+]
+
+[[package]]
+name = "nemo-lens"
+version = "0.2.0+b85578f"
+source = { git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d#b85578fc2b736a1804705e537001b5f45e9c715d" }
+dependencies = [
+    { name = "opentelemetry-api" },
 ]
 
 [[package]]
@@ -4757,6 +4795,7 @@ name = "torch"
 version = "2.14.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+<<<<<<< HEAD
     { name = "cuda-bindings", marker = "platform_machine != 'aarch64' and sys_platform == 'linux'" },
     { name = "filelock", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')" },
     { name = "fsspec", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')" },
@@ -4766,6 +4805,17 @@ dependencies = [
     { name = "sympy", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')" },
     { name = "triton", marker = "sys_platform == 'never'" },
     { name = "typing-extensions", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')" },
+=======
+    { name = "cuda-bindings", marker = "python_version < '0'" },
+    { name = "filelock" },
+    { name = "fsspec" },
+    { name = "jinja2" },
+    { name = "networkx" },
+    { name = "setuptools" },
+    { name = "sympy" },
+    { name = "triton" },
+    { name = "typing-extensions" },
+>>>>>>> 4a9ccd0c4 (feat(glm5-next): GLM-5.3-Flash support)
 ]
 
 [[package]]
@@ -4793,9 +4843,15 @@ name = "torchvision"
 version = "0.29.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+<<<<<<< HEAD
     { name = "numpy", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')" },
     { name = "pillow", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')" },
     { name = "torch", marker = "sys_platform == 'never'" },
+=======
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "torch" },
+>>>>>>> 4a9ccd0c4 (feat(glm5-next): GLM-5.3-Flash support)
 ]
 
 [[package]]
@@ -4832,13 +4888,17 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
+<<<<<<< HEAD
 version = "2.19.0+5e52befd"
 source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=5e52befd5262c06289106338c308079d6adb391f#5e52befd5262c06289106338c308079d6adb391f" }
+=======
+version = "2.17.1+4329ff84"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=4329ff84bfbdaa778a33cba02a15fb0807c64689#4329ff84bfbdaa778a33cba02a15fb0807c64689" }
+>>>>>>> 4a9ccd0c4 (feat(glm5-next): GLM-5.3-Flash support)
 dependencies = [
     { name = "einops" },
     { name = "importlib-metadata" },
     { name = "nvdlfw-inspect" },
-    { name = "nvidia-cudnn-frontend" },
     { name = "onnx" },
     { name = "onnxscript" },
     { name = "packaging" },
@@ -4848,7 +4908,11 @@ dependencies = [
 
 [[package]]
 name = "transformers"
+<<<<<<< HEAD
 version = "5.15.0"
+=======
+version = "5.15.1"
+>>>>>>> 4a9ccd0c4 (feat(glm5-next): GLM-5.3-Flash support)
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub" },
@@ -4861,9 +4925,15 @@ dependencies = [
     { name = "tqdm" },
     { name = "typer" },
 ]
+<<<<<<< HEAD
 sdist = { url = "https://files.pythonhosted.org/packages/a6/3f/d89353267d511e18f137dfd7769d07837350c11b88408ce1dfe2e93e56c7/transformers-5.15.0.tar.gz", hash = "sha256:bbf98f57b2ddd7c4ecbccfa2c0069017aa6fd01cc204bd50cbc0eeadcf2a13b8", size = 9377983, upload-time = "2026-08-10T10:27:23.261Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d8/43/81355710a4c84e9420e11a86d41a5364deb561f2ef36dfdf254a07371bbb/transformers-5.15.0-py3-none-any.whl", hash = "sha256:d7f007736f67749ae9490c4f8cb5d30b452ae2d68c8675e50ba8d63ea7feb107", size = 11749280, upload-time = "2026-08-10T10:27:20.416Z" },
+=======
+sdist = { url = "https://files.pythonhosted.org/packages/2a/92/c50c61da7046bbb59a4d011291aeadcfb4d7980ab36fdb31e93823a3fb93/transformers-5.15.1.tar.gz", hash = "sha256:27c996bd9075ddc82d40f8590dfdc81ea45f611bfca477e0db5d7fd257a482f7", size = 9378434, upload-time = "2026-08-19T11:28:20.33Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/41/c4/a12e1d9b387fb0c40a57116db82b457e8c771cb419163cda29204d74a595/transformers-5.15.1-py3-none-any.whl", hash = "sha256:b7cdf238ff583e3a58dbc7fa34da1aaf091ce063141f65a30538160bd5afe93f", size = 11749582, upload-time = "2026-08-19T11:28:16.726Z" },
+>>>>>>> 4a9ccd0c4 (feat(glm5-next): GLM-5.3-Flash support)
 ]
 
 [[package]]
