@@ -304,7 +304,6 @@ class Gemma4Bridge(MegatronModelBridge):
 
     def _build_moe_provider(self, hf_config) -> Gemma4ModelProvider:
         """Build a Gemma4ModelProvider from HF config (MoE path)."""
-<<<<<<< HEAD
         provider_kwargs = self.hf_config_to_provider_kwargs(hf_config)
         provider_kwargs["num_query_groups"] = _attention_config_value(
             hf_config,
@@ -312,17 +311,6 @@ class Gemma4Bridge(MegatronModelBridge):
             "num_key_value_heads",
             getattr(hf_config, "__dict__", {}).get("num_key_value_heads", 4),
         )
-=======
-        # transformers >= 5.15 guards the per-layer attributes (num_key_value_heads, head_dim)
-        # behind this flag. The global values are the sliding-layer geometry, which is what
-        # the provider wants; the global layers get theirs below.
-        _prev_global_access = getattr(hf_config, "allow_global_per_layer_attribute_access", False)
-        hf_config.allow_global_per_layer_attribute_access = True
-        try:
-            provider_kwargs = self.hf_config_to_provider_kwargs(hf_config)
-        finally:
-            hf_config.allow_global_per_layer_attribute_access = _prev_global_access
->>>>>>> 6646e5f7e (feat(gemma4): Gemma 4 26B-A4B (MoE) support (#79))
         provider = Gemma4ModelProvider(**provider_kwargs)
 
         provider.window_size = getattr(hf_config, "sliding_window", 1024)
@@ -708,9 +696,7 @@ class Gemma4Bridge(MegatronModelBridge):
                 hidden_size = config.hidden_size
                 attention_output_gate = getattr(config, "attention_output_gate", False)
 
-            q_out, k_out, v_out = split_qkv_weights(
-                _GlobalAttnCfg(), linear_out_weight, feature_dim=feature_dim
-            )
+            q_out, k_out, v_out = split_qkv_weights(_GlobalAttnCfg(), linear_out_weight, feature_dim=feature_dim)
             # ABSENT_PROJECTION is only true under K=V tying, where HF ships no
             # v_proj weight for these layers. Without the flag the global layers
             # have a live V that goes through _v_norm into attention, and

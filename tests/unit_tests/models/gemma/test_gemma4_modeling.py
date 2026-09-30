@@ -43,6 +43,7 @@ from megatron.bridge.models.gemma.modeling_gemma4 import (
     Gemma4RMSNorm,
     Gemma4RotaryEmbedding,
     Gemma4SelfAttention,
+    Gemma4TEDotProductAttention,
     Gemma4TopKRouter,
     Gemma4TransformerLayer,
     _attach_ple_modules,
@@ -840,9 +841,9 @@ class TestGemma4SelfAttention:
         assert calls["rotary_pos_emb"] is global_rope
 
 
-<<<<<<< HEAD
 class TestGemma4TEDotProductAttention:
-    def test_image_attention_keeps_future_image_tokens_in_window(self, monkeypatch):
+    @pytest.mark.parametrize("layer_number", [1, 2])
+    def test_image_attention_uses_explicit_mask_only_for_sliding_layers(self, monkeypatch, layer_number):
         from megatron.core.transformer.enums import AttnMaskType
 
         calls = {}
@@ -857,11 +858,12 @@ class TestGemma4TEDotProductAttention:
             text_config=SimpleNamespace(use_bidirectional_attention="vision"),
         )
         Gemma4TEDotProductAttention(
-            config=config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type="self"
+            config=config, layer_number=layer_number, attn_mask_type=AttnMaskType.causal, attention_type="self"
         )
 
         assert calls["config"].window_size is None
-        assert calls["attn_mask_type"] == AttnMaskType.arbitrary
+        expected_mask_type = AttnMaskType.arbitrary if layer_number == 1 else AttnMaskType.causal
+        assert calls["attn_mask_type"] == expected_mask_type
         assert config.window_size == 512
 
     @pytest.mark.parametrize("image_bidirectional", [True, False])
@@ -913,7 +915,7 @@ class TestGemma4TEDotProductAttention:
         assert calls["mask"][0, 0, 3, 2].item() is False
         assert calls["mask"][0, 0, 0, 1].item() is (not with_image_mask)
 
-=======
+
 def _moe_cfg(**overrides):
     """MoE attention config with the fields the shared base reads (flex flag, SDPA scale/dropout, CP)."""
     cfg = dict(
@@ -929,7 +931,6 @@ def _moe_cfg(**overrides):
 
 
 class TestGemma4MoEAttention:
->>>>>>> 6646e5f7e (feat(gemma4): Gemma 4 26B-A4B (MoE) support (#79))
     def test_init_sets_local_window_size(self, monkeypatch):
         calls = []
 
@@ -962,14 +963,6 @@ class TestGemma4MoEAttention:
             "megatron.bridge.models.gemma.modeling_gemma4.TEDotProductAttention.__init__",
             fake_init,
         )
-<<<<<<< HEAD
-        cfg = SimpleNamespace(
-            interleaved_attn_pattern=(1, 1),
-            window_size=512,
-            text_config=SimpleNamespace(use_bidirectional_attention="vision"),
-        )
-=======
->>>>>>> 6646e5f7e (feat(gemma4): Gemma 4 26B-A4B (MoE) support (#79))
 
         Gemma4MoEAttention(
             config=_moe_cfg(),
@@ -1099,9 +1092,7 @@ class TestGemma4DenseCoreAttention:
     def test_sdpa_prefers_is_causal_when_no_mask(self, monkeypatch):
         """No explicit mask means never allocating [sq, sk]."""
         layer, _ = self._build(monkeypatch, layer_number=2)
-        attn_mask, is_causal = layer._sdpa_attention_mask(
-            None, AttnMaskType.causal, q_len=4, kv_len=4
-        )
+        attn_mask, is_causal = layer._sdpa_attention_mask(None, AttnMaskType.causal, q_len=4, kv_len=4)
         assert attn_mask is None and is_causal is True
 
     def test_sdpa_decode_step_needs_no_causal_mask(self, monkeypatch):
@@ -1112,9 +1103,7 @@ class TestGemma4DenseCoreAttention:
     def test_sdpa_rejects_a_non_bool_mask(self, monkeypatch):
         layer, _ = self._build(monkeypatch, layer_number=2)
         with pytest.raises(TypeError, match="boolean"):
-            layer._sdpa_attention_mask(
-                torch.zeros(1, 1, 2, 2), AttnMaskType.padding_causal, 2, 2
-            )
+            layer._sdpa_attention_mask(torch.zeros(1, 1, 2, 2), AttnMaskType.padding_causal, 2, 2)
 
 
 class TestGemma4RotaryEmbeddings:
@@ -2097,7 +2086,8 @@ class TestGemma4MoEHelpers:
         assert layer.pre_shared_expert_layernorm.weight.sequence_parallel is True
         assert layer.post_ffn_layernorm.weight.sequence_parallel is True
 
-    def test_gemma4_block_spec_patches_attention_layer_and_moe_modules(self, monkeypatch):
+    @pytest.mark.parametrize("legacy_moe_core_attention", [False, True])
+    def test_gemma4_block_spec_patches_attention_layer_and_moe_modules(self, monkeypatch, legacy_moe_core_attention):
         from megatron.core.transformer.attention import SelfAttention
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
@@ -2122,13 +2112,15 @@ class TestGemma4MoEHelpers:
             fake_get_gpt_decoder_block_spec,
         )
 
-        out = _gemma4_block_spec("config", use_transformer_engine=True, extra="value")
+        config = SimpleNamespace(legacy_moe_core_attention=legacy_moe_core_attention)
+        out = _gemma4_block_spec(config, use_transformer_engine=True, extra="value")
 
         assert out is block_spec
-        assert calls == [("config", True, {"extra": "value"})]
+        assert calls == [(config, True, {"extra": "value"})]
         assert layer_spec.module is Gemma4TransformerLayer
         assert layer_spec.submodules.self_attention.module is Gemma4SelfAttention
-        assert attn_submodules.core_attention is Gemma4MoEAttention
+        expected_attention = Gemma4TEDotProductAttention if legacy_moe_core_attention else Gemma4MoEAttention
+        assert attn_submodules.core_attention is expected_attention
         assert attn_submodules.linear_proj != "old_proj"
         assert layer_spec.submodules.mlp.module is Gemma4MoELayer
         assert mlp_submodules.router is Gemma4TopKRouter

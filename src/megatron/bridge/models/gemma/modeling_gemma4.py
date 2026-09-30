@@ -926,9 +926,7 @@ class Gemma4CoreAttention(TEDotProductAttention):
                 )
             self.force_flex_attention = bool(config.force_flex_attention)
             self._gemma4_window = config.window_size
-            self._sliding_softmax_scale = (
-                softmax_scale if softmax_scale is not None else config.softmax_scale
-            )
+            self._sliding_softmax_scale = softmax_scale if softmax_scale is not None else config.softmax_scale
             self._sliding_attention_dropout = (
                 config.attention_dropout if attention_dropout is None else attention_dropout
             )
@@ -1098,9 +1096,7 @@ class Gemma4CoreAttention(TEDotProductAttention):
 
         mask_type = attn_mask_type if attn_mask_type is not None else self._sliding_attn_mask_type
         if mask_type not in (AttnMaskType.causal, AttnMaskType.padding_causal):
-            raise ValueError(
-                f"Gemma 4 sliding attention expects a causal mask type; got {mask_type}."
-            )
+            raise ValueError(f"Gemma 4 sliding attention expects a causal mask type; got {mask_type}.")
         if attention_mask is not None:
             # A padding mask would have to be AND-ed into mask_mod. Dropping it would
             # silently attend to padding, so refuse instead of guessing.
@@ -1119,8 +1115,7 @@ class Gemma4CoreAttention(TEDotProductAttention):
         window = self._gemma4_window
         if not window or window[1]:
             raise ValueError(
-                "Gemma 4 sliding attention expects a left-only causal window "
-                f"(left, 0); got window_size={window!r}."
+                f"Gemma 4 sliding attention expects a left-only causal window (left, 0); got window_size={window!r}."
             )
         left = int(window[0])
 
@@ -1134,11 +1129,7 @@ class Gemma4CoreAttention(TEDotProductAttention):
         # [s, b, np, hn] -> [b, np, s, hn]; hn stays stride-1, so these are views.
         query, key, value = (tensor.permute(1, 2, 0, 3) for tensor in (query, key, value))
 
-        scale = (
-            self._sliding_softmax_scale
-            if self._sliding_softmax_scale is not None
-            else query.size(-1) ** -0.5
-        )
+        scale = self._sliding_softmax_scale if self._sliding_softmax_scale is not None else query.size(-1) ** -0.5
         block_mask = _sliding_block_mask(left, query.size(2), key.size(2), str(query.device))
 
         context = _compiled_flex_attention()(query, key, value, block_mask=block_mask, scale=scale)
@@ -1217,36 +1208,6 @@ class Gemma4MoEAttention(Gemma4CoreAttention):
         if isinstance(window, (tuple, list)):
             return tuple(window)
         return (window - 1, 0)
-
-
-class Gemma4TEDotProductAttention(TEDotProductAttention):
-    """Pre-refactor MoE core attention on plain TE, selectable via ``legacy_moe_core_attention``
-    for bisection. Cannot serve the hd512 global layers.
-    """
-
-    def __init__(
-        self,
-        config: TransformerConfig,
-        layer_number: int,
-        attn_mask_type: AttnMaskType,
-        attention_type: str,
-        attention_dropout: Optional[float] = None,
-        **kwargs,
-    ):
-        config = copy.deepcopy(config)
-        if _is_local_attn_layer(layer_number, config.interleaved_attn_pattern):
-            config.window_size = (config.window_size - 1, 0)
-        else:
-            config.window_size = None
-
-        super().__init__(
-            config=config,
-            layer_number=layer_number,
-            attn_mask_type=attn_mask_type,
-            attention_type=attention_type,
-            attention_dropout=attention_dropout,
-            **kwargs,
-        )
 
 
 def get_gemma4_layer_spec(config: Optional[TransformerConfig] = None) -> ModuleSpec:
@@ -2245,7 +2206,6 @@ class Gemma4SelfAttention(SelfAttention):
         )
 
 
-<<<<<<< HEAD
 class Gemma4TEDotProductAttention(TEDotProductAttention):
     """Gemma 4 MoE core attention — switches between sliding and global window."""
 
@@ -2309,8 +2269,6 @@ class Gemma4TEDotProductAttention(TEDotProductAttention):
         return super().forward(query, key, value, attention_mask, attn_mask_type, **kwargs)
 
 
-=======
->>>>>>> 6646e5f7e (feat(gemma4): Gemma 4 26B-A4B (MoE) support (#79))
 class Gemma4RotaryEmbedding(RotaryEmbedding):
     """Gemma 4 MoE position RoPE — dual local/global embeddings."""
 
