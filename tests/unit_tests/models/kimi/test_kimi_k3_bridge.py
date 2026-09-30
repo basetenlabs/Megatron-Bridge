@@ -18,7 +18,6 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from megatron.bridge.models.conversion.model_bridge import HFWeightTuple, MegatronModelBridge
 from megatron.bridge.models.conversion.param_mapping import (
     ColumnParallelMapping,
     ReplicatedMapping,
@@ -194,45 +193,62 @@ def test_kda_a_log_export_restores_zero_padding() -> None:
     assert torch.count_nonzero(result[name][96:]).item() == 0
 
 
-def test_export_preserves_unconverted_multimodal_weights(monkeypatch: pytest.MonkeyPatch) -> None:
-    """K3 keeps the published vision tower and projector in strict HF exports."""
-    language = torch.tensor([1.0])
-    vision = torch.tensor([2.0])
-    projector = torch.tensor([3.0])
-    unrelated = torch.tensor([4.0])
-    tensors = {
-        "vision_tower.encoder.weight": vision,
-        "mm_projector.proj.weight": projector,
-        "unrelated.weight": unrelated,
-    }
+@pytest.fixture
+def kimi_k3_vl_pretrained(kimi_k3_pretrained: Mock) -> Mock:
+    """The same proxy with the released checkpoint's vision tower config."""
+    kimi_k3_pretrained.config.vision_config = SimpleNamespace(vt_hidden_size=1024, text_hidden_size=7168)
+    kimi_k3_pretrained.config.media_placeholder_token_id = 163605
+    return kimi_k3_pretrained
 
-    class _Source:
-        @staticmethod
-        def get_all_keys() -> list[str]:
-            return list(tensors)
 
-    class _State:
-        source = _Source()
+def test_provider_bridge_enables_vision_from_checkpoint(kimi_k3_vl_pretrained: Mock) -> None:
+    """A checkpoint with a tower builds the VL model, whose splice needs unscattered embeddings."""
+    provider = KimiK3Bridge().provider_bridge(kimi_k3_vl_pretrained)
 
-        def __getitem__(self, name: str) -> torch.Tensor:
-            return tensors[name]
+    assert provider.vision_config is kimi_k3_vl_pretrained.config.vision_config
+    assert provider.media_placeholder_token_id == 163605
+    assert provider.scatter_embedding_sequence_parallel is False
 
-    monkeypatch.setattr(
-        MegatronModelBridge,
-        "stream_weights_megatron_to_hf",
-        lambda *_args, **_kwargs: iter((HFWeightTuple("language_model.weight", language),)),
-    )
-    pretrained = SimpleNamespace(state=_State())
 
-    result = list(KimiK3Bridge().stream_weights_megatron_to_hf([], pretrained))
+def test_provider_bridge_without_vision_keeps_text_model(kimi_k3_pretrained: Mock) -> None:
+    provider = KimiK3Bridge().provider_bridge(kimi_k3_pretrained)
 
-    assert [item.param_name for item in result] == [
-        "language_model.weight",
-        "vision_tower.encoder.weight",
-        "mm_projector.proj.weight",
-    ]
-    torch.testing.assert_close(result[1].weight, vision, rtol=0, atol=0)
-    torch.testing.assert_close(result[2].weight, projector, rtol=0, atol=0)
+    assert provider.vision_config is None
+    assert provider.scatter_embedding_sequence_parallel is True
+
+
+def test_provider_rejects_vision_with_scattering_embedding(kimi_k3_vl_pretrained: Mock) -> None:
+    provider = KimiK3Bridge().provider_bridge(kimi_k3_vl_pretrained)
+    provider.scatter_embedding_sequence_parallel = True
+
+    with pytest.raises(ValueError, match="scatter_embedding_sequence_parallel"):
+        provider.provide()
+
+
+def test_mapping_registry_nests_backbone_and_replicates_tower(kimi_k3_vl_pretrained: Mock) -> None:
+    """With a tower the backbone sits under ``language_model.``; tower names match the checkpoint."""
+    bridge = KimiK3Bridge()
+    bridge.provider_bridge(kimi_k3_vl_pretrained)
+    bridge.hf_config = kimi_k3_vl_pretrained.config
+    registry = bridge.mapping_registry()
+
+    backbone = registry.megatron_to_hf_lookup("language_model.decoder.layers.1.self_attention.o_proj.weight")
+    assert isinstance(backbone, RowParallelMapping)
+    assert backbone.hf_param == "language_model.model.layers.1.self_attn.o_proj.weight"
+    assert registry.megatron_to_hf_lookup("decoder.layers.1.self_attention.o_proj.weight") is None
+    last_layer = registry.megatron_to_hf_lookup("language_model.decoder.layers.3.output_attn_res_proj.weight")
+    assert last_layer.hf_param == "language_model.model.output_attn_res_proj.weight"
+
+    for name in (
+        "vision_tower.encoder.blocks.0.wqkv.weight",
+        "vision_tower.patch_embed.pos_emb.weight",
+        "mm_projector.proj.2.weight",
+        "mm_projector.post_norm.weight",
+    ):
+        mapping = registry.megatron_to_hf_lookup(name)
+        assert isinstance(mapping, ReplicatedMapping)
+        assert mapping.hf_param == name
+        assert registry.hf_to_megatron_lookup(name).megatron_param == name
 
 
 def test_stage_boundary_pack_unpack_and_bank_schedule() -> None:

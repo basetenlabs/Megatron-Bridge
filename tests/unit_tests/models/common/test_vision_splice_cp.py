@@ -6,7 +6,7 @@ Under context parallelism each rank sees one zigzag THD shard of the sequence, b
 the vision tower produces every image's features in global document order. The
 plain ``masked_scatter`` the cp=1 path uses consumes that tensor from the front, so
 on any rank but 0 it splices the wrong images -- and the shapes still line up, so
-nothing raises. ``_local_feature_index`` is what prevents that.
+nothing raises. ``local_feature_index`` is what prevents that.
 
 The property checked here is the whole contract: for every local placeholder, the
 returned feature row equals the count of image tokens before it in the *global*
@@ -15,12 +15,13 @@ indexer uses, which is what the model does at runtime -- this test covers the in
 arithmetic layered on top of it, not the helper.
 
 The arithmetic is device-independent, so this runs on CPU over gloo and needs no
-GPU. Run standalone: ``python test_glm5_next_vl_cp.py``.
+GPU. Run standalone: ``python test_vision_splice_cp.py``.
 """
 
 import os
 
 import torch
+
 
 CP = int(os.environ.get("BT_VL_CP_SIZE", "2"))
 
@@ -42,13 +43,11 @@ def _cu_seqlens(lengths, device):
 
 
 def _run_rank(rank: int, world: int, rdv_file: str, result_file: str):
-    torch.distributed.init_process_group(
-        "gloo", init_method=f"file://{rdv_file}", world_size=world, rank=rank
-    )
+    torch.distributed.init_process_group("gloo", init_method=f"file://{rdv_file}", world_size=world, rank=rank)
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.transformer.experimental_attention_variant import dsa_layout
 
-    from megatron.bridge.models.glm5_next.glm5_next_vl_model import Glm5NextVLModel
+    from megatron.bridge.models.common.vision_splice import local_feature_index
 
     cp_group = torch.distributed.new_group(list(range(world)))
     device = torch.device("cpu")
@@ -81,17 +80,13 @@ def _run_rank(rank: int, world: int, rdv_file: str, result_file: str):
     local_ids[in_range] = global_ids.index_select(0, positions[in_range])
     placeholders = local_ids == IMAGE_TOKEN
 
-    got = Glm5NextVLModel._local_feature_index(
-        None, placeholders, psp, cp_group, n_features=len(IMAGE_POSITIONS)
-    )
+    got = local_feature_index(placeholders, psp, cp_group, n_features=len(IMAGE_POSITIONS))
 
     # A tower/token-count disagreement must raise rather than resolve to a
     # plausible-looking index.
     mismatch_raised = False
     try:
-        Glm5NextVLModel._local_feature_index(
-            None, placeholders, psp, cp_group, n_features=len(IMAGE_POSITIONS) - 1
-        )
+        local_feature_index(placeholders, psp, cp_group, n_features=len(IMAGE_POSITIONS) - 1)
     except ValueError:
         mismatch_raised = True
 
@@ -102,9 +97,7 @@ def _run_rank(rank: int, world: int, rdv_file: str, result_file: str):
     mismatch = int((got != want).sum().item()) + (0 if mismatch_raised else 1000)
     counted = int(placeholders.sum().item())
     gathered = [torch.zeros(2, dtype=torch.int64, device=device) for _ in range(world)]
-    torch.distributed.all_gather(
-        gathered, torch.tensor([mismatch, counted], dtype=torch.int64, device=device)
-    )
+    torch.distributed.all_gather(gathered, torch.tensor([mismatch, counted], dtype=torch.int64, device=device))
     if rank == 0:
         bad = sum(int(t[0].item()) for t in gathered)
         seen = sum(int(t[1].item()) for t in gathered)
@@ -114,7 +107,7 @@ def _run_rank(rank: int, world: int, rdv_file: str, result_file: str):
     torch.distributed.destroy_process_group()
 
 
-def test_glm5_next_vision_splice_cp_indices_match_global_order():
+def test_vision_splice_cp_indices_match_global_order():
     import re
     import subprocess
     import sys

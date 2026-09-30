@@ -37,13 +37,14 @@ import types
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from torch import Tensor
-
 from megatron.core.tensor_parallel import scatter_to_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
+from torch import Tensor
 
+from megatron.bridge.models.common.vision_splice import context_parallel_group, splice_features
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
+
 
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -142,9 +143,7 @@ class Glm5NextVLModel(MegatronModule):
 
             if pixel_values is not None:
                 image_embeds = self.get_image_features(pixel_values, image_grid_thw).pooler_output
-                image_embeds = torch.cat(image_embeds, dim=0).to(
-                    inputs_embeds.device, inputs_embeds.dtype
-                )
+                image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = self._splice(
                     inputs_embeds,
                     input_ids,
@@ -156,9 +155,7 @@ class Glm5NextVLModel(MegatronModule):
 
             if pixel_values_videos is not None:
                 video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw).pooler_output
-                video_embeds = torch.cat(video_embeds, dim=0).to(
-                    inputs_embeds.device, inputs_embeds.dtype
-                )
+                video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = self._splice(
                     inputs_embeds,
                     input_ids,
@@ -171,11 +168,7 @@ class Glm5NextVLModel(MegatronModule):
             inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()
 
             if self.config.sequence_parallel:
-                tp_group = (
-                    self.config._pg_collection.tp
-                    if self.config._pg_collection is not None
-                    else None
-                )
+                tp_group = self.config._pg_collection.tp if self.config._pg_collection is not None else None
                 inputs_embeds = scatter_to_sequence_parallel_region(inputs_embeds, group=tp_group)
                 if padding_mask is not None:
                     # GPTModel scatters this alongside its own embedding, but that
@@ -185,9 +178,7 @@ class Glm5NextVLModel(MegatronModule):
                     # the hidden states it is indexed against. Same transpose dance
                     # as upstream: the mask is [batch, seq].
                     padding_mask = (
-                        scatter_to_sequence_parallel_region(
-                            padding_mask.transpose(0, 1).contiguous(), group=tp_group
-                        )
+                        scatter_to_sequence_parallel_region(padding_mask.transpose(0, 1).contiguous(), group=tp_group)
                         .transpose(0, 1)
                         .contiguous()
                     )
@@ -216,112 +207,13 @@ class Glm5NextVLModel(MegatronModule):
             padding_mask=padding_mask,
         )
 
-    def _cp_group(self):
-        """The context-parallel process group, or None when CP is off."""
-        collection = getattr(self.config, "_pg_collection", None)
-        group = getattr(collection, "cp", None) if collection is not None else None
-        return group if group is not None and group.size() > 1 else None
-
-    def _local_feature_index(self, placeholders, packed_seq_params, cp_group, n_features=None):
-        """Which multimodal feature row each local placeholder wants.
-
-        Under context parallelism the sequence reaching this model is already one
-        zigzag THD shard, but the vision tower produces every image's features in
-        global document order. ``masked_scatter`` consumes that tensor from the
-        front, so on any rank but 0 it would splice the wrong images -- silently,
-        because the shapes still line up.
-
-        The fix is to look each local placeholder up by its rank among *global*
-        placeholders. Positions come from the same helper the DSA indexer uses for
-        its own CP bookkeeping, so this makes no independent assumption about the
-        zigzag layout; the global placeholder mask is rebuilt by all-gathering the
-        local ones and scattering them into those positions.
-
-        That all-gather is a collective, so every rank in the CP group has to reach
-        it. It holds because the data path attaches the batch's vision tensors to
-        every CP rank whole rather than sharding them, which makes ``pixel_values is
-        not None`` -- the condition guarding this call -- uniform across the group.
-        A path that gave images to only some CP ranks would deadlock here.
-
-        Indexing also makes the tower's gradients come out right, which is a second
-        reason not to reach for a cheaper trick. Every global placeholder belongs to
-        exactly one rank's shard, so the index sets are disjoint; the write's
-        backward hands each rank gradient only for the feature rows it read, and the
-        gradient reduction across the CP group reassembles the whole thing with
-        nothing double-counted. The tower runs redundantly per rank, but it is not
-        trained redundantly.
-
-        The redundant forward is a real cost on image-dense data, and worth naming
-        rather than waving at. One image per row makes it a rounding error against a
-        321B language stack. MMLongBench-128K's ICL split averages 566 images per
-        row -- roughly half a million patches through a depth-24, hidden-1024 tower
-        -- and paying that on all eight CP ranks is not free. The fix, when it
-        matters, is to split the images across the CP group and all-gather the
-        features before this lookup; the lookup itself is unaffected, since it
-        addresses features by global row either way.
-        """
-        from megatron.core.transformer.experimental_attention_variant import dsa_layout
-
-        if packed_seq_params is None or packed_seq_params.qkv_format != "thd":
-            raise ValueError(
-                "GLM-5.3 vision under context parallelism requires packed THD sequences: "
-                "the local-to-global position map is derived from cu_seqlens."
-            )
-
-        cp_size, cp_rank = cp_group.size(), cp_group.rank()
-        local_rows = placeholders.numel()
-        cu_seqlens_q, _ = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
-        device = placeholders.device
-
-        positions = [
-            dsa_layout.build_packed_allgather_cp_local_positions(
-                cu_seqlens_q.to(device=device, dtype=torch.int64),
-                cp_size,
-                rank,
-                device,
-                output_size=local_rows,
-                cu_seqlens_cover_output=False,
-            )
-            for rank in range(cp_size)
-        ]
-
-        # Padded rows are given positions past the real tokens, so the scratch mask
-        # is sized for that tail rather than for the sequence alone. Padding is never
-        # a placeholder, so those rows contribute nothing to the running count.
-        span = 2 * cp_size * local_rows
-        global_placeholders = torch.zeros(span, dtype=torch.int32, device=device)
-        gathered = torch.empty(cp_size * local_rows, dtype=torch.int32, device=device)
-        torch.distributed.all_gather_into_tensor(
-            gathered, placeholders.to(torch.int32).contiguous(), group=cp_group
-        )
-        flat_positions = torch.cat(positions, dim=0).clamp_(max=span - 1)
-        global_placeholders[flat_positions] = gathered
-
-        counts = global_placeholders.to(torch.int64)
-        if n_features is not None:
-            # The cp=1 path gets this check from HF's get_placeholder_mask, which
-            # cannot run here (it counts against the local shard). Without it a
-            # tower/token-count disagreement reads as a plausible index instead of
-            # an error -- the exact failure mode this whole method exists to stop.
-            total = int(counts.sum().item())
-            if total != n_features:
-                raise ValueError(
-                    f"GLM-5.3 vision splice: {total} placeholder(s) across the "
-                    f"context-parallel group but {n_features} feature row(s) from the "
-                    "tower; the expected token count per image disagrees with the "
-                    "processor's grid."
-                )
-        feature_index = torch.cumsum(counts, dim=0) - 1
-        local_index = feature_index.index_select(0, positions[cp_rank].clamp_(max=span - 1))
-        return local_index[placeholders]
-
     def _splice(self, inputs_embeds, input_ids, features, token_id, packed_seq_params, *, kind):
         """Write multimodal features over their placeholder tokens.
 
         ``inputs_embeds`` is [batch, seq, hidden] here, matching HuggingFace's own
         masking helpers.
         """
-        cp_group = self._cp_group()
+        cp_group = context_parallel_group(self.config)
         if cp_group is None:
             mask, _ = self.get_placeholder_mask(
                 input_ids,
@@ -329,20 +221,7 @@ class Glm5NextVLModel(MegatronModule):
                 **{f"{kind}_features": features},
             )
             return inputs_embeds.masked_scatter(mask, features)
-
-        if inputs_embeds.size(0) != 1:
-            raise ValueError(
-                "GLM-5.3 vision under context parallelism expects packed THD batches "
-                f"(batch 1), got batch {inputs_embeds.size(0)}."
-            )
-
-        placeholders = input_ids.view(-1) == token_id
-        index = self._local_feature_index(
-            placeholders, packed_seq_params, cp_group, n_features=features.size(0)
-        )
-        rows = inputs_embeds.view(-1, inputs_embeds.size(-1)).clone()
-        rows[placeholders] = features.index_select(0, index).to(rows.dtype)
-        return rows.view_as(inputs_embeds)
+        return splice_features(inputs_embeds, input_ids, features, token_id, packed_seq_params, cp_group)
 
     def freeze(
         self,

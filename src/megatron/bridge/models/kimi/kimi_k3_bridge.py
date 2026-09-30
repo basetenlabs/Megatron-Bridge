@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Hugging Face ↔ Megatron conversion for the Kimi K3 language backbone.
+"""Hugging Face ↔ Megatron conversion for Kimi K3, vision tower included.
 
 The initial parameter mapping was adapted from the Apache-2.0 Miles implementation:
 https://github.com/radixark/miles/blob/dc62a0bd4b7af1c59ee2084852eb18b5585ec082/miles_plugins/mbridge/kimi_k3.py
 """
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 
 import torch
 import torch.nn.functional as F
@@ -27,7 +27,7 @@ from megatron.core.transformer.enums import AttnBackend
 
 from megatron.bridge.models.conversion import quantization_utils
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-from megatron.bridge.models.conversion.model_bridge import HFWeightTuple, MegatronModelBridge, WeightConversionTask
+from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ColumnParallelMapping,
@@ -51,9 +51,13 @@ from megatron.bridge.models.kimi.native_nvfp4_import import (
     model_type="kimi_k3",
 )
 class KimiK3Bridge(MegatronModelBridge):
-    """Megatron Bridge for the Kimi K3 language backbone."""
+    """Megatron Bridge for Kimi K3.
 
-    _HF_PASSTHROUGH_PREFIXES = ("vision_tower.", "mm_projector.")
+    A checkpoint with a ``vision_config`` builds ``KimiK3VLModel``; one without (the
+    debug checkpoints) builds the bare language model.
+    """
+
+    _VISION_PREFIXES = ("vision_tower.", "mm_projector.")
 
     @classmethod
     def hf_to_megatron_activation(cls, hidden_act: str):
@@ -141,8 +145,17 @@ class KimiK3Bridge(MegatronModelBridge):
         provider.persist_layer_norm = True
         provider.should_pad_vocab = False
 
+        provider.vision_config = getattr(hf_config, "vision_config", None)
+        if provider.vision_config is not None:
+            provider.media_placeholder_token_id = hf_config.media_placeholder_token_id
+            provider.scatter_embedding_sequence_parallel = False
+
         self._num_hidden_layers = text_config.num_hidden_layers
         return provider
+
+    def _has_vision_tower(self) -> bool:
+        """Read off ``self.hf_config``, which conversion sets before ``mapping_registry``."""
+        return getattr(self.hf_config, "vision_config", None) is not None
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         """Map K3's nested language model and custom layer parameters."""
@@ -267,6 +280,15 @@ class KimiK3Bridge(MegatronModelBridge):
                 ),
             ]
         )
+        if not self._has_vision_tower():
+            return MegatronMappingRegistry(*mappings)
+
+        # The VL model holds the backbone one level down.
+        for mapping in mappings:
+            mapping.megatron_param = f"language_model.{mapping.megatron_param}"
+        # The tower is plain torch modules named as in the checkpoint and identical on
+        # every rank; AutoMapping cannot infer parallelism for nn.Linear.
+        mappings.extend(ReplicatedMapping(f"{prefix}**", f"{prefix}**") for prefix in self._VISION_PREFIXES)
         return MegatronMappingRegistry(*mappings)
 
     @staticmethod
@@ -399,36 +421,6 @@ class KimiK3Bridge(MegatronModelBridge):
             return super().build_conversion_tasks(hf_pretrained, megatron_model, weight_dtype=weight_dtype)
         finally:
             hf_pretrained.state.source.get_all_keys = original_get_all_keys
-
-    @torch.no_grad()
-    def stream_weights_megatron_to_hf(
-        self,
-        megatron_model: GPTModel | list[GPTModel],
-        hf_pretrained: PreTrainedCausalLM,
-        cpu: bool = True,
-        show_progress: bool = True,
-        conversion_tasks: list[WeightConversionTask] | None = None,
-        merge_adapter_weights: bool = True,
-        weight_dtype: torch.dtype | None = None,
-    ) -> Iterable[HFWeightTuple]:
-        """Export the language model and preserve unchanged multimodal weights."""
-        yield from super().stream_weights_megatron_to_hf(
-            megatron_model,
-            hf_pretrained,
-            cpu=cpu,
-            show_progress=show_progress,
-            conversion_tasks=conversion_tasks,
-            merge_adapter_weights=merge_adapter_weights,
-            weight_dtype=weight_dtype,
-        )
-
-        state = getattr(hf_pretrained, "state", None)
-        source = getattr(state, "source", None)
-        if source is None:
-            return
-        for name in source.get_all_keys():
-            if name.startswith(self._HF_PASSTHROUGH_PREFIXES):
-                yield from HFWeightTuple(name, state[name]).iter_finalized(cpu=cpu)
 
 
 def _classify_te_quantized_tensor(tensor: torch.Tensor) -> tuple[bool, bool]:
