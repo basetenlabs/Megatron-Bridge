@@ -24,11 +24,8 @@ import pytest
 import torch
 from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
-<<<<<<< HEAD
-from megatron.core.transformer.transformer_layer import TransformerLayer
-=======
 from megatron.core.transformer.enums import AttnMaskType
->>>>>>> 0bbd3f0fd (feat(model): run Gemma 4 dense on Hopper and Blackwell (SDPA global, flex sliding) (#46))
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.training.config.instantiate_utils import instantiate
 
 from megatron.bridge.models.gemma.modeling_gemma4 import (
