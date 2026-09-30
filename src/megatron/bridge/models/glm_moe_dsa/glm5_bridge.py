@@ -15,12 +15,8 @@
 import json
 import logging
 import os
-<<<<<<< HEAD
 from collections.abc import Mapping
 from typing import Any
-=======
-from typing import Any, Mapping
->>>>>>> e6ab3619a (feat(glm): import GLM-5.2 routed experts as native FP8 (#54))
 
 import torch
 from huggingface_hub import hf_hub_download
@@ -36,15 +32,11 @@ from megatron.bridge.models.conversion.param_mapping import (
     GatedMLPMapping,
     QKVMapping,
 )
-<<<<<<< HEAD
-=======
-from megatron.bridge.models.conversion.quantization_utils import maybe_dequantize_fp8_blockwise
 from megatron.bridge.models.glm_moe_dsa.native_fp8_import import (
     copy_native_fp8_expert_weight,
     is_routed_expert_weight,
     prepare_native_fp8_expert_weight,
 )
->>>>>>> e6ab3619a (feat(glm): import GLM-5.2 routed experts as native FP8 (#54))
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.mla_provider import MLAModelProvider
 
@@ -359,14 +351,6 @@ class GLM5Bridge(MegatronModelBridge):
 
         return MegatronMappingRegistry(*mapping_list)
 
-<<<<<<< HEAD
-    def maybe_modify_loaded_hf_weight(
-        self,
-        hf_param: str | dict[str, str],
-        hf_state_dict: Mapping[str, torch.Tensor],
-    ) -> torch.Tensor | dict[str, torch.Tensor]:
-        """Dequantize block-scaled FP8 checkpoint weights during import."""
-=======
     def maybe_load_native_hf_weight(
         self,
         task: WeightConversionTask,
@@ -400,9 +384,12 @@ class GLM5Bridge(MegatronModelBridge):
         copy_native_fp8_expert_weight(destination, source)
         return True
 
-    def maybe_modify_loaded_hf_weight(self, hf_param, hf_state_dict):
-        """Dequantize block-wise FP8 GLM-5.2 HF weights on load."""
->>>>>>> e6ab3619a (feat(glm): import GLM-5.2 routed experts as native FP8 (#54))
+    def maybe_modify_loaded_hf_weight(
+        self,
+        hf_param: str | dict[str, str],
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        """Dequantize block-scaled FP8 checkpoint weights during import."""
         hf_weights = super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
 
         if isinstance(hf_weights, dict):
@@ -413,7 +400,6 @@ class GLM5Bridge(MegatronModelBridge):
         return self._maybe_dequantize_fp8(hf_weights, hf_param, hf_state_dict)
 
     @staticmethod
-<<<<<<< HEAD
     def _maybe_dequantize_fp8(
         weight: torch.Tensor,
         param_name: str,
@@ -421,10 +407,6 @@ class GLM5Bridge(MegatronModelBridge):
     ) -> torch.Tensor:
         scale_key = param_name + "_scale_inv"
         return quantization_utils.maybe_dequantize_fp8_blockwise(weight, hf_state_dict.get(scale_key))
-=======
-    def _maybe_dequant_fp8(weight, param_name, hf_state_dict):
-        scale_inv = hf_state_dict.get(param_name + "_scale_inv")
-        return maybe_dequantize_fp8_blockwise(weight, scale_inv)
 
 
 def _classify_te_quantized_tensor(tensor: torch.Tensor) -> tuple[bool, bool]:
@@ -446,4 +428,3 @@ def _classify_te_quantized_tensor(tensor: torch.Tensor) -> tuple[bool, bool]:
         isinstance(tensor, QuantizedTensor) or is_grouped,
         isinstance(tensor, Float8BlockwiseQTensor),
     )
->>>>>>> e6ab3619a (feat(glm): import GLM-5.2 routed experts as native FP8 (#54))

@@ -1130,7 +1130,6 @@ class MegatronModelBridge(
             hf_weights = {k: hf_state_dict[v] for k, v in hf_param.items()}
         return hf_weights
 
-<<<<<<< HEAD
     @staticmethod
     def get_hf_import_param_names(
         hf_param: str | dict[str, str],
@@ -1194,7 +1193,7 @@ class MegatronModelBridge(
         if task.megatron_module is None:
             return None
         return task.mapping.hf_to_megatron(hf_weights, task.megatron_module)
-=======
+
     def maybe_load_native_hf_weight(
         self,
         task: WeightConversionTask[Any],
@@ -1209,7 +1208,6 @@ class MegatronModelBridge(
             Whether the destination was loaded and normal conversion should be skipped.
         """
         return False
->>>>>>> e6ab3619a (feat(glm): import GLM-5.2 routed experts as native FP8 (#54))
 
     def maybe_modify_converted_hf_weight(
         self,
