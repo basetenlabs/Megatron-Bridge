@@ -583,9 +583,9 @@ def get_rng_state(
     }
 
     rng_state_list = None
-    if torch.distributed.is_initialized() and pg_collection.dp.size() > 1 and data_parallel_random_init:
-        rng_state_list = [None for i in range(pg_collection.dp.size())]
-        torch.distributed.all_gather_object(rng_state_list, rng_state, group=pg_collection.dp)
+    if torch.distributed.is_initialized() and pg_collection.dp_cp.size() > 1 and data_parallel_random_init:
+        rng_state_list = [None for i in range(pg_collection.dp_cp.size())]
+        torch.distributed.all_gather_object(rng_state_list, rng_state, group=pg_collection.dp_cp)
     else:
         rng_state_list = [rng_state]
 
@@ -615,7 +615,6 @@ def get_rng_state(
     return rng_state_list
 
 
-<<<<<<< HEAD
 def _checkpoint_has_per_dp_rng_states(run_config: dict[str, Any]) -> bool:
     """Return whether a checkpoint stores one RNG state per DP/CP rank."""
     return run_config.get("checkpoint", {}).get("save_rng_state_per_dp_rank", False) or run_config.get("rng", {}).get(
@@ -625,9 +624,10 @@ def _checkpoint_has_per_dp_rng_states(run_config: dict[str, Any]) -> bool:
 
 def _select_rng_state(
     rng_state_list: list[dict[str, Any]], per_dp_rank: bool, pg_collection: ProcessGroupCollection
-) -> dict[str, Any]:
-    """Select the RNG state matching the saved checkpoint layout."""
-    return rng_state_list[pg_collection.dp_cp.rank() if per_dp_rank else 0]
+) -> dict[str, Any] | None:
+    """Select the RNG state matching the saved checkpoint layout, or None if this DP/CP rank has none."""
+    index = pg_collection.dp_cp.rank() if per_dp_rank else 0
+    return rng_state_list[index] if index < len(rng_state_list) else None
 
 
 def _align_rng_state_sharded_metadata(rng_state: ShardedObject, checkpoint_name: str) -> ShardedObject | None:
@@ -691,7 +691,8 @@ def _match_rng_state_metadata(
         global_offset=stored.global_offset,
         replica_id=dp_rank if len(stored.global_offset) == 2 else 0,
     )
-=======
+
+
 class StateToLoad(NamedTuple):
     """One checkpoint section's load decision.
 
@@ -721,8 +722,8 @@ def resolve_state_to_load(
         kind: Name of the section, for the log line ("RNG", "Rerun").
         sharded_state: The state this run would request -- a bare ShardedObject
             (what ``get_rng_state`` returns for torch_dist) or a sharded state
-            dict containing some. ``None`` when the caller already decided not
-            to load, which passes straight through.
+            dict containing some. ``None`` when this rank already decided not
+            to load; it still joins the vote without vetoing the other ranks.
         state_dict_metadata: The checkpoint's ``state_dict_metadata``. Only its
             keys are consulted; empty means "cannot verify", which loads.
 
@@ -731,9 +732,8 @@ def resolve_state_to_load(
         otherwise ``ignore=True`` with no state.
     """
     if sharded_state is None:
-        return StateToLoad(ignore=True, state=None)
-
-    if isinstance(sharded_state, ShardedObject):
+        objects = []
+    elif isinstance(sharded_state, ShardedObject):
         objects = [sharded_state]
     else:
         objects = [v for v in nested_values(sharded_state) if isinstance(v, ShardedObject)]
@@ -746,36 +746,13 @@ def resolve_state_to_load(
         torch.distributed.all_reduce(vote, op=torch.distributed.ReduceOp.MIN)
         present = bool(vote.item())
 
+    if sharded_state is None:
+        return StateToLoad(ignore=True, state=None)
     if present:
         return StateToLoad(ignore=False, state=sharded_state)
 
     print_rank_0(f"checkpoint {kind} shards do not match this parallel layout: {kind} state will be ignored")
     return StateToLoad(ignore=True, state=None)
-
-
-def _select_dp_rng_state(
-    rng_state_list: list, pg_collection: ProcessGroupCollection, data_parallel_random_init: bool
-) -> dict | None:
-    """Pick this rank's entry out of a saved RNG payload, or None if it has none.
-
-    Without ``data_parallel_random_init`` the payload is a single shared entry
-    and any DP size can read it. With it, the payload holds one entry per DP
-    rank at save time, so a run at a different DP size has no correct mapping --
-    and the key alone cannot detect that, because without expert parallelism DP
-    is a ShardedObject ``replica_id`` rather than part of the key.
-    """
-    if not data_parallel_random_init:
-        return rng_state_list[0]
-
-    dp_size = pg_collection.dp.size()
-    if len(rng_state_list) != dp_size:
-        print_rank_0(
-            f"checkpoint holds {len(rng_state_list)} per-DP RNG states but this run has "
-            f"{dp_size} data-parallel ranks: RNG state will be ignored"
-        )
-        return None
-    return rng_state_list[pg_collection.dp.rank()]
->>>>>>> 65020c312 (fix(ckpt): skip RNG and rerun state when checkpoint shards do not match the run (#44))
 
 
 class CheckpointType(Enum):
@@ -3053,9 +3030,9 @@ def _load_checkpoint_from_path(
             tp_pp_match = ckpt_tp_pp == run_tp_pp
             mismatch_msg = "(TP, PP) mismatch after resume ({} vs {} from checkpoint)".format(run_tp_pp, ckpt_tp_pp)
 
-        # tp_pp_match is not the whole layout: RNG is sharded by (PP, TP, DP)
-        # under EP and rerun state by world size, and run_config.yaml records
-        # neither DP nor world size, so consult the checkpoint's own metadata.
+        # tp_pp_match is not the whole layout: RNG is sharded by (PP, TP, DP/CP)
+        # and rerun state by world size, and run_config.yaml records neither
+        # DP nor world size, so consult the checkpoint's own metadata.
         if ckpt_type == CheckpointType.LOCAL:
             state_dict_metadata = {}  # local checkpoints always resume with the same parallelism
         else:
@@ -3073,21 +3050,15 @@ def _load_checkpoint_from_path(
             and cfg.checkpoint.load_rng
             and run_config["checkpoint"]["save_rng"]
         ):
-<<<<<<< HEAD
-            gen_sd_rng_state = get_rng_state(
-                load_dp_rng_states,
-=======
             candidate_rng_state = get_rng_state(
-                cfg.rng.data_parallel_random_init,
->>>>>>> 65020c312 (fix(ckpt): skip RNG and rerun state when checkpoint shards do not match the run (#44))
+                load_dp_rng_states,
                 ckpt_format,
                 pg_collection=pg_collection,
                 module_name=module_name,
             )
             if ckpt_type != CheckpointType.LOCAL:
-                gen_sd_rng_state = _align_rng_state_sharded_metadata(gen_sd_rng_state, checkpoint_name)
-                if gen_sd_rng_state is None:
-                    ignore_rng_state = True
+                candidate_rng_state = _align_rng_state_sharded_metadata(candidate_rng_state, checkpoint_name)
+                if candidate_rng_state is None:
                     print_rank_0(
                         "RNG state cannot be restored for this DP/CP layout; using freshly initialized RNG state"
                     )
@@ -3502,21 +3473,13 @@ def _load_checkpoint_from_path(
                     else:
                         print_rank_0("WARNING: RNG state not found for current TP/PP rank")
                         rng_state_list = next(iter(state_dict["rng_state"].values()))
-<<<<<<< HEAD
-                    rng_state = _select_rng_state(rng_state_list, load_dp_rng_states, pg_collection)
                 else:
                     # torch_dist format: ShardedObject
                     rng_state_list = state_dict["rng_state"]
-                    rng_state = _select_rng_state(rng_state_list, load_dp_rng_states, pg_collection)
-=======
-                else:
-                    # torch_dist format: ShardedObject
-                    rng_state_list = state_dict["rng_state"]
->>>>>>> 65020c312 (fix(ckpt): skip RNG and rerun state when checkpoint shards do not match the run (#44))
 
-                rng_state = _select_dp_rng_state(rng_state_list, pg_collection, cfg.rng.data_parallel_random_init)
-                # None means the saved per-DP states cannot be mapped onto this
-                # run; leave the generators as _set_random_seed left them.
+                rng_state = _select_rng_state(rng_state_list, load_dp_rng_states, pg_collection)
+                # None means this DP/CP rank has no saved state; leave the
+                # generators as _set_random_seed left them.
                 if rng_state is not None:
                     random.setstate(rng_state["random_rng_state"])
                     np.random.set_state(rng_state["np_rng_state"])
