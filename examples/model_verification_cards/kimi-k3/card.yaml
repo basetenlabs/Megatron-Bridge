@@ -8,7 +8,7 @@ summary: >
   results. This card covers the Kimi K3 language backbone and vision tower in
   the published multimodal checkpoint. Only image inputs are claimed: the
   tower matches the reference implementation in fp32, and video input is
-  unverified. Full-checkpoint GPU import and deterministic Megatron
+  rejected. Full-checkpoint GPU import and deterministic Megatron
   greedy text generation were verified at bridge_commit below, before the
   vision tower existed; the vision-layout import is not yet re-verified
   through this card's commands. CPU conversion, GPU export, full-model

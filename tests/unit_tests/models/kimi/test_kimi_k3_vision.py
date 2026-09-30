@@ -154,3 +154,11 @@ def test_splice_rejects_feature_count_mismatch() -> None:
             packed_seq_params=None,
             cp_group=None,
         )
+
+
+def test_video_grids_are_rejected() -> None:
+    """Frame pooling would emit fewer rows than the placeholders expanded upstream."""
+    tower = KimiK3VisionTower(_vision_config())
+    grid = [[2, 2, 2]]
+    with pytest.raises(ValueError, match="images only"):
+        tower(_pixels(grid), torch.tensor(grid))

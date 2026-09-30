@@ -64,7 +64,7 @@ No training recipe ships for K3 yet. Pretraining, SFT, and PEFT configs, checkpo
 - Strict full-checkpoint Megatron → HF export, HF reload, and exact round-trip parity are unverified.
 - Full HF/Megatron forward-logit correlation is unverified. A four-layer proxy reached cosine similarity `0.9998` and Pearson correlation `0.9998`.
 - Virtual pipeline parallelism (VPP) is not supported.
-- Vision is verified for image inputs (tower output matches the reference implementation in fp32). Video input (`t > 1`) is implemented but unverified.
+- Vision covers image inputs (tower output matches the reference implementation in fp32). Video input (`t > 1`) is rejected.
 - The model has not been performance-tuned. Reported timings are sanity checks, not optimized throughput results.
 
 ## Related Implementation

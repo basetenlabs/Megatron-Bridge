@@ -50,19 +50,15 @@ def _check_supported(vision_config: "PretrainedConfig") -> None:
             raise ValueError(f"Kimi K3 vision: unsupported {field}={actual!r}; only {expected!r} is implemented")
 
 
-def _sincos_1d(dim: int, length: int) -> Tensor:
-    """Fixed temporal embedding, [length, dim] as [sin | cos]."""
-    omega = 1.0 / _ROPE_THETA ** (torch.arange(dim // 2, dtype=torch.float32) / (dim / 2.0))
-    angles = torch.outer(torch.arange(length, dtype=torch.float32), omega)
-    return torch.cat([angles.sin(), angles.cos()], dim=1)
+class _GridPosEmb(nn.Module):
+    """Learnable 2D grid embedding, bilinearly resized per image.
 
+    Images only: the checkpoint's video path (``t > 1``) adds a temporal embedding and
+    pools frames, which the placeholder expansion upstream of this tower does not model.
+    """
 
-class _DividedPosEmb(nn.Module):
-    """Learnable 2D grid embedding, bilinearly resized per image, plus fixed time embedding."""
-
-    def __init__(self, height: int, width: int, num_frames: int, dim: int, interpolation_mode: str) -> None:
+    def __init__(self, height: int, width: int, dim: int, interpolation_mode: str) -> None:
         super().__init__()
-        self.num_frames = num_frames
         self.interpolation_mode = interpolation_mode
         self.weight = nn.Parameter(torch.empty(height, width, dim))
         nn.init.normal_(self.weight)
@@ -70,27 +66,21 @@ class _DividedPosEmb(nn.Module):
     def forward(self, x: Tensor, grid: list[list[int]]) -> Tensor:
         pos_embs = []
         for t, h, w in grid:
-            if t > self.num_frames:
-                raise ValueError(f"Kimi K3 vision: {t} frames exceeds the {self.num_frames} the tower embeds")
+            if t != 1:
+                raise ValueError(f"Kimi K3 vision supports images only; got a {t}-frame grid")
             if (h, w) == tuple(self.weight.shape[:-1]):
-                pos_2d = self.weight.flatten(end_dim=1)
-            else:
-                pos_2d = (
-                    F.interpolate(
-                        self.weight.permute(2, 0, 1).unsqueeze(0),
-                        size=(h, w),
-                        mode=self.interpolation_mode,
-                    )
-                    .squeeze(0)
-                    .permute(1, 2, 0)
-                    .flatten(end_dim=1)
+                pos_embs.append(self.weight.flatten(end_dim=1))
+                continue
+            pos_embs.append(
+                F.interpolate(
+                    self.weight.permute(2, 0, 1).unsqueeze(0),
+                    size=(h, w),
+                    mode=self.interpolation_mode,
                 )
-            if t == 1:
-                pos_embs.append(pos_2d)
-            else:
-                # Fixed, not a buffer: a meta-device build would leave a buffer unmaterialized.
-                time_2d = _sincos_1d(pos_2d.size(-1), t).to(pos_2d).unsqueeze(1)
-                pos_embs.append((pos_2d.unsqueeze(0) + time_2d).flatten(end_dim=1))
+                .squeeze(0)
+                .permute(1, 2, 0)
+                .flatten(end_dim=1)
+            )
         return x + torch.cat(pos_embs)
 
 
@@ -104,10 +94,9 @@ class _PatchEmbed(nn.Module):
             stride=config.patch_size,
             bias=config.patch_embed_proj_bias,
         )
-        self.pos_emb = _DividedPosEmb(
+        self.pos_emb = _GridPosEmb(
             config.init_pos_emb_height,
             config.init_pos_emb_width,
-            config.init_pos_emb_time,
             config.vt_hidden_size,
             config.pos_emb_interpolation_mode,
         )
