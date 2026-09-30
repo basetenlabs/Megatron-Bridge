@@ -25,11 +25,16 @@ from unittest.mock import MagicMock, Mock, mock_open, patch
 import numpy as np
 import pytest
 import torch
+<<<<<<< HEAD
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
 )
+=======
+from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
+>>>>>>> d915ae9fa (fix(ckpt): complete empty async save requests (#82))
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.optimizer import distrib_optimizer
 from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
@@ -79,12 +84,15 @@ from megatron.bridge.training.checkpointing import (
     read_metadata,
     save_checkpoint,
     schedule_async_save,
+<<<<<<< HEAD
 )
 from megatron.bridge.training.config import (
     CheckpointConfig,
     ConfigContainer,
     DistributedDataParallelConfig,
     SchedulerConfig,
+=======
+>>>>>>> d915ae9fa (fix(ckpt): complete empty async save requests (#82))
 )
 from megatron.bridge.training.state import GlobalState, TrainState
 from megatron.bridge.utils.instantiate_utils import InstantiationException
@@ -101,6 +109,18 @@ class _DummyClass:
 
 
 _dummy_obj = _DummyClass()
+
+
+@pytest.mark.unit
+def test_schedule_async_save_gives_empty_request_work() -> None:
+    queue = Mock()
+    state = Mock(async_calls_queue=queue)
+
+    schedule_async_save(state, AsyncRequest(None, (), []))
+
+    request = queue.schedule_async_request.call_args.args[0]
+    assert request.async_fn is not None
+    request.async_fn()
 
 
 def _write_dataloader_state_marker(path: str) -> None:
