@@ -43,6 +43,8 @@ def _vision_config(**overrides) -> SimpleNamespace:
         linear_bias=False,
         patch_embed_proj_bias=False,
         mm_projector_type="patchmergerv2",
+        activation_func="gelu_pytorch_tanh",
+        projector_hidden_act="gelu",
         mm_hidden_size=32,
         text_hidden_size=40,
         projector_ln_eps=1e-5,
@@ -115,7 +117,12 @@ def test_rope_matches_reference_table_layout() -> None:
 
 @pytest.mark.parametrize(
     "field,value",
-    [("mm_projector_type", "patchmerger"), ("norm_type", "layernorm"), ("merge_type", "sd2")],
+    [
+        ("mm_projector_type", "patchmerger"),
+        ("norm_type", "layernorm"),
+        ("merge_type", "sd2"),
+        ("activation_func", "gelu"),
+    ],
 )
 def test_unsupported_layouts_are_rejected(field: str, value: str) -> None:
     with pytest.raises(ValueError, match=field):

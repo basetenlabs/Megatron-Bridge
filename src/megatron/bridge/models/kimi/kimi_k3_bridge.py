@@ -149,7 +149,8 @@ class KimiK3Bridge(MegatronModelBridge):
         provider.vision_config = getattr(hf_config, "vision_config", None)
         self._vision_config = provider.vision_config
         if provider.vision_config is not None:
-            provider.media_placeholder_token_id = hf_config.media_placeholder_token_id
+            # None falls through to provide()'s explicit error.
+            provider.media_placeholder_token_id = getattr(hf_config, "media_placeholder_token_id", None)
             provider.scatter_embedding_sequence_parallel = False
 
         self._num_hidden_layers = text_config.num_hidden_layers

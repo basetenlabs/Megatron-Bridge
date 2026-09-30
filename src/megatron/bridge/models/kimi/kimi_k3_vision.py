@@ -38,6 +38,8 @@ _SUPPORTED = {
     "mlp_type": "mlp2",
     "merge_type": "sd2_tpool",
     "mm_projector_type": "patchmergerv2",
+    "activation_func": "gelu_pytorch_tanh",
+    "projector_hidden_act": "gelu",
 }
 _ROPE_MAX_GRID = 512
 _ROPE_THETA = 10000.0
