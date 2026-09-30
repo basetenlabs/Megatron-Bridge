@@ -596,11 +596,7 @@ class MegatronPeftBridge:
                     and hasattr(adapter, "base_linear_is_parallel")
                 ):
                     input_is_parallel = adapter.input_is_parallel
-<<<<<<< HEAD
                     base_linear_is_parallel = not getattr(adapter, "replicate_adapter", False)
-=======
-                    base_linear_is_parallel = adapter.base_linear_is_parallel
->>>>>>> 64f2ba0da (fix(peft): replicate LoRA for duplicated linears)
                     requires_expert_splits = adapter.linear_in.weight.ndim > 2
                 elif isinstance(adapter, LinearAdapter):
                     # Adapter wrapping a plain nn.Linear: no parallelism layout
