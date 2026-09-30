@@ -58,6 +58,13 @@ def test_is_routed_expert_weight_matches_only_expert_projections():
     assert not is_routed_expert_weight("decoder.layers.3.self_attn.q_proj.weight")
 
 
+def test_is_routed_expert_weight_matches_under_vl_prefix():
+    """The VL model nests the backbone; missing it falls back to BF16 dequant silently."""
+    assert is_routed_expert_weight("language_model.decoder.layers.3.mlp.experts.linear_fc1.weight7")
+    assert not is_routed_expert_weight("language_model.decoder.layers.3.mlp.shared_experts.linear_fc1.weight")
+    assert not is_routed_expert_weight("vision_tower.encoder.blocks.0.mlp.fc0.weight")
+
+
 def test_scale_regroup_preserves_values_exactly():
     """The regrouped NVFP4 scales must reconstruct the MXFP4 values bit for bit."""
     packed, scale = _random_mxfp4(64, 256)

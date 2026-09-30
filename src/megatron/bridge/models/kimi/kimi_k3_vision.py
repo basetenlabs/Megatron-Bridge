@@ -60,7 +60,6 @@ class _DividedPosEmb(nn.Module):
         self.interpolation_mode = interpolation_mode
         self.weight = nn.Parameter(torch.empty(height, width, dim))
         nn.init.normal_(self.weight)
-        self.register_buffer("time_weight", _sincos_1d(dim, num_frames).unsqueeze(1), persistent=False)
 
     def forward(self, x: Tensor, grid_thws: Tensor) -> Tensor:
         pos_embs = []
@@ -83,7 +82,9 @@ class _DividedPosEmb(nn.Module):
             if t == 1:
                 pos_embs.append(pos_2d)
             else:
-                pos_embs.append((pos_2d.unsqueeze(0) + self.time_weight[:t]).flatten(end_dim=1))
+                # Fixed, not a buffer: a meta-device build would leave a buffer unmaterialized.
+                time_2d = _sincos_1d(pos_2d.size(-1), t).to(pos_2d).unsqueeze(1)
+                pos_embs.append((pos_2d.unsqueeze(0) + time_2d).flatten(end_dim=1))
         return x + torch.cat(pos_embs)
 
 
@@ -151,6 +152,7 @@ class _EncoderLayer(nn.Module):
         qkv_hidden = config.qkv_hidden_size or hidden
         self.num_heads = config.vt_num_attention_heads
         self.head_dim = qkv_hidden // self.num_heads
+        # Default eps (dtype epsilon), as in the reference tower and vLLM's.
         self.norm0 = nn.RMSNorm(hidden)
         self.norm1 = nn.RMSNorm(hidden)
         self.wqkv = nn.Linear(hidden, 3 * qkv_hidden, bias=config.attn_bias)

@@ -21,11 +21,14 @@ features are written over the placeholder embeddings and position ids pass throu
 from typing import TYPE_CHECKING
 
 import torch
-from megatron.core.tensor_parallel import scatter_to_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from torch import Tensor
 
-from megatron.bridge.models.common.vision_splice import context_parallel_group, splice_features
+from megatron.bridge.models.common.vision_splice import (
+    context_parallel_group,
+    scatter_spliced_embeddings,
+    splice_features,
+)
 from megatron.bridge.models.kimi.kimi_k3_vision import KimiK3VisionProjector, KimiK3VisionTower
 from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
 
@@ -47,20 +50,20 @@ class KimiK3VLModel(MegatronModule):
         vp_stage: int | None = None,
     ) -> None:
         super().__init__(config=config)
-        self.pre_process = pre_process
-        self.post_process = post_process
+        self.language_model = config.provide_language_model(
+            pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
+        )
+        # The backbone resolves None to "first/last pipeline stage".
+        self.pre_process = self.language_model.pre_process
+        self.post_process = self.language_model.post_process
         self.vp_stage = vp_stage
 
-        if pre_process:
+        if self.pre_process:
             self.vision_tower = KimiK3VisionTower(config.vision_config)
             self.mm_projector = KimiK3VisionProjector(config.vision_config)
             # Plain torch modules replicated on every TP rank: mark them for TP grad sync.
             hook_hf_module_setattr_for_tp_grad_sync(self.vision_tower)
             hook_hf_module_setattr_for_tp_grad_sync(self.mm_projector)
-
-        self.language_model = config.provide_language_model(
-            pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
-        )
         # Megatron's finalize-grad path looks these up on the top-level module.
         self.share_embeddings_and_output_weights = config.share_embeddings_and_output_weights
         self.shared_embedding_or_output_weight = self.language_model.shared_embedding_or_output_weight
@@ -128,18 +131,4 @@ class KimiK3VLModel(MegatronModule):
             packed_seq_params,
             context_parallel_group(self.config),
         )
-        embeds = embeds.transpose(0, 1).contiguous()
-
-        # The provider turns off the embedding's own scatter so the splice sees whole
-        # rows, and GPTModel does not scatter a supplied decoder_input, so it happens here.
-        if self.config.sequence_parallel:
-            tp_group = self.config._pg_collection.tp if self.config._pg_collection is not None else None
-            embeds = scatter_to_sequence_parallel_region(embeds, group=tp_group)
-            if padding_mask is not None:
-                # GPTModel scatters this alongside its own embedding only.
-                padding_mask = (
-                    scatter_to_sequence_parallel_region(padding_mask.transpose(0, 1).contiguous(), group=tp_group)
-                    .transpose(0, 1)
-                    .contiguous()
-                )
-        return embeds, padding_mask
+        return scatter_spliced_embeddings(embeds.transpose(0, 1).contiguous(), padding_mask, self.config)

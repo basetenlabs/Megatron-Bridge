@@ -58,6 +58,7 @@ class KimiK3Bridge(MegatronModelBridge):
     """
 
     _VISION_PREFIXES = ("vision_tower.", "mm_projector.")
+    _vision_config = None
 
     @classmethod
     def hf_to_megatron_activation(cls, hidden_act: str):
@@ -146,6 +147,7 @@ class KimiK3Bridge(MegatronModelBridge):
         provider.should_pad_vocab = False
 
         provider.vision_config = getattr(hf_config, "vision_config", None)
+        self._vision_config = provider.vision_config
         if provider.vision_config is not None:
             provider.media_placeholder_token_id = hf_config.media_placeholder_token_id
             provider.scatter_embedding_sequence_parallel = False
@@ -154,8 +156,11 @@ class KimiK3Bridge(MegatronModelBridge):
         return provider
 
     def _has_vision_tower(self) -> bool:
-        """Read off ``self.hf_config``, which conversion sets before ``mapping_registry``."""
-        return getattr(self.hf_config, "vision_config", None) is not None
+        """Prefer ``self.hf_config`` (set by conversion before ``mapping_registry``), else
+        what ``provider_bridge`` saw: the weight-loading hook resolves its own instance."""
+        if self.hf_config is not None:
+            return getattr(self.hf_config, "vision_config", None) is not None
+        return self._vision_config is not None
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         """Map K3's nested language model and custom layer parameters."""

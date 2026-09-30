@@ -15,8 +15,15 @@
 """Model provider for Kimi K3."""
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from megatron.core.models.gpt import GPTModel as MCoreGPTModel
 
 from megatron.bridge.models.mla_provider import MLAModelProvider
+
+
+if TYPE_CHECKING:
+    from megatron.bridge.models.kimi.kimi_k3_vl_model import KimiK3VLModel
 
 
 @dataclass
@@ -39,7 +46,9 @@ class KimiK3ModelProvider(MLAModelProvider):
     vision_config: object = None
     media_placeholder_token_id: int = 163605
 
-    def provide(self, pre_process=None, post_process=None, vp_stage=None):
+    def provide(
+        self, pre_process: bool | None = None, post_process: bool | None = None, vp_stage: int | None = None
+    ) -> "MCoreGPTModel | KimiK3VLModel":
         """Build the VL model when the checkpoint carries a vision tower."""
         if self.vision_config is None:
             return self.provide_language_model(pre_process, post_process, vp_stage)
@@ -51,6 +60,8 @@ class KimiK3ModelProvider(MLAModelProvider):
 
         return KimiK3VLModel(self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
 
-    def provide_language_model(self, pre_process=None, post_process=None, vp_stage=None):
+    def provide_language_model(
+        self, pre_process: bool | None = None, post_process: bool | None = None, vp_stage: int | None = None
+    ) -> MCoreGPTModel:
         """Build only the Megatron language backbone."""
         return MLAModelProvider.provide(self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)

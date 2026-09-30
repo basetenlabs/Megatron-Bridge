@@ -24,14 +24,16 @@ its rank among *global* placeholders instead.
 from typing import TYPE_CHECKING
 
 import torch
+from megatron.core.tensor_parallel import scatter_to_sequence_parallel_region
 from torch import Tensor
 
 
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-def context_parallel_group(config) -> torch.distributed.ProcessGroup | None:
+def context_parallel_group(config: "TransformerConfig") -> torch.distributed.ProcessGroup | None:
     """The context-parallel process group, or None when CP is off."""
     collection = getattr(config, "_pg_collection", None)
     group = getattr(collection, "cp", None) if collection is not None else None
@@ -144,3 +146,25 @@ def splice_features(
     flat = rows.view(-1, rows.size(-1))
     flat[placeholders] = features.index_select(0, index).to(rows.dtype)
     return rows
+
+
+def scatter_spliced_embeddings(
+    embeds: Tensor, padding_mask: Tensor | None, config: "TransformerConfig"
+) -> tuple[Tensor, Tensor | None]:
+    """Sequence-parallel scatter of spliced [seq, batch, hidden] embeddings.
+
+    VL providers turn off the embedding's own scatter so the splice sees whole rows,
+    and GPTModel scatters neither a supplied ``decoder_input`` nor, then, the MoE
+    router's ``padding_mask`` ([batch, seq]); both happen here.
+    """
+    if not config.sequence_parallel:
+        return embeds, padding_mask
+    tp_group = config._pg_collection.tp if config._pg_collection is not None else None
+    embeds = scatter_to_sequence_parallel_region(embeds, group=tp_group)
+    if padding_mask is not None:
+        padding_mask = (
+            scatter_to_sequence_parallel_region(padding_mask.transpose(0, 1).contiguous(), group=tp_group)
+            .transpose(0, 1)
+            .contiguous()
+        )
+    return embeds, padding_mask
