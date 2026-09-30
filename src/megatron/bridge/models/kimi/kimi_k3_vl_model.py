@@ -34,6 +34,7 @@ from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_gra
 
 
 if TYPE_CHECKING:
+    from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.packed_seq_params import PackedSeqParams
 
     from megatron.bridge.models.kimi.kimi_k3_provider import KimiK3ModelProvider
@@ -85,6 +86,7 @@ class KimiK3VLModel(MegatronModule):
         padding_mask: Tensor | None = None,
         *,
         loss_mask: Tensor | None = None,
+        inference_context: "BaseInferenceContext | None" = None,
     ) -> Tensor:
         """Embed text, write image features over the placeholders, then run the backbone.
 
@@ -109,7 +111,23 @@ class KimiK3VLModel(MegatronModule):
             runtime_gather_output=runtime_gather_output,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            inference_context=inference_context,
         )
+
+    def freeze(
+        self, *, freeze_language_model: bool, freeze_vision_model: bool, freeze_vision_projection: bool
+    ) -> None:
+        """Set ``requires_grad = False`` on whole submodules."""
+        modules = []
+        if freeze_language_model:
+            modules.append(self.language_model)
+        if self.pre_process and freeze_vision_model:
+            modules.append(self.vision_tower)
+        if self.pre_process and freeze_vision_projection:
+            modules.append(self.mm_projector)
+        for module in modules:
+            for param in module.parameters():
+                param.requires_grad = False
 
     def _embed_with_images(
         self,
@@ -125,10 +143,10 @@ class KimiK3VLModel(MegatronModule):
         features = self.mm_projector(self.vision_tower(pixel_values.to(tower_dtype), image_grid_thw))
         embeds = splice_features(
             embeds,
-            input_ids,
-            features,
-            self.config.media_placeholder_token_id,
-            packed_seq_params,
-            context_parallel_group(self.config),
+            input_ids=input_ids,
+            features=features,
+            token_id=self.config.media_placeholder_token_id,
+            packed_seq_params=packed_seq_params,
+            cp_group=context_parallel_group(self.config),
         )
         return scatter_spliced_embeddings(embeds.transpose(0, 1).contiguous(), padding_mask, self.config)

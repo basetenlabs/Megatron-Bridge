@@ -44,7 +44,11 @@ class KimiK3ModelProvider(MLAModelProvider):
 
     # HF ``KimiK3VisionConfig``; None builds the text-only backbone.
     vision_config: object = None
-    media_placeholder_token_id: int = 163605
+    # Required with vision_config; the bridge sets it from the checkpoint.
+    media_placeholder_token_id: int | None = None
+    freeze_language_model: bool = False
+    freeze_vision_model: bool = False
+    freeze_vision_projection: bool = False
 
     def provide(
         self, pre_process: bool | None = None, post_process: bool | None = None, vp_stage: int | None = None
@@ -55,10 +59,18 @@ class KimiK3ModelProvider(MLAModelProvider):
         if self.scatter_embedding_sequence_parallel:
             # The splice needs whole rows; a scattering embedding would shard twice.
             raise ValueError("Kimi K3 with vision requires scatter_embedding_sequence_parallel=False")
+        if self.media_placeholder_token_id is None:
+            raise ValueError("Kimi K3 with vision requires media_placeholder_token_id")
 
         from megatron.bridge.models.kimi.kimi_k3_vl_model import KimiK3VLModel
 
-        return KimiK3VLModel(self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+        model = KimiK3VLModel(self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+        model.freeze(
+            freeze_language_model=self.freeze_language_model,
+            freeze_vision_model=self.freeze_vision_model,
+            freeze_vision_projection=self.freeze_vision_projection,
+        )
+        return model
 
     def provide_language_model(
         self, pre_process: bool | None = None, post_process: bool | None = None, vp_stage: int | None = None

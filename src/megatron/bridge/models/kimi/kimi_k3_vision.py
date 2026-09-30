@@ -61,9 +61,9 @@ class _DividedPosEmb(nn.Module):
         self.weight = nn.Parameter(torch.empty(height, width, dim))
         nn.init.normal_(self.weight)
 
-    def forward(self, x: Tensor, grid_thws: Tensor) -> Tensor:
+    def forward(self, x: Tensor, grid: list[list[int]]) -> Tensor:
         pos_embs = []
-        for t, h, w in grid_thws.tolist():
+        for t, h, w in grid:
             if t > self.num_frames:
                 raise ValueError(f"Kimi K3 vision: {t} frames exceeds the {self.num_frames} the tower embeds")
             if (h, w) == tuple(self.weight.shape[:-1]):
@@ -106,16 +106,16 @@ class _PatchEmbed(nn.Module):
             config.pos_emb_interpolation_mode,
         )
 
-    def forward(self, pixel_values: Tensor, grid_thws: Tensor) -> Tensor:
+    def forward(self, pixel_values: Tensor, grid: list[list[int]]) -> Tensor:
         x = self.proj(pixel_values).view(pixel_values.size(0), -1)
-        return self.pos_emb(x, grid_thws)
+        return self.pos_emb(x, grid)
 
 
-def _rope_2d(grid_thws: Tensor, head_dim: int, device: torch.device) -> Tensor:
+def _rope_2d(grid: list[list[int]], head_dim: int, device: torch.device) -> Tensor:
     """cis(angle) per patch, [patches, head_dim // 2], pairs interleaved as (x_i, y_i)."""
     freqs = 1.0 / _ROPE_THETA ** (torch.arange(0, head_dim, 4, device=device)[: head_dim // 4].float() / head_dim)
     out = []
-    for t, h, w in grid_thws.tolist():
+    for t, h, w in grid:
         if not (1 <= h <= _ROPE_MAX_GRID and 1 <= w <= _ROPE_MAX_GRID):
             raise ValueError(f"Kimi K3 vision: grid {h}x{w} exceeds the {_ROPE_MAX_GRID}x{_ROPE_MAX_GRID} rope table")
         y, x = torch.meshgrid(
@@ -181,12 +181,11 @@ class _Encoder(nn.Module):
         self.blocks = nn.ModuleList(_EncoderLayer(config) for _ in range(config.vt_num_hidden_layers))
         self.final_layernorm = nn.RMSNorm(config.vt_hidden_size)
 
-    def forward(self, x: Tensor, grid_thws: Tensor) -> Tensor:
-        freqs_cis = _rope_2d(grid_thws, self.blocks[0].head_dim, x.device)
-        lengths = (grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]).tolist()
+    def forward(self, x: Tensor, grid: list[list[int]]) -> Tensor:
+        freqs_cis = _rope_2d(grid, self.blocks[0].head_dim, x.device)
         cu_seqlens = [0]
-        for length in lengths:
-            cu_seqlens.append(cu_seqlens[-1] + length)
+        for t, h, w in grid:
+            cu_seqlens.append(cu_seqlens[-1] + t * h * w)
         for block in self.blocks:
             x = block(x, cu_seqlens, freqs_cis)
         return self.final_layernorm(x)
@@ -204,11 +203,12 @@ class KimiK3VisionTower(nn.Module):
 
     def forward(self, pixel_values: Tensor, grid_thws: Tensor) -> list[Tensor]:
         """[patches, 3, p, p] -> one [merged_tokens, kh * kw, hidden] tensor per image."""
-        x = self.encoder(self.patch_embed(pixel_values, grid_thws), grid_thws)
+        grid = grid_thws.tolist()  # the tower's only host sync
+        x = self.encoder(self.patch_embed(pixel_values, grid), grid)
         kh, kw = self.merge_kernel_size
         outputs = []
         offset = 0
-        for t, h, w in grid_thws.tolist():
+        for t, h, w in grid:
             seq = x[offset : offset + t * h * w].view(t, h // kh, kh, w // kw, kw, -1)
             outputs.append(seq.permute(0, 1, 3, 2, 4, 5).mean(dim=0).reshape((h // kh) * (w // kw), kh * kw, -1))
             offset += t * h * w

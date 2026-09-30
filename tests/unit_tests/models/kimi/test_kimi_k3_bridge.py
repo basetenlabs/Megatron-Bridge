@@ -225,6 +225,14 @@ def test_provider_rejects_vision_with_scattering_embedding(kimi_k3_vl_pretrained
         provider.provide()
 
 
+def test_provider_requires_placeholder_token_with_vision(kimi_k3_vl_pretrained: Mock) -> None:
+    provider = KimiK3Bridge().provider_bridge(kimi_k3_vl_pretrained)
+    provider.media_placeholder_token_id = None
+
+    with pytest.raises(ValueError, match="media_placeholder_token_id"):
+        provider.provide()
+
+
 def test_mapping_registry_nests_backbone_and_replicates_tower(kimi_k3_vl_pretrained: Mock) -> None:
     """With a tower the backbone sits under ``language_model.``; tower names match the checkpoint."""
     bridge = KimiK3Bridge()

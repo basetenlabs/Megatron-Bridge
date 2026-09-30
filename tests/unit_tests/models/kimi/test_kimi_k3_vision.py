@@ -110,7 +110,7 @@ def test_rope_matches_reference_table_layout() -> None:
 
     want = torch.cat([table[:h, :w].reshape(-1, head_dim // 2).repeat(t, 1) for t, h, w in grid])
 
-    torch.testing.assert_close(_rope_2d(torch.tensor(grid), head_dim, torch.device("cpu")), want, rtol=0, atol=0)
+    torch.testing.assert_close(_rope_2d(grid, head_dim, torch.device("cpu")), want, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -128,7 +128,9 @@ def test_splice_writes_features_in_placeholder_order() -> None:
     embeds = torch.zeros(2, 4, 3)
     features = torch.arange(9, dtype=torch.float32).view(3, 3)
 
-    out = splice_features(embeds, input_ids, features, token, packed_seq_params=None, cp_group=None)
+    out = splice_features(
+        embeds, input_ids=input_ids, features=features, token_id=token, packed_seq_params=None, cp_group=None
+    )
 
     torch.testing.assert_close(out[input_ids == token], features)
     assert torch.count_nonzero(out[input_ids != token]) == 0
@@ -137,4 +139,11 @@ def test_splice_writes_features_in_placeholder_order() -> None:
 def test_splice_rejects_feature_count_mismatch() -> None:
     input_ids = torch.tensor([[7, 7, 1]])
     with pytest.raises(ValueError, match="2 placeholder"):
-        splice_features(torch.zeros(1, 3, 3), input_ids, torch.zeros(3, 3), 7, None, None)
+        splice_features(
+            torch.zeros(1, 3, 3),
+            input_ids=input_ids,
+            features=torch.zeros(3, 3),
+            token_id=7,
+            packed_seq_params=None,
+            cp_group=None,
+        )

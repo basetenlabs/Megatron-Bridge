@@ -293,7 +293,7 @@ class KimiK3Bridge(MegatronModelBridge):
             mapping.megatron_param = f"language_model.{mapping.megatron_param}"
         # The tower is plain torch modules named as in the checkpoint and identical on
         # every rank; AutoMapping cannot infer parallelism for nn.Linear.
-        mappings.extend(ReplicatedMapping(f"{prefix}**", f"{prefix}**") for prefix in self._VISION_PREFIXES)
+        mappings.extend(ReplicatedMapping(f"{tower}**", f"{tower}**") for tower in self._VISION_PREFIXES)
         return MegatronMappingRegistry(*mappings)
 
     @staticmethod

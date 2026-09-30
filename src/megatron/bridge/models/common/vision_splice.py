@@ -113,6 +113,7 @@ def local_feature_index(
 
 def splice_features(
     inputs_embeds: Tensor,
+    *,
     input_ids: Tensor,
     features: Tensor,
     token_id: int,

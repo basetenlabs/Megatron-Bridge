@@ -210,7 +210,14 @@ class Glm5NextVLModel(MegatronModule):
                 **{f"{kind}_features": features},
             )
             return inputs_embeds.masked_scatter(mask, features)
-        return splice_features(inputs_embeds, input_ids, features, token_id, packed_seq_params, cp_group)
+        return splice_features(
+            inputs_embeds,
+            input_ids=input_ids,
+            features=features,
+            token_id=token_id,
+            packed_seq_params=packed_seq_params,
+            cp_group=cp_group,
+        )
 
     def freeze(
         self,
