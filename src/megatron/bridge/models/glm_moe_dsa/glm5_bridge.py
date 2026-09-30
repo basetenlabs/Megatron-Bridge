@@ -18,11 +18,8 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
-<<<<<<< HEAD
 import torch
-=======
 from huggingface_hub import hf_hub_download
->>>>>>> 588f0d74f (fix(glm5): support FP8 context-parallel launches (#19))
 from megatron.core.models.gpt.gpt_model import GPTModel
 from transformers import GlmMoeDsaForCausalLM
 
