@@ -46,10 +46,17 @@ class DummyHybridStack(DummyTransformerBlock):
 
 
 class DummyModel(torch.nn.Module):
+<<<<<<< HEAD
     def __init__(self, block_cls=DummyTransformerBlock, multi_adapter: bool = False) -> None:
         super().__init__()
         self.config = SimpleNamespace(recompute_method="uniform")
         self.block = block_cls()
+=======
+    def __init__(self, block_cls=None) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(recompute_method="uniform")
+        self.block = (block_cls or DummyTransformerBlock)()
+>>>>>>> ec507f102 ([baseten] fix(peft): extend recompute input-grad hook to HybridStack (#18))
 
         # Frozen base parameter (not trainable)
         self.base = torch.nn.Linear(1, 1, bias=False)
@@ -68,8 +75,16 @@ class DummyModel(torch.nn.Module):
             yield module
 
 
+<<<<<<< HEAD
 def _patch_recompute_blocks(monkeypatch):
     import megatron.core.models.hybrid.hybrid_block as hybrid_block
+=======
+class DummyHybridStack(DummyTransformerBlock):
+    """Distinct dummy type standing in for megatron's HybridStack."""
+
+
+def _patch_transformer_block(monkeypatch):
+>>>>>>> ec507f102 ([baseten] fix(peft): extend recompute input-grad hook to HybridStack (#18))
     import megatron.core.transformer.transformer_block as transformer_block
 
     monkeypatch.setattr(hybrid_block, "HybridStack", DummyHybridStack, raising=False)
@@ -81,9 +96,25 @@ def _patch_recompute_blocks(monkeypatch):
     )
 
 
+<<<<<<< HEAD
 @pytest.mark.parametrize("block_cls", [DummyTransformerBlock, DummyHybridStack])
 def test_maybe_enable_recompute_inputs_grad_patches_block(monkeypatch, block_cls):
     _patch_recompute_blocks(monkeypatch)
+=======
+def _patch_hybrid_stack(monkeypatch):
+    import megatron.core.models.hybrid.hybrid_block as hybrid_block
+
+    monkeypatch.setattr(
+        hybrid_block,
+        "HybridStack",
+        DummyHybridStack,
+        raising=False,
+    )
+
+
+def test_maybe_enable_recompute_inputs_grad_patches_block(monkeypatch):
+    _patch_transformer_block(monkeypatch)
+>>>>>>> ec507f102 ([baseten] fix(peft): extend recompute input-grad hook to HybridStack (#18))
     recompute_mod.PEFT_RECOMPUTE_PATCHED.clear()
 
     model = DummyModel(block_cls)
@@ -104,6 +135,7 @@ def test_maybe_enable_recompute_inputs_grad_patches_block(monkeypatch, block_cls
     assert model.block.forward is patched_forward
 
 
+<<<<<<< HEAD
 def test_recompute_patch_registry_tracks_model_lifetime(monkeypatch):
     _patch_recompute_blocks(monkeypatch)
     recompute_mod.PEFT_RECOMPUTE_PATCHED.clear()
@@ -135,4 +167,22 @@ def test_maybe_enable_recompute_inputs_grad_recognizes_multi_adapter_parameters(
 
     assert len(patched_registry) == 1
     model.block(torch.zeros(2, 2))
+=======
+def test_maybe_enable_recompute_inputs_grad_patches_hybrid_stack(monkeypatch):
+    # HybridStack honours recompute_granularity='full' via the same reentrant
+    # checkpoint as TransformerBlock, so adapter-only training needs the same
+    # input-grad fix — without it LoRA gradients are silently zero at PP=1.
+    _patch_hybrid_stack(monkeypatch)
+    recompute_mod.PEFT_RECOMPUTE_PATCHED.clear()
+
+    model = DummyModel(block_cls=DummyHybridStack)
+    patched_registry = maybe_enable_recompute_inputs_grad(model, set())
+
+    assert id(model) in patched_registry
+
+    input_tensor = torch.zeros(2, 2)
+    assert input_tensor.requires_grad is False
+
+    model.block(input_tensor)
+>>>>>>> ec507f102 ([baseten] fix(peft): extend recompute input-grad hook to HybridStack (#18))
     assert model.block.last_input_requires_grad is True
