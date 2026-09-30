@@ -69,13 +69,13 @@ class KimiK3VLModel(MegatronModule):
         self.share_embeddings_and_output_weights = config.share_embeddings_and_output_weights
         self.shared_embedding_or_output_weight = self.language_model.shared_embedding_or_output_weight
 
-    def set_input_tensor(self, input_tensor) -> None:
+    def set_input_tensor(self, input_tensor: Tensor | list[Tensor]) -> None:
         """Set this model chunk's input tensor."""
         self.language_model.set_input_tensor(input_tensor)
 
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
+        input_ids: torch.LongTensor | None = None,
         position_ids: torch.LongTensor | None = None,
         attention_mask: Tensor | None = None,
         pixel_values: Tensor | None = None,

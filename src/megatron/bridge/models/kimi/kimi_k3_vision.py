@@ -45,7 +45,7 @@ _ROPE_THETA = 10000.0
 
 def _check_supported(vision_config: "PretrainedConfig") -> None:
     for field, expected in _SUPPORTED.items():
-        actual = getattr(vision_config, field)
+        actual = getattr(vision_config, field, None)
         if actual != expected:
             raise ValueError(f"Kimi K3 vision: unsupported {field}={actual!r}; only {expected!r} is implemented")
 

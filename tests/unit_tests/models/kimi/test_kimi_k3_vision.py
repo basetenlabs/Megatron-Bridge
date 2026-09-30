@@ -122,6 +122,13 @@ def test_unsupported_layouts_are_rejected(field: str, value: str) -> None:
         KimiK3VisionTower(_vision_config(**{field: value}))
 
 
+def test_missing_layout_field_is_rejected() -> None:
+    config = _vision_config()
+    del config.merge_type
+    with pytest.raises(ValueError, match="merge_type=None"):
+        KimiK3VisionTower(config)
+
+
 def test_splice_writes_features_in_placeholder_order() -> None:
     token = 7
     input_ids = torch.tensor([[1, token, token, 2], [token, 3, 4, 5]])
