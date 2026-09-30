@@ -46,6 +46,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
+from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -333,6 +334,10 @@ class KimiK3Attention(MegatronModule):
         self._keep_in_float32_parameter_names = ("A_log", "dt_bias")
         set_tensor_model_parallel_attributes(self.A_log, True, 0, 1)
         set_tensor_model_parallel_attributes(self.dt_bias, True, 0, 1)
+        if config.perform_initialization:
+            with get_cuda_rng_tracker().fork():
+                self.A_log.data.copy_(torch.empty_like(self.A_log).uniform_(1, 16).log())
+            self.dt_bias.data.fill_(1.0)
 
         self.o_norm = FusedRMSNormGated(
             self.head_dim,
