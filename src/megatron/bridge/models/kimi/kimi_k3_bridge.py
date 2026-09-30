@@ -438,12 +438,9 @@ class KimiK3Bridge(MegatronModelBridge):
             return
         for name in source.get_all_keys():
             if name.startswith(self._HF_PASSTHROUGH_PREFIXES):
-<<<<<<< HEAD
                 yield from HFWeightTuple(name, state[name]).iter_finalized(
                     cpu=cpu, megatron_param_names=passthrough_sources
                 )
-=======
-                yield from HFWeightTuple(name, state[name]).iter_finalized(cpu=cpu)
 
 
 def _classify_te_quantized_tensor(tensor: torch.Tensor) -> tuple[bool, bool]:
@@ -454,4 +451,3 @@ def _classify_te_quantized_tensor(tensor: torch.Tensor) -> tuple[bool, bool]:
     except (ImportError, ModuleNotFoundError):
         return False, False
     return isinstance(tensor, QuantizedTensor), isinstance(tensor, NVFP4Tensor)
->>>>>>> a39166294 (feat(kimi): import K3 routed experts as native NVFP4 (#62))
