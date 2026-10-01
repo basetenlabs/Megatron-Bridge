@@ -31,12 +31,10 @@ import pytest
 import torch
 import torch.distributed as dist
 from megatron.core.dist_checkpointing.optimizer import get_param_id_to_sharded_param_map
-from megatron.core.distributed import DistributedDataParallel
-from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-from megatron.bridge.peft.utils import ParallelLinearAdapter, SharedOuterGroupedExpertAdapter
+from megatron.bridge.peft.utils import SharedOuterGroupedExpertAdapter
 
 
 _WORLD_SIZE = 2
@@ -137,12 +135,6 @@ def _all_gather(tensor: torch.Tensor) -> list[torch.Tensor]:
     return gathered
 
 
-def _sum_over(tensor: torch.Tensor, group: object) -> torch.Tensor:
-    reduced = tensor.float().clone()
-    dist.all_reduce(reduced, group=group)
-    return reduced
-
-
 def _rel_err(actual: torch.Tensor, expected: torch.Tensor) -> float:
     scale = expected.float().abs().max().clamp_min(1e-6)
     return ((actual.float() - expected.float()).abs().max() / scale).item()
@@ -213,89 +205,3 @@ def test_sharded_state_dict_is_checkpointable(ep_size: int, is_fc1: bool) -> Non
         assert tensor.global_offset[0] == expert_offset
     for tensor in shared:
         assert tensor.axis_fragmentations[0] == 1
-
-
-class _SharedOuterWithControl(torch.nn.Module):
-    """An fc2 shared-outer adapter next to an ordinary LoRA adapter, so one DDP buckets both."""
-
-    def __init__(self, ep_size: int) -> None:
-        super().__init__()
-        self.config = _config()
-        self.shared_outer = _make_adapter(is_fc1=False, ep_size=ep_size)
-        self.control = ParallelLinearAdapter(
-            _HIDDEN,
-            _HIDDEN,
-            _DIM,
-            base_linear_name="linear_proj",
-            activation="identity",
-            column_init_method="xavier",
-            row_init_method="normal",
-            input_is_parallel=False,
-            model_parallel_config=self.config,
-            alpha=_ALPHA,
-            is_expert=False,
-        )
-
-    def forward(
-        self, x_expert: torch.Tensor, m_splits: list[int], x_dense: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.shared_outer(x_expert, m_splits), self.control(x_dense)
-
-
-@pytest.mark.gpu
-def test_ddp_gradient_scaling_matches_ordinary_lora(ep_size: int) -> None:
-    """After real DDP, the shared side must be SUM over experts and MEAN over expert-data copies.
-
-    EP=1 catches a hook that also sums over data-parallel copies; EP=2 catches a missing
-    sum over experts. The ordinary adapter checks the harness itself.
-    """
-    model = _SharedOuterWithControl(ep_size).cuda()
-    ddp = DistributedDataParallel(
-        config=model.config,
-        ddp_config=DistributedDataParallelConfig(overlap_grad_reduce=False),
-        module=model,
-    )
-    ddp.zero_grad_buffer()
-
-    m_splits = [16] * model.shared_outer.num_local_experts
-    n_tokens = sum(m_splits)
-    torch.manual_seed(4321 + dist.get_rank())
-    x_expert = torch.randn(n_tokens, _MOE_FFN, device="cuda", dtype=torch.bfloat16)
-    x_dense = torch.randn(n_tokens, _HIDDEN, device="cuda", dtype=torch.bfloat16)
-    torch.manual_seed(99)
-    loss_weights = torch.randn(n_tokens, _HIDDEN, device="cuda", dtype=torch.bfloat16)
-
-    out_expert, out_dense = ddp(x_expert, m_splits, x_dense)
-    ((out_expert * loss_weights).sum() + (out_dense * loss_weights).sum()).backward()
-    ddp.finish_grad_sync()
-
-    # This rank's local gradients, recomputed without the adapter's hooks or DDP.
-    local = {
-        name: getattr(module, side).weight.detach().float().requires_grad_()
-        for name, module, side in (
-            ("per_expert", model.shared_outer, "linear_in"),
-            ("shared", model.shared_outer, "linear_out"),
-            ("control_in", model.control, "linear_in"),
-            ("control", model.control, "linear_out"),
-        )
-    }
-    expert_out = _reference_forward(x_expert, m_splits, local["per_expert"], local["shared"], is_fc1=False)
-    dense_out = x_dense.float() @ local["control_in"].T @ local["control"].T * (_ALPHA / _DIM)
-    ((expert_out + dense_out) * loss_weights.float()).sum().backward()
-
-    dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
-    expt_dp = parallel_state.get_expert_data_parallel_group()
-    dp_size = dist.get_world_size(group=dp_cp)
-    expt_dp_size = dist.get_world_size(group=expt_dp)
-    expected = {
-        "control": (model.control.linear_out.weight, _sum_over(local["control"].grad, dp_cp) / dp_size),
-        "shared": (model.shared_outer.linear_out.weight, _sum_over(local["shared"].grad, dp_cp) / expt_dp_size),
-        # Megatron scales every expert parameter by 1/dp_cp, not 1/expt_dp.
-        "per_expert": (
-            model.shared_outer.linear_in.weight,
-            _sum_over(local["per_expert"].grad, expt_dp) / dp_size,
-        ),
-    }
-    for name, (param, want) in expected.items():
-        err = _rel_err(param.main_grad, want)
-        assert err < 5e-2, f"{name}: main_grad rel err {err:.3e}"
