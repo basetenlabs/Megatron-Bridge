@@ -29,6 +29,7 @@ from megatron.bridge.models.conversion.model_bridge import (
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ColumnParallelMapping,
+    MambaInProjMapping,
     RowParallelMapping,
     _fuse_gdn_separate_to_grouped,
     merge_gdn_linear_weights,
@@ -876,6 +877,63 @@ def test_build_adapter_conversion_tasks_excludes_base_prefix_before_mapping(monk
     )
 
     assert tasks_by_base == {}
+
+
+@pytest.mark.parametrize("tp_size", [1, 2], ids=["unsharded", "tensor-parallel"])
+def test_mamba_adapter_export_preserves_row_order(monkeypatch: pytest.MonkeyPatch, tp_size: int) -> None:
+    """Mamba adapter export must preserve Hugging Face row ordering."""
+
+    bridge = DummyBridge()
+    bridge.hf_pretrained = SimpleNamespace()
+    bridge.hf_config = bridge.hf_pretrained
+
+    config = SimpleNamespace(mamba_num_heads=4, mamba_head_dim=2, mamba_state_dim=2, mamba_num_groups=2)
+    alpha, dim = 2, 4
+    base_prefix = "decoder.layers.0.mixer.in_proj"
+    hf_name = "backbone.layers.0.mixer.in_proj.weight"
+    local_component_sizes = [size // tp_size for size in [8, 8, 4, 4, 4]]  # z, x, B, C, dt
+    local_rows = sum(local_component_sizes)
+    # Distinct row/column values expose permutations.
+    linear_in_local = (torch.arange(dim // tp_size * 3, dtype=torch.float32).reshape(-1, 3) - 5) / 4
+    linear_out_local = (torch.arange(local_rows * dim, dtype=torch.float32).reshape(local_rows, dim) - 55) / 16
+
+    def expected_hf_order(local_weight: torch.Tensor) -> torch.Tensor:
+        # Rank 1 holds twice rank 0's values; HF groups z0,z1,x0,x1,... rather than whole ranks.
+        components = local_weight.split(local_component_sizes, dim=0)
+        return torch.cat([component * (rank + 1) for component in components for rank in range(tp_size)])
+
+    linear_in_weight = torch.cat([linear_in_local * (rank + 1) for rank in range(tp_size)])
+    linear_out_weight = expected_hf_order(linear_out_local)
+
+    # Build real conversion tasks for rank 0, replacing distributed communication below.
+    adapter = SimpleNamespace(
+        linear_in=SimpleNamespace(weight=linear_in_local, config=config),
+        linear_out=SimpleNamespace(weight=linear_out_local, config=config),
+    )
+    adapters_info = [(f"{base_prefix}.adapter", base_prefix, False, True, False, alpha, dim, 0, 0)]
+    monkeypatch.setattr(bridge, "_megatron_global_adapters_info_all_pp_ranks", lambda *_: adapters_info)
+    monkeypatch.setattr(bridge, "_get_adapter_wrap_module", lambda *_: (adapter, None))
+    monkeypatch.setattr(
+        "megatron.bridge.models.conversion.model_bridge.parallel_state.get_pipeline_model_parallel_rank",
+        lambda: 0,
+    )
+    base_mapping = MambaInProjMapping(megatron_param=f"{base_prefix}.weight", hf_param=hf_name)
+    registry = MegatronMappingRegistry(base_mapping)
+    monkeypatch.setattr(bridge, "mapping_registry", lambda: registry)
+    for mapping_cls in (ColumnParallelMapping, MambaInProjMapping):
+        monkeypatch.setattr(mapping_cls, "broadcast_from_pp_rank", lambda self, tensor, cache_key=None: tensor)
+        monkeypatch.setattr(mapping_cls, "broadcast_obj_from_pp_rank", lambda self, obj, cache_key=None: obj)
+        monkeypatch.setattr(mapping_cls, "tp_size", property(lambda self: tp_size))
+        monkeypatch.setattr(
+            mapping_cls, "gather_from_tp_ranks", lambda self, tensor: [tensor * (rank + 1) for rank in range(tp_size)]
+        )
+
+    task = bridge.build_adapter_conversion_tasks([Mock()])[base_prefix][0]
+
+    # Adapter export must reconstruct A and B in HF order.
+    exported_adapter = bridge.materialize_adapter_weights([task])[0]
+    torch.testing.assert_close(exported_adapter.linear_in_weight.weight, linear_in_weight)
+    torch.testing.assert_close(exported_adapter.linear_out_weight.weight, linear_out_weight)
 
 
 def test_materialize_adapter_weights(monkeypatch):
