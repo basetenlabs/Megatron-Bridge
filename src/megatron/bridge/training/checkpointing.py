@@ -475,15 +475,11 @@ def _extract_megatron_lm_args_from_state_dict(state_dict: dict[str, Any]) -> dic
 # ============================================================================
 
 
-<<<<<<< HEAD
-def schedule_async_save(global_state: GlobalState, async_request: NVRxAsyncRequest) -> None:
-=======
 def _noop_async_save(*_args: Any, **_kwargs: Any) -> None:
     pass
 
 
-def schedule_async_save(global_state: GlobalState, async_request: AsyncRequest) -> None:
->>>>>>> d915ae9fa (fix(ckpt): complete empty async save requests (#82))
+def schedule_async_save(global_state: GlobalState, async_request: NVRxAsyncRequest) -> None:
     """Schedule the async save request.
 
     Args:
