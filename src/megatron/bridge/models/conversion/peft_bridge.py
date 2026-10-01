@@ -29,6 +29,7 @@ from megatron.core.utils import get_pg_rank, unwrap_model
 
 from megatron.bridge.models.conversion.param_mapping import (
     ColumnParallelMapping,
+    MambaInProjMapping,
     ReplicatedMapping,
     RowParallelMapping,
     _split_gdn_grouped_to_separate,
@@ -740,6 +741,12 @@ class MegatronPeftBridge:
             if base_linear_is_parallel:
                 linear_in_mapping_cls = RowParallelMapping if input_is_parallel else ColumnParallelMapping
                 linear_out_mapping_cls = ColumnParallelMapping
+                base_mapping = mapping_registry.megatron_to_hf_lookup(f"{global_base_prefix}{base_suffix}")
+                if isinstance(base_mapping, MambaInProjMapping):
+                    # Each TensorParallel rank holds [z, x, B, C, dt] rows of the fused Mamba in_proj, so LoRA-B must be
+                    # gathered per component rather than concatenated rank by rank
+                    # e.g. [z0, z1..., x0, x1..., ...] rather than [z0, x0..., z1, x1..., ...]
+                    linear_out_mapping_cls = MambaInProjMapping
             else:
                 linear_in_mapping_cls = ReplicatedMapping
                 linear_out_mapping_cls = ReplicatedMapping
