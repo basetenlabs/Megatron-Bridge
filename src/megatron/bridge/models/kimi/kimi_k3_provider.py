@@ -12,16 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model provider for the Kimi K3 language backbone."""
+"""Model provider for Kimi K3."""
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from megatron.core.models.gpt import GPTModel as MCoreGPTModel
 
 from megatron.bridge.models.mla_provider import MLAModelProvider
 
 
+if TYPE_CHECKING:
+    from megatron.bridge.models.kimi.kimi_k3_vl_model import KimiK3VLModel
+
+
 @dataclass
 class KimiK3ModelProvider(MLAModelProvider):
-    """Megatron configuration and provider for Kimi K3."""
+    """Megatron configuration and provider for Kimi K3.
+
+    With ``vision_config`` set, ``provide`` builds the vision-language model, whose
+    backbone sits under ``language_model``; without it, the bare language model.
+    """
 
     variable_seq_lengths: bool = True
     kimi_kda_layers: tuple[int, ...] = ()
@@ -30,3 +41,39 @@ class KimiK3ModelProvider(MLAModelProvider):
     kimi_linear_conv_kernel_size: int = 4
     kimi_kda_gate_lower_bound: float = -5.0
     kimi_attn_res_block_size: int = 12
+
+    # HF ``KimiK3VisionConfig``; None builds the text-only backbone.
+    vision_config: object = None
+    # Required with vision_config; the bridge sets it from the checkpoint.
+    media_placeholder_token_id: int | None = None
+    freeze_language_model: bool = False
+    freeze_vision_model: bool = False
+    freeze_vision_projection: bool = False
+
+    def provide(
+        self, pre_process: bool | None = None, post_process: bool | None = None, vp_stage: int | None = None
+    ) -> "MCoreGPTModel | KimiK3VLModel":
+        """Build the VL model when the checkpoint carries a vision tower."""
+        if self.vision_config is None:
+            return self.provide_language_model(pre_process, post_process, vp_stage)
+        if self.scatter_embedding_sequence_parallel:
+            # The splice needs whole rows; a scattering embedding would shard twice.
+            raise ValueError("Kimi K3 with vision requires scatter_embedding_sequence_parallel=False")
+        if self.media_placeholder_token_id is None:
+            raise ValueError("Kimi K3 with vision requires media_placeholder_token_id")
+
+        from megatron.bridge.models.kimi.kimi_k3_vl_model import KimiK3VLModel
+
+        model = KimiK3VLModel(self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+        model.freeze(
+            freeze_language_model=self.freeze_language_model,
+            freeze_vision_model=self.freeze_vision_model,
+            freeze_vision_projection=self.freeze_vision_projection,
+        )
+        return model
+
+    def provide_language_model(
+        self, pre_process: bool | None = None, post_process: bool | None = None, vp_stage: int | None = None
+    ) -> MCoreGPTModel:
+        """Build only the Megatron language backbone."""
+        return MLAModelProvider.provide(self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)

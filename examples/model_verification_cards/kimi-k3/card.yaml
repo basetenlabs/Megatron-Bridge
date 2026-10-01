@@ -5,12 +5,15 @@ title: kimi_k3
 summary: >
   Performance disclaimer: this model has not been performance-tuned; reported
   timing and throughput metrics are sanity checks, not optimized performance
-  results. This card covers the Kimi K3 language backbone in the published
-  multimodal checkpoint. It does not claim support for the vision tower or
-  multimodal inputs. Full-checkpoint GPU import and deterministic Megatron
-  greedy text generation are verified. CPU conversion, GPU export,
-  full-model Hugging Face/Megatron forward correlation, and every training
-  workflow remain unverified.
+  results. This card covers the Kimi K3 language backbone and vision tower in
+  the published multimodal checkpoint. Only image inputs are claimed: the
+  tower matches the reference implementation in fp32, and video input is
+  rejected. Full-checkpoint GPU import and deterministic Megatron
+  greedy text generation were verified at bridge_commit below, before the
+  vision tower existed; the vision-layout import is not yet re-verified
+  through this card's commands. CPU conversion, GPU export, full-model
+  Hugging Face/Megatron forward correlation, and every training workflow
+  remain unverified.
 verification_index:
   model_level:
     verified:
