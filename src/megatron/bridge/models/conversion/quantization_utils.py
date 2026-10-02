@@ -528,10 +528,11 @@ def maybe_dequantize_modelopt_weight(
 
 
 def _modelopt_weight_scale(name: str, suffix: str, hf_state_dict: Mapping[str, torch.Tensor]) -> torch.Tensor:
+    scale_name = f"{name}{suffix}"
     try:
-        return hf_state_dict[f"{name}{suffix}"]
+        return hf_state_dict[scale_name]
     except KeyError:
-        raise KeyError(f"Quantized ModelOpt weight {name!r} has no {name}{suffix!r} tensor") from None
+        raise KeyError(f"Quantized ModelOpt weight {name!r} has no {scale_name!r} tensor") from None
 
 
 def requantize_hf_weight_scale_pairs(
