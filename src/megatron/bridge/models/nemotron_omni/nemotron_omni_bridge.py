@@ -388,6 +388,60 @@ from .configuration_radio import RADIOConfig as _RADIOConfig
                 tensor = tensor.to(device=torch.cuda.current_device())
             yield from HFWeightTuple(name, tensor).iter_finalized(cpu=cpu, megatron_param_names=passthrough_sources)
 
+    def maybe_modify_loaded_hf_weight(
+        self,
+        hf_param: str | dict[str, str],
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        """Dequantize ModelOpt NVFP4 and FP8 weights; BF16 checkpoints pass through."""
+        if isinstance(hf_param, str):
+            return maybe_dequantize_modelopt_weight(hf_param, hf_state_dict)
+        return {key: maybe_dequantize_modelopt_weight(name, hf_state_dict) for key, name in hf_param.items()}
+
+    def maybe_load_native_hf_weight(
+        self,
+        task: WeightConversionTask,
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> bool:
+        """Load routed experts built as TE NVFP4 tensors straight from the NVFP4 payload.
+
+        Every other destination, including other quantized formats, takes the
+        dequantizing path above.
+        """
+        destination = task.param_weight
+        if destination is None or not is_routed_expert_weight(task.param_name):
+            return False
+        _, is_nvfp4 = classify_te_quantized_tensor(destination)
+        if not is_nvfp4:
+            return False
+
+        source = prepare_native_nvfp4_expert_weight(
+            megatron_param=task.param_name,
+            hf_param=task.mapping.hf_param,
+            hf_state_dict=hf_state_dict,
+            tp_size=task.mapping.tp_size,
+            tp_rank=task.mapping.tp_rank,
+        )
+        copy_native_nvfp4_expert_weight(destination, source)
+        return True
+
+    @staticmethod
+    def get_hf_import_param_names(
+        hf_param: str | dict[str, str],
+        available_hf_param_names: set[str] | None = None,
+    ) -> tuple[str, ...]:
+        """Also declare the ModelOpt scale tensors the import hooks read."""
+        names = NemotronVLBridge.get_hf_import_param_names(hf_param, available_hf_param_names)
+        if available_hf_param_names is None:
+            return names
+        scales = [
+            f"{name}{suffix}"
+            for name in names
+            for suffix in MODELOPT_WEIGHT_SCALE_SUFFIXES
+            if f"{name}{suffix}" in available_hf_param_names
+        ]
+        return tuple(dict.fromkeys((*names, *scales)))
+
 
 @MegatronModelBridge.register_bridge(
     source="NemotronH_Omni_Reasoning_V3",
@@ -546,66 +600,6 @@ class Nemotron35SuperVLBridge(NemotronOmniBridge):
     def _mtp_hf_prefix(self) -> str:
         """Nemotron 3.5 Super VL nests MTP below ``language_model``."""
         return "language_model."
-
-    def maybe_modify_loaded_hf_weight(
-        self,
-        hf_param: str | dict[str, str],
-        hf_state_dict: Mapping[str, torch.Tensor],
-    ) -> torch.Tensor | dict[str, torch.Tensor]:
-        """Dequantize ModelOpt NVFP4 and FP8 weights; BF16 checkpoints pass through."""
-        if isinstance(hf_param, str):
-            return maybe_dequantize_modelopt_weight(hf_param, hf_state_dict)
-        return {key: maybe_dequantize_modelopt_weight(name, hf_state_dict) for key, name in hf_param.items()}
-
-    def maybe_load_native_hf_weight(
-        self,
-        task: WeightConversionTask,
-        hf_state_dict: Mapping[str, torch.Tensor],
-    ) -> bool:
-        """Load routed experts directly into TE NVFP4 storage.
-
-        Only a model built under an NVFP4 expert-storage recipe presents a quantized
-        destination here; every other parameter takes the dequantizing path above.
-        """
-        destination = task.param_weight
-        if destination is None or not is_routed_expert_weight(task.param_name):
-            return False
-
-        is_quantized, is_nvfp4 = classify_te_quantized_tensor(destination)
-        if not is_quantized:
-            return False
-        if not is_nvfp4:
-            raise ValueError(
-                "Native Nemotron 3.5 Super VL expert import requires TE NVFP4Tensor parameters; "
-                f"got {type(destination).__name__} for {task.param_name!r}"
-            )
-
-        source = prepare_native_nvfp4_expert_weight(
-            megatron_param=task.param_name,
-            hf_param=task.mapping.hf_param,
-            hf_state_dict=hf_state_dict,
-            tp_size=task.mapping.tp_size,
-            tp_rank=task.mapping.tp_rank,
-        )
-        copy_native_nvfp4_expert_weight(destination, source)
-        return True
-
-    @staticmethod
-    def get_hf_import_param_names(
-        hf_param: str | dict[str, str],
-        available_hf_param_names: set[str] | None = None,
-    ) -> tuple[str, ...]:
-        """Also declare the ModelOpt scale tensors the import hooks read."""
-        names = NemotronOmniBridge.get_hf_import_param_names(hf_param, available_hf_param_names)
-        if available_hf_param_names is None:
-            return names
-        scales = [
-            f"{name}{suffix}"
-            for name in names
-            for suffix in MODELOPT_WEIGHT_SCALE_SUFFIXES
-            if f"{name}{suffix}" in available_hf_param_names
-        ]
-        return tuple(dict.fromkeys((*names, *scales)))
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         """Add the Super-VL vision final norm to the shared Omni mappings."""

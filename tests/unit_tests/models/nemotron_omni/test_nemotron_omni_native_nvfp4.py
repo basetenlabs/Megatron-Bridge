@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for loading Nemotron 3.5 Super VL ModelOpt checkpoints.
+"""Tests for loading Nemotron Omni ModelOpt checkpoints.
 
 Two loading paths must agree on the value of every routed-expert weight:
 dequantizing to BF16, and importing the NVFP4 payload natively into TE storage.
@@ -34,7 +34,7 @@ from megatron.bridge.models.nemotron_omni.native_nvfp4_import import (
     is_routed_expert_weight,
     prepare_native_nvfp4_expert_weight,
 )
-from megatron.bridge.models.nemotron_omni.nemotron_omni_bridge import Nemotron35SuperVLBridge
+from megatron.bridge.models.nemotron_omni.nemotron_omni_bridge import NemotronOmniBridge
 
 
 pytestmark = pytest.mark.unit
@@ -334,7 +334,7 @@ def test_bridge_dequantizes_every_projection_of_a_mapping():
         state_dict[name] = torch.full((4, 8), 1.0 + index).to(torch.float8_e4m3fn)
         state_dict[f"{name}_scale"] = torch.tensor(0.5)
 
-    loaded = Nemotron35SuperVLBridge().maybe_modify_loaded_hf_weight(names, state_dict)
+    loaded = NemotronOmniBridge().maybe_modify_loaded_hf_weight(names, state_dict)
 
     assert set(loaded) == {"q", "k", "v"}
     torch.testing.assert_close(loaded["v"], torch.full((4, 8), 1.5, dtype=torch.bfloat16), rtol=0, atol=0)
@@ -347,7 +347,7 @@ def test_bridge_loads_routed_experts_natively_into_nvfp4_storage(monkeypatch):
     destination = _FakeNVFP4Destination(32, 64)
     task = _task("language_model.decoder.layers.1.mlp.experts.linear_fc1.weight3", name, destination=destination)
 
-    assert Nemotron35SuperVLBridge().maybe_load_native_hf_weight(task, state_dict)
+    assert NemotronOmniBridge().maybe_load_native_hf_weight(task, state_dict)
 
     torch.testing.assert_close(destination._rowwise_data, state_dict[name], rtol=0, atol=0)
     scale_bits = state_dict[f"{name}_scale"].view(torch.uint8)
@@ -356,7 +356,7 @@ def test_bridge_loads_routed_experts_natively_into_nvfp4_storage(monkeypatch):
 
 
 def test_bridge_leaves_bf16_and_non_expert_destinations_to_the_normal_path(monkeypatch):
-    bridge = Nemotron35SuperVLBridge()
+    bridge = NemotronOmniBridge()
     expert = "language_model.decoder.layers.1.mlp.experts.linear_fc1.weight3"
     assert not bridge.maybe_load_native_hf_weight(_task(expert, "w", destination=torch.zeros(2, 2)), {})
 
@@ -365,24 +365,23 @@ def test_bridge_leaves_bf16_and_non_expert_destinations_to_the_normal_path(monke
     assert not bridge.maybe_load_native_hf_weight(_task(shared, "w", destination=object()), {})
 
 
-def test_bridge_refuses_a_routed_expert_quantized_to_another_format(monkeypatch):
+def test_bridge_leaves_routed_experts_in_other_quantized_formats_to_the_normal_path(monkeypatch):
     monkeypatch.setattr(nemotron_omni_bridge, "classify_te_quantized_tensor", lambda tensor: (True, False))
     task = _task("language_model.decoder.layers.1.mlp.experts.linear_fc2.weight0", "w", destination=object())
 
-    with pytest.raises(ValueError, match="requires TE NVFP4Tensor parameters"):
-        Nemotron35SuperVLBridge().maybe_load_native_hf_weight(task, {})
+    assert not NemotronOmniBridge().maybe_load_native_hf_weight(task, {})
 
 
 def test_bridge_declares_the_modelopt_scale_tensors_it_reads():
     name = f"{_EXPERT}.up_proj.weight"
     available = {name, f"{name}_scale", f"{name}_scale_2", f"{name[: -len('weight')]}input_scale"}
 
-    assert Nemotron35SuperVLBridge.get_hf_import_param_names(name, available) == (
+    assert NemotronOmniBridge.get_hf_import_param_names(name, available) == (
         name,
         f"{name}_scale",
         f"{name}_scale_2",
     )
-    assert Nemotron35SuperVLBridge.get_hf_import_param_names(name, {name}) == (name,)
+    assert NemotronOmniBridge.get_hf_import_param_names(name, {name}) == (name,)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
