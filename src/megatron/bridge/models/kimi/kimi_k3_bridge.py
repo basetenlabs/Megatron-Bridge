@@ -33,6 +33,10 @@ from megatron.bridge.models.conversion.model_bridge import (
     MegatronModelBridge,
     WeightConversionTask,
 )
+from megatron.bridge.models.conversion.native_nvfp4 import (
+    classify_te_quantized_tensor,
+    copy_native_nvfp4_expert_weight,
+)
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ColumnParallelMapping,
@@ -43,7 +47,6 @@ from megatron.bridge.models.conversion.param_mapping import (
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.kimi.kimi_k3_provider import KimiK3ModelProvider
 from megatron.bridge.models.kimi.native_nvfp4_import import (
-    copy_native_nvfp4_expert_weight,
     is_routed_expert_weight,
     prepare_native_nvfp4_expert_weight,
 )
@@ -302,7 +305,7 @@ class KimiK3Bridge(MegatronModelBridge):
         if destination is None or not is_routed_expert_weight(task.param_name):
             return False
 
-        is_quantized, is_nvfp4 = _classify_te_quantized_tensor(destination)
+        is_quantized, is_nvfp4 = classify_te_quantized_tensor(destination)
         if not is_quantized:
             return False
         if not is_nvfp4:
@@ -441,13 +444,3 @@ class KimiK3Bridge(MegatronModelBridge):
                 yield from HFWeightTuple(name, state[name]).iter_finalized(
                     cpu=cpu, megatron_param_names=passthrough_sources
                 )
-
-
-def _classify_te_quantized_tensor(tensor: torch.Tensor) -> tuple[bool, bool]:
-    """Classify a tensor without requiring Transformer Engine at import time."""
-    try:
-        from transformer_engine.pytorch.tensor import QuantizedTensor
-        from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Tensor
-    except (ImportError, ModuleNotFoundError):
-        return False, False
-    return isinstance(tensor, QuantizedTensor), isinstance(tensor, NVFP4Tensor)
