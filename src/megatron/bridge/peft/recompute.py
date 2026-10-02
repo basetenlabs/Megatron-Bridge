@@ -90,7 +90,11 @@ def maybe_enable_recompute_inputs_grad(model, peft_recompute_patched: Set[int] |
                 continue  # Not adapter-only training, no fix needed
 
             def _patch_block(module: torch.nn.Module) -> bool:
-                if isinstance(module, (TransformerBlock, HybridStack)):
+                # A block without trainable parameters (e.g. a frozen vision tower) needs no
+                # checkpoint backward; forcing grad on its input would keep its activations.
+                if isinstance(module, (TransformerBlock, HybridStack)) and any(
+                    p.requires_grad for p in module.parameters()
+                ):
                     original_forward = module.forward
 
                     @wraps(original_forward)

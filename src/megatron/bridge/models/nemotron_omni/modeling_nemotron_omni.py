@@ -26,6 +26,7 @@ The historical collapse/expand implementation remains available explicitly as
 is not the canonical model selected by AutoBridge.
 """
 
+import contextlib
 import logging
 from collections import namedtuple
 from typing import Optional
@@ -669,12 +670,21 @@ class NemotronOmniModel(MegatronModule):
             if input_ids is None:
                 raise ValueError("The first Nemotron Omni pipeline stage requires input_ids.")
             if images is not None and images.numel() > 0:
-                image_embeddings = self._encode_images(
-                    images,
-                    imgs_sizes,
-                    vision_packed_seq_params,
-                    num_frames,
+                # A frozen tower and projector need no autograd graph; every CP rank
+                # makes the same choice, so the feature gather stays collective-safe.
+                vision_frozen = not any(
+                    parameter.requires_grad
+                    for module in (self.vision_model, self.vision_projection)
+                    if module is not None
+                    for parameter in module.parameters()
                 )
+                with torch.no_grad() if vision_frozen else contextlib.nullcontext():
+                    image_embeddings = self._encode_images(
+                        images,
+                        imgs_sizes,
+                        vision_packed_seq_params,
+                        num_frames,
+                    )
             else:
                 image_embeddings = None
 
