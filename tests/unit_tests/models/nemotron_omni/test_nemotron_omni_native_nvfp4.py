@@ -128,10 +128,10 @@ def test_dequantize_nvfp4_round_trips_within_fp4_resolution():
         payload, block_scale=weight_scale, global_scale=weight_scale_2, dtype=torch.float32
     )
 
-    # E2M1 spacing is at most a third of a block's maximum, so half of it bounds the error.
-    block_max = weight.abs().reshape(64, 8, 16).amax(dim=-1, keepdim=True)
+    # The widest E2M1 step is 2 (from 4 to 6), so rounding errs by at most one decode scale.
+    decode_scale = (weight_scale.float() * weight_scale_2).unsqueeze(-1)
     error = (restored - weight).abs().reshape(64, 8, 16)
-    assert bool((error <= block_max / 6 + 1e-6).all())
+    assert bool((error <= decode_scale * (1 + 1e-6)).all())
 
 
 @pytest.mark.parametrize(
