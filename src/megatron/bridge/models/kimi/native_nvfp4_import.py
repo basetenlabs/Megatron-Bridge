@@ -36,10 +36,11 @@ rather than silently rounding.
 """
 
 import re
-from dataclasses import dataclass
 from typing import Mapping, cast
 
 import torch
+
+from megatron.bridge.models.conversion.native_nvfp4 import NativeNVFP4ExpertWeight
 
 
 # MXFP4 groups 32 elements per scale; NVFP4 groups 16.
@@ -59,15 +60,6 @@ _ROUTED_EXPERT_WEIGHT = re.compile(
     r"^decoder\.layers\.\d+\.mlp\.experts\.linear_fc(?P<projection>[12])\.weight(?P<expert>\d+)$"
 )
 _ROUTED_EXPERT_PREFIX = re.compile(r"^decoder\.layers\.\d+\.mlp\.experts\.linear_fc[12]\.weight")
-
-
-@dataclass(frozen=True)
-class NativeNVFP4ExpertWeight:
-    """One ETP-local expert weight in TE rowwise NVFP4 layout."""
-
-    rowwise_data: torch.Tensor
-    scale_inv: torch.Tensor
-    amax: torch.Tensor
 
 
 def is_routed_expert_weight(param_name: str) -> bool:
@@ -189,48 +181,6 @@ def _build_expert_weight(*, rowwise_data: torch.Tensor, exponents: torch.Tensor)
         scale_inv=block_scale.to(torch.float8_e4m3fn).view(torch.uint8),
         amax=amax,
     )
-
-
-def copy_native_nvfp4_expert_weight(destination: torch.Tensor, source: NativeNVFP4ExpertWeight) -> None:
-    """Copy native nibbles, regrouped scales, and the per-tensor amax into a TE tensor."""
-    rowwise_data = destination._rowwise_data
-    rowwise_scale_inv = destination._rowwise_scale_inv
-    amax = destination._amax_rowwise
-    if rowwise_data is None or rowwise_data.dtype is not torch.uint8:
-        raise ValueError("Native NVFP4 destination requires uint8 rowwise payload")
-    if rowwise_scale_inv is None or rowwise_scale_inv.dtype is not torch.uint8:
-        raise ValueError("Native NVFP4 destination requires uint8 rowwise scales")
-    if amax is None:
-        raise ValueError("Native NVFP4 destination requires a rowwise amax")
-    if destination._columnwise_data is not None or destination._columnwise_scale_inv is not None:
-        raise ValueError("Native NVFP4 import requires rowwise-only storage")
-    if destination._with_gemm_swizzled_scales:
-        raise ValueError("Native NVFP4 import requires an unswizzled scale layout")
-    if rowwise_data.shape != source.rowwise_data.shape:
-        raise ValueError(
-            f"Native NVFP4 payload shape {tuple(source.rowwise_data.shape)} does not match "
-            f"destination {tuple(rowwise_data.shape)}"
-        )
-    source_scale_shape = tuple(source.scale_inv.shape)
-    destination_scale_shape = tuple(rowwise_scale_inv.shape)
-    if (
-        len(destination_scale_shape) != 2
-        or destination_scale_shape[0] != source_scale_shape[0]
-        or destination_scale_shape[1] < source_scale_shape[1]
-    ):
-        raise ValueError(
-            f"Native NVFP4 scale grid shape {source_scale_shape} does not fit destination {destination_scale_shape}"
-        )
-    if amax.shape != source.amax.shape:
-        raise ValueError(
-            f"Native NVFP4 amax shape {tuple(source.amax.shape)} does not match destination {tuple(amax.shape)}"
-        )
-
-    with torch.no_grad():
-        rowwise_data.copy_(source.rowwise_data.to(device=rowwise_data.device))
-        rowwise_scale_inv.zero_()
-        rowwise_scale_inv[:, : source.scale_inv.shape[1]].copy_(source.scale_inv.to(device=rowwise_scale_inv.device))
-        amax.copy_(source.amax.to(device=amax.device))
 
 
 def _load_mxfp4_weight(

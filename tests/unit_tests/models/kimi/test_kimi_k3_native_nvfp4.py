@@ -23,11 +23,11 @@ being a pure memory change and quietly becomes a numerical one.
 import pytest
 import torch
 
+from megatron.bridge.models.conversion.native_nvfp4 import copy_native_nvfp4_expert_weight
 from megatron.bridge.models.conversion.quantization_utils import dequantize_mxfp4_e2m1_packed
 from megatron.bridge.models.kimi.native_nvfp4_import import (
     _build_expert_weight,
     _load_mxfp4_weight,
-    copy_native_nvfp4_expert_weight,
     is_routed_expert_weight,
     prepare_native_nvfp4_expert_weight,
 )
