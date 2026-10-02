@@ -784,6 +784,7 @@ class TestSaveCheckpoint:
         assert torch.load(latest_train_state, weights_only=True)["step"].item() == 500
         assert legacy_tracker.read_text() == "500"
 
+    @pytest.mark.parametrize("transform", [False, True], ids=["no_transform", "transform"])
     @pytest.mark.parametrize("save_rng", [True, False])
     @patch("megatron.bridge.training.checkpointing.wandb_utils")
     @patch("megatron.bridge.training.checkpointing.is_last_rank")
@@ -833,6 +834,7 @@ class TestSaveCheckpoint:
         mock_wandb,
         save_checkpoint_fixtures,
         save_rng,
+        transform,
     ):
         """Test saving a global checkpoint."""
         # Setup mocks
@@ -870,6 +872,9 @@ class TestSaveCheckpoint:
         call_order.attach_mock(mock_dist_ckpt.save, "model")
         call_order.attach_mock(mock_save_dataloader, "loader")
 
+        transformed = {"model": {"param1": "narrowed"}}
+        sharded_state_dict_transform = Mock(return_value=transformed) if transform else None
+
         # Call save_checkpoint
         save_checkpoint(
             save_checkpoint_fixtures["mock_state"],
@@ -879,6 +884,7 @@ class TestSaveCheckpoint:
             1000000,
             checkpointing_context={},
             non_persistent_ckpt=False,
+            sharded_state_dict_transform=sharded_state_dict_transform,
         )
 
         assert [call[0] for call in call_order.mock_calls] == ["model", "loader"]
@@ -887,6 +893,10 @@ class TestSaveCheckpoint:
         mock_ft.on_checkpointing_start.assert_called_once()
         mock_gen_state.assert_called_once()
         mock_dist_ckpt.save.assert_called_once()
+        if transform:
+            # The transform sees the complete state dict and its output is what is written.
+            assert sharded_state_dict_transform.call_args.args[0]["model"] == {"param1": "value1", "param2": "value2"}
+            assert mock_dist_ckpt.save.call_args.args[0] is transformed
         if save_rng:
             mock_get_rng.assert_called_once()
         else:
@@ -2333,6 +2343,7 @@ class TestLoadCheckpoint:
     @patch("torch.distributed.barrier")
     @patch("torch.cuda.empty_cache")
     @patch("os.path.exists")  # Add patch for train state file existence check
+    @pytest.mark.parametrize("transform", [False, True], ids=["no_transform", "transform"])
     @pytest.mark.parametrize("saved_version", [3.0, 3.1])
     def test_load_checkpoint_found(
         self,
@@ -2363,6 +2374,7 @@ class TestLoadCheckpoint:
         mock_is_hf_checkpoint_dir,
         load_checkpoint_fixtures,
         saved_version,
+        transform,
     ):
         """Test successful checkpoint loading."""
         # Setup mocks
@@ -2447,17 +2459,25 @@ class TestLoadCheckpoint:
         }
         mock_load_base.return_value = (mock_state_dict, "/ckpt/path", False, CheckpointType.GLOBAL)
 
+        transformed = {"test": "allow shape mismatch"}
+        sharded_state_dict_transform = Mock(return_value=transformed) if transform else None
+
         result = load_checkpoint(
             load_checkpoint_fixtures["mock_state"],
             load_checkpoint_fixtures["mock_model"],
             load_checkpoint_fixtures["mock_optimizer"],
             load_checkpoint_fixtures["mock_scheduler"],
+            sharded_state_dict_transform=sharded_state_dict_transform,
         )
 
         # Verify results
         assert result[0] == 1000  # iteration
         assert result[1] == 500000  # FLOPs
         mock_set_version.assert_called_with(saved_version)
+        if transform:
+            # The transform sees the requested state dict and its output is what is read.
+            assert sharded_state_dict_transform.call_args.args[0]["test"] == "state"
+            assert mock_load_base.call_args.kwargs["sharded_state_dict"] is transformed
         metadata = mock_generate_state_dict.call_args.kwargs["optim_sd_kwargs"]["metadata"]
         assert metadata["checkpoint_version"] == saved_version
         if saved_version < 3.1 and hasattr(distrib_optimizer, "get_legacy_grad_dtypes"):
@@ -5406,6 +5426,7 @@ class TestCheckpointManager:
                 pg_collection=None,
                 callback_manager=None,
                 module_name=None,
+                sharded_state_dict_transform=None,
             )
 
     def test_default_checkpoint_manager_load_delegates(self):
@@ -5445,6 +5466,7 @@ class TestCheckpointManager:
                 skip_load_to_model_and_opt=True,
                 pg_collection=None,
                 module_name=None,
+                sharded_state_dict_transform=None,
             )
             assert result == (100, 50000)
 

@@ -719,6 +719,8 @@ class CheckpointSaveContext:
         num_floating_point_operations_so_far: Cumulative FLOPs computed up to this point.
         train_data_iterator: Optional training data iterator to save its state.
         non_persistent_ckpt: If True, saves as a non-persistent (temporary) checkpoint.
+        sharded_state_dict_transform: Optional function applied to the complete state
+            dict right before it is written.
     """
 
     state: GlobalState
@@ -731,6 +733,7 @@ class CheckpointSaveContext:
     non_persistent_ckpt: bool = False
     pg_collection: ProcessGroupCollection | None = None
     module_name: str | None = None
+    sharded_state_dict_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
 
 @dataclass
@@ -745,6 +748,8 @@ class CheckpointLoadContext:
         strict: Whether to enforce strict loading (see torch.nn.Module.load_state_dict).
         skip_load_to_model_and_opt: If True, only loads metadata but skips loading
             state into model and optimizer modules.
+        sharded_state_dict_transform: Optional function applied to the sharded state
+            dict right before it is read from a torch_dist checkpoint.
     """
 
     state: GlobalState
@@ -756,6 +761,7 @@ class CheckpointLoadContext:
     skip_load_to_model_and_opt: bool = False
     pg_collection: ProcessGroupCollection | None = None
     module_name: str | None = None
+    sharded_state_dict_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
 
 @runtime_checkable
@@ -860,6 +866,7 @@ class DefaultCheckpointManager:
             pg_collection=ctx.pg_collection,
             callback_manager=callback_manager,
             module_name=ctx.module_name,
+            sharded_state_dict_transform=ctx.sharded_state_dict_transform,
         )
 
     def load(self, ctx: CheckpointLoadContext) -> tuple[int, int]:
@@ -883,6 +890,7 @@ class DefaultCheckpointManager:
             skip_load_to_model_and_opt=ctx.skip_load_to_model_and_opt,
             pg_collection=ctx.pg_collection,
             module_name=ctx.module_name,
+            sharded_state_dict_transform=ctx.sharded_state_dict_transform,
         )
 
     def finalize_async_saves(self, state: GlobalState, blocking: bool = False, terminate: bool = False) -> None:
@@ -1250,6 +1258,7 @@ def save_checkpoint(
     pg_collection: Optional[ProcessGroupCollection] = None,
     callback_manager: Optional[CallbackManager] = None,
     module_name: str | None = None,
+    sharded_state_dict_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> None:
     """Save a model checkpoint.
 
@@ -1278,6 +1287,8 @@ def save_checkpoint(
         module_name: Optional MegatronMIMO module name for per-module RNG state namespacing.
                     When set, RNG ShardedObject keys are namespaced to avoid collisions
                     across modules with identical (pp_rank, tp_rank) coordinates.
+        sharded_state_dict_transform: Optional function applied to the complete state
+                                      dict right before it is written.
     """
 
     train_state = state.train_state
@@ -1432,6 +1443,8 @@ def save_checkpoint(
     # extra HF artifact under ``iter_*/hf/``.
     if cfg.peft is not None:
         state_dict = apply_peft_adapter_filter_to_state_dict(state_dict, cfg.peft)
+    if sharded_state_dict_transform is not None:
+        state_dict = sharded_state_dict_transform(state_dict)
 
     # ``also_save_hf_checkpoint=True`` is an extra export:
     # keep the native Megatron checkpoint behavior at ``iter_*/`` and write HF
@@ -2458,6 +2471,7 @@ def load_checkpoint(
     skip_load_to_model_and_opt: bool = False,
     pg_collection: Optional[ProcessGroupCollection] = None,
     module_name: str | None = None,
+    sharded_state_dict_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> tuple[int, int]:
     """Load a model checkpoint.
 
@@ -2478,6 +2492,8 @@ def load_checkpoint(
                       extracting from model via get_pg_collection(). Required for MegatronMIMO where
                       model-level PG extraction may not reflect rank-local topology.
         module_name: Optional MegatronMIMO module name for per-module RNG state namespacing.
+        sharded_state_dict_transform: Optional function applied to the sharded state dict
+                                      right before it is read from a torch_dist checkpoint.
 
     Returns:
         A tuple containing:
@@ -2515,6 +2531,7 @@ def load_checkpoint(
         skip_load_to_model_and_opt=skip_load_to_model_and_opt,
         pg_collection=pg_collection,
         module_name=module_name,
+        sharded_state_dict_transform=sharded_state_dict_transform,
     )
 
 
@@ -2845,6 +2862,7 @@ def _load_checkpoint_from_path(
     ignore_ckpt_step: bool = False,
     pg_collection: Optional[ProcessGroupCollection] = None,
     module_name: str | None = None,
+    sharded_state_dict_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> tuple[int, int]:
     """Load a checkpoint from a given path.
 
@@ -2863,6 +2881,8 @@ def _load_checkpoint_from_path(
         pg_collection: Optional ProcessGroupCollection. When provided, uses this instead of
                       extracting from model via get_pg_collection(). Required for MegatronMIMO where
                       model-level PG extraction may not reflect rank-local topology.
+        sharded_state_dict_transform: Optional function applied to the sharded state dict
+                                      right before it is read from a torch_dist checkpoint.
 
     Returns:
         A tuple containing:
@@ -3192,6 +3212,8 @@ def _load_checkpoint_from_path(
         load_kwargs["sharded_state_dict"] = apply_peft_adapter_filter_to_state_dict(
             load_kwargs["sharded_state_dict"], cfg.peft
         )
+    if sharded_state_dict_transform is not None and "sharded_state_dict" in load_kwargs:
+        load_kwargs["sharded_state_dict"] = sharded_state_dict_transform(load_kwargs["sharded_state_dict"])
 
     # Load the checkpoint
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
