@@ -372,18 +372,6 @@ def test_bridge_leaves_routed_experts_in_other_quantized_formats_to_the_normal_p
     assert not NemotronOmniBridge().maybe_load_native_hf_weight(task, {})
 
 
-def test_bridge_declares_the_modelopt_scale_tensors_it_reads():
-    name = f"{_EXPERT}.up_proj.weight"
-    available = {name, f"{name}_scale", f"{name}_scale_2", f"{name[: -len('weight')]}input_scale"}
-
-    assert NemotronOmniBridge.get_hf_import_param_names(name, available) == (
-        name,
-        f"{name}_scale",
-        f"{name}_scale_2",
-    )
-    assert NemotronOmniBridge.get_hf_import_param_names(name, {name}) == (name,)
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_imported_weight_dequantizes_identically_in_transformer_engine():
     """TE must read the copied nibbles, block scales and amax as ModelOpt wrote them."""

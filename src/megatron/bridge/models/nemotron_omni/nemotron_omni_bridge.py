@@ -50,10 +50,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ReplicatedMapping,
 )
-from megatron.bridge.models.conversion.quantization_utils import (
-    MODELOPT_WEIGHT_SCALE_SUFFIXES,
-    maybe_dequantize_modelopt_weight,
-)
+from megatron.bridge.models.conversion.quantization_utils import maybe_dequantize_modelopt_weight
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.hf_pretrained.state import SafeTensorsStateSource, StateDict
 from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import NemotronOmniModel
@@ -370,23 +367,6 @@ class NemotronOmniBridge(NemotronVLBridge):
         )
         copy_native_nvfp4_expert_weight(destination, source)
         return True
-
-    @staticmethod
-    def get_hf_import_param_names(
-        hf_param: str | dict[str, str],
-        available_hf_param_names: set[str] | None = None,
-    ) -> tuple[str, ...]:
-        """Also declare the ModelOpt scale tensors the import hooks read."""
-        names = NemotronVLBridge.get_hf_import_param_names(hf_param, available_hf_param_names)
-        if available_hf_param_names is None:
-            return names
-        scales = [
-            f"{name}{suffix}"
-            for name in names
-            for suffix in MODELOPT_WEIGHT_SCALE_SUFFIXES
-            if f"{name}{suffix}" in available_hf_param_names
-        ]
-        return tuple(dict.fromkeys((*names, *scales)))
 
 
 class NemotronOmniLlavaBridge(NemotronOmniBridge):

@@ -25,8 +25,6 @@ FP8_E4M3_MAX = 448.0
 FP4_E2M1_MAX = 6.0
 MXFP4_BLOCK_SIZE = 32
 NVFP4_BLOCK_SIZE = 16
-# ModelOpt stores a quantized ``<name>.weight`` with these sibling tensors.
-MODELOPT_WEIGHT_SCALE_SUFFIXES = ("_scale", "_scale_2")
 
 _FP4_E2M1_TABLE_VALUES = [
     0.0,
