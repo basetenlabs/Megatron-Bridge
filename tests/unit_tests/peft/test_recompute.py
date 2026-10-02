@@ -32,9 +32,11 @@ class DummyAdapter(torch.nn.Module):
 
 
 class DummyTransformerBlock(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, trainable: bool = True) -> None:
         super().__init__()
         self.last_input_requires_grad = None
+        if trainable:
+            self.adapter = DummyAdapter()
 
     def forward(self, hidden_states, *args, **kwargs):
         self.last_input_requires_grad = hidden_states.requires_grad
@@ -79,6 +81,20 @@ def _patch_recompute_blocks(monkeypatch):
         DummyTransformerBlock,
         raising=False,
     )
+
+
+def test_maybe_enable_recompute_inputs_grad_skips_frozen_block(monkeypatch):
+    _patch_recompute_blocks(monkeypatch)
+    recompute_mod.PEFT_RECOMPUTE_PATCHED.clear()
+
+    model = DummyModel()
+    model.frozen_tower = DummyTransformerBlock(trainable=False)
+    maybe_enable_recompute_inputs_grad(model, set())
+
+    model.frozen_tower(torch.zeros(2, 2))
+    assert model.frozen_tower.last_input_requires_grad is False
+    model.block(torch.zeros(2, 2))
+    assert model.block.last_input_requires_grad is True
 
 
 @pytest.mark.parametrize("block_cls", [DummyTransformerBlock, DummyHybridStack])
