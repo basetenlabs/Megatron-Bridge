@@ -1994,6 +1994,24 @@ def _make_grouped_expert_sharded_tensor(
     )
 
 
+def _set_expert_parallel_replica_ids(
+    state_dict: ShardedStateDict, *, ep_group: object | None, expt_dp_group: object | None
+) -> None:
+    """Keep one main replica of weights replicated across EP and expert DP.
+
+    The EP rank joins the TP coordinate because the distributed optimizer replaces the DP
+    coordinate of its state's replica ids.
+    """
+
+    ep_rank = _process_group_rank(ep_group)
+    ep_size = _process_group_size(ep_group)
+    edp_rank = _process_group_rank(expt_dp_group)
+    for value in state_dict.values():
+        pp, tp, _ = value.replica_id
+        dp = 0 if getattr(value, "is_data_parallel_fully_shard", False) else edp_rank
+        value.replica_id = (pp, tp * ep_size + ep_rank, dp)
+
+
 class _GroupedExpertAdapterWeight(nn.Module):
     """Callable parameter container so DDP forward pre-hooks see grouped LoRA weights."""
 
@@ -2712,7 +2730,8 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
     ``linear_out.weight``) sees a standard single-weight linear per side.
 
     Differs from ``ParallelLinearAdapter`` in ``__init__`` and ``forward``;
-    ``sharded_state_dict`` is specialized for the packed 3D per-expert side.
+    ``sharded_state_dict`` is specialized for the packed 3D per-expert side and the
+    EP-replicated shared side.
     """
 
     def __init__(
@@ -2864,6 +2883,11 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
 
         linear_in_sd = self.linear_in.sharded_state_dict(f"{prefix}linear_in.", sharded_offsets, metadata)
         linear_out_sd = self.linear_out.sharded_state_dict(f"{prefix}linear_out.", sharded_offsets, metadata)
+        _set_expert_parallel_replica_ids(
+            linear_in_sd if self._is_fc1 else linear_out_sd,
+            ep_group=self.ep_group,
+            expt_dp_group=_get_process_group(self.pg_collection, "expt_dp"),
+        )
 
         if self._is_fc1:
             singleton_local_shards = (metadata or {}).get("singleton_local_shards", False)
