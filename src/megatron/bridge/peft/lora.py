@@ -26,6 +26,7 @@ from megatron.core.utils import unwrap_model
 
 from megatron.bridge.models.common.te_layers import TERowParallelLinearLayerNorm
 from megatron.bridge.peft.base import PEFT
+from megatron.bridge.peft.canonical_lora import LoRALinearSplitFC1UpGate, LoRALinearSplitQKV
 from megatron.bridge.peft.lora_layers import (
     LinearAdapter,
     LoRALinear,
@@ -34,6 +35,7 @@ from megatron.bridge.peft.lora_layers import (
     TEFusedLoRALinear,
 )
 from megatron.bridge.peft.module_matcher import ModuleMatcher
+from megatron.bridge.peft.split_lora import LoRALinearSplitGDNInProj, SplitGroups, build_split_lora
 from megatron.bridge.peft.utils import (
     GroupedExpertLinearAdapter,
     ParallelLinearAdapter,
@@ -44,6 +46,7 @@ from megatron.bridge.peft.utils import (
     is_expert_linear,
     is_grouped_expert_linear,
     is_modelopt_linear,
+    wildcard_match,
 )
 
 
@@ -140,6 +143,10 @@ class LoRA(PEFT, ModuleMatcher):
             SGLang's ``experts_shared_outer_loras=True`` serving contract (PR
             #21466). Default False preserves the adapter layout selected by
             ``share_expert_adapters``.
+        split_adapters (Dict[str, SplitGroups]): Maps a target pattern for a fused linear
+            (``linear_qkv``, ``linear_fc1`` or GDN ``in_proj``) to groups of its output
+            components, e.g. ``{"*.in_proj": (("q", "k", "v", "z"),)}``. Each group gets its own
+            adapter; components in no group are not adapted. See ``split_lora``.
     """
 
     target_modules: List[str] = field(
@@ -157,6 +164,17 @@ class LoRA(PEFT, ModuleMatcher):
     normalize_moe_lora: bool = False
     share_expert_adapters: bool = True
     experts_shared_outer_loras: bool = False
+    split_adapters: Dict[str, SplitGroups] = field(default_factory=dict)
+
+    def _split_groups(self, name: str, full_name: str) -> Optional[SplitGroups]:
+        hits = [
+            groups
+            for pattern, groups in self.split_adapters.items()
+            if name == pattern or wildcard_match(pattern, full_name)
+        ]
+        if len(hits) > 1:
+            raise ValueError(f"{full_name} matches more than one split_adapters pattern")
+        return hits[0] if hits else None
 
     def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
         """
@@ -171,7 +189,13 @@ class LoRA(PEFT, ModuleMatcher):
             nn.Module: The modified module with LoRA applied, or the original module if not a target.
         """
         # Skip already transformed modules
-        adapter_types = (LoRALinear, LoRATopKRouter)
+        adapter_types = (
+            LoRALinear,
+            LoRATopKRouter,
+            LoRALinearSplitQKV,
+            LoRALinearSplitFC1UpGate,
+            LoRALinearSplitGDNInProj,
+        )
         if isinstance(module, adapter_types):
             return module
 
@@ -256,6 +280,18 @@ class LoRA(PEFT, ModuleMatcher):
                     disable_tensor_parallel_comm=attrs.disable_tensor_parallel_comm,
                     disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
                     replicate_adapter=attrs.replicate_adapter,
+                )
+            split_groups = self._split_groups(name, full_name)
+            if split_groups is not None:
+                if use_grouped_expert_adapter or isinstance(module, TopKRouter):
+                    raise ValueError(f"split_adapters does not support {full_name}")
+                return build_split_lora(
+                    module,
+                    name,
+                    split_groups,
+                    attrs.in_features,
+                    attrs.out_features,
+                    lambda in_features, out_features: adapter_cls(in_features, out_features, dim, **adapter_kwargs),
                 )
             adapter = adapter_cls(attrs.in_features, attrs.out_features, dim, **adapter_kwargs)
             if isinstance(module, TopKRouter):
