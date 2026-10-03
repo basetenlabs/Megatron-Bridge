@@ -86,11 +86,15 @@ class _BoundaryModel(NemotronOmniModel):
         self.sequence_parallel_lm = False
         self.config = SimpleNamespace(mtp_num_layers=None)
         self.language_model = _FakeLanguageModel()
+        self.vision_model = None
+        self.vision_projection = None
         self.image_features = image_features
         self.sound_features = torch.empty(0, 3) if sound_features is None else sound_features
+        self.encode_images_grad_enabled = None
 
     def _encode_images(self, images, imgs_sizes, vision_packed_seq_params, num_frames):
         del images, imgs_sizes, vision_packed_seq_params, num_frames
+        self.encode_images_grad_enabled = torch.is_grad_enabled()
         return self.image_features
 
     def _encode_sound(self, sound_clips, sound_length):
@@ -818,6 +822,24 @@ def test_image_forward_replaces_expanded_placeholders_without_changing_length():
     assert torch.equal(output[1, 0], image_features[0])
     assert torch.equal(output[2, 0], image_features[1])
     assert torch.equal(output[3, 0], torch.tensor([9.0, 9.0, 9.0]))
+
+
+@pytest.mark.parametrize("trainable_vision", [False, True])
+def test_image_encoding_records_autograd_only_for_a_trainable_vision_path(trainable_vision):
+    model = _BoundaryModel(torch.tensor([[101.0, 102.0, 103.0]]))
+    model.vision_model = nn.Linear(1, 1)
+    model.vision_projection = nn.Linear(1, 1)
+    model.vision_model.requires_grad_(False)
+    model.vision_projection.requires_grad_(trainable_vision)
+    input_ids = torch.tensor([[7, 18, 9]])
+
+    model(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids, dtype=torch.bool),
+        images=torch.ones(1),
+    )
+
+    assert model.encode_images_grad_enabled is trainable_vision
 
 
 def test_image_forward_does_not_use_mcore_causal_mask_as_token_validity():
