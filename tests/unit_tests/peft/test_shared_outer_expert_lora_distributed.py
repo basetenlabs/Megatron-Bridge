@@ -14,9 +14,10 @@
 
 """Two-rank tests for ``SharedOuterGroupedExpertAdapter``.
 
-Each test runs at EP=1 (two data-parallel copies of every expert) and EP=2
-(each rank owns half the experts), so the expert axis and the expert-data axis
-are exercised separately.
+Each test runs at EP=1 (two data-parallel copies of every expert), EP=2
+(each rank owns half the experts), and TP=2 x EP=2 (EP folded into TP with no
+dense data parallelism, as MoE models are usually laid out), so the expert axis
+and the expert-data axis are exercised separately.
 
 Run with:
 uv run python -m torch.distributed.run --nproc_per_node=2 -m pytest \
@@ -31,6 +32,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from megatron.core.dist_checkpointing.optimizer import get_param_id_to_sharded_param_map
+from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -61,18 +63,19 @@ def _process_group() -> Iterator[None]:
         dist.destroy_process_group()
 
 
-@pytest.fixture(params=[1, 2], ids=["ep1", "ep2"])
+@pytest.fixture(params=[(1, 1), (1, 2), (2, 2)], ids=["ep1", "ep2", "tp2_ep2"])
 def ep_size(request: pytest.FixtureRequest, _process_group: None) -> Iterator[int]:
+    tp_size, ep = request.param
     parallel_state.initialize_model_parallel(
-        tensor_model_parallel_size=1,
+        tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
-        expert_model_parallel_size=request.param,
+        expert_model_parallel_size=ep,
         expert_tensor_parallel_size=1,
     )
     model_parallel_cuda_manual_seed(2026, force_reset_rng=True)
     try:
-        yield request.param
+        yield ep
     finally:
         parallel_state.destroy_model_parallel()
 
@@ -205,3 +208,23 @@ def test_sharded_state_dict_is_checkpointable(ep_size: int, is_fc1: bool) -> Non
         assert tensor.global_offset[0] == expert_offset
     for tensor in shared:
         assert tensor.axis_fragmentations[0] == 1
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("is_fc1", [True, False], ids=_FC_IDS)
+def test_shared_side_has_one_main_replica(ep_size: int, is_fc1: bool) -> None:
+    """Every rank holds the shared factor, so exactly one rank may save it, for weights and optimizer state."""
+    adapter = _make_adapter(is_fc1=is_fc1, ep_size=ep_size)
+    metadata = {"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)}
+    sharded = adapter.sharded_state_dict(prefix="adapter.", metadata=metadata)
+    shared_name, _ = _shared_and_per_expert_names(is_fc1)
+    shared = _sharded_tensors(sharded[f"adapter.{shared_name}.weight"])
+
+    # Runs the integrity check dist_checkpointing.save does; raises on duplicate main replicas.
+    save_preprocess(sharded)
+
+    # The distributed optimizer resets the DP coordinate of its state's replica ids, so EP
+    # replicas must stay distinguishable without it.
+    ep_rank = parallel_state.get_expert_model_parallel_rank()
+    for tensor in shared:
+        assert any(tensor.replica_id[:2]) == (ep_rank != 0), tensor.replica_id
