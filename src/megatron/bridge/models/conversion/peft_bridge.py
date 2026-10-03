@@ -20,7 +20,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 from string import digits
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar, Union
 
 import torch
 from megatron.core import parallel_state
@@ -44,6 +44,11 @@ from megatron.bridge.models.conversion.utils import (
 from megatron.bridge.peft.canonical_lora import ModuleDict
 from megatron.bridge.peft.lora_layers import LinearAdapter
 from megatron.bridge.peft.lora_merge import LoRAMerge
+from megatron.bridge.peft.split_lora import (
+    GDN_ADAPTER_PREFIX,
+    gdn_components_from_adapter_key,
+    gdn_in_proj_component_sizes,
+)
 from megatron.bridge.peft.utils import (
     get_adapter_attributes_from_linear,
     is_expert_linear,
@@ -931,6 +936,19 @@ class MegatronPeftBridge:
             is_grouped_expert = is_expert and ".local_experts." not in adapter_task.global_base_prefix
             is_shared_outer_lora = is_grouped_expert and linear_in_tensor.ndim != linear_out_tensor.ndim
 
+            if adapter_task.adapter_key is not None and adapter_task.adapter_key.startswith(GDN_ADAPTER_PREFIX):
+                yield from self._stream_gdn_split_adapter_weights(
+                    megatron_model,
+                    mapping_registry,
+                    adapter_task,
+                    linear_in_tensor,
+                    linear_out_tensor,
+                    cpu,
+                    emit_in,
+                    emit_out,
+                )
+                continue
+
             if is_shared_outer_lora:
                 yield from self._stream_shared_outer_adapter_weights(
                     megatron_model,
@@ -1073,6 +1091,51 @@ class MegatronPeftBridge:
 
                 yield emit_in(linear_in_hf_names[0], current_linear_in_tensor)
                 yield emit_out(linear_out_hf_names[0], current_linear_out_tensor)
+
+    def _stream_gdn_split_adapter_weights(
+        self,
+        megatron_model: List[MegatronModel],
+        mapping_registry: "MegatronMappingRegistry",
+        adapter_task: AdapterWeightConversionTask,
+        linear_in_tensor: torch.Tensor,
+        linear_out_tensor: torch.Tensor,
+        cpu: bool,
+        emit_in: Callable[..., Any],
+        emit_out: Callable[..., Any],
+    ) -> Iterable[Any]:
+        """Emit one split GDN in_proj adapter (see ``split_lora``) under HF module names.
+
+        q, k and v in one adapter export as ``in_proj_qkv``; otherwise each exports as its own
+        ``in_proj_{q,k,v}`` module. z, b and a export as ``in_proj_{z,b,a}``. Every exported
+        module of one adapter shares its lora_A.
+        """
+        components = gdn_components_from_adapter_key(adapter_task.adapter_key)
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        local_rows = gdn_in_proj_component_sizes(megatron_model[0].config, tp_size)
+        # lora_B is gathered rank by rank; each rank holds its local rows of every component.
+        per_rank = linear_out_tensor.reshape(tp_size, -1, linear_out_tensor.shape[-1])
+        rows = {
+            c: part.reshape(-1, part.shape[-1])
+            for c, part in zip(components, torch.split(per_rank, [local_rows[c] for c in components], dim=1))
+        }
+
+        base_names = self._get_base_hf_param_names_for_adapter(
+            mapping_registry, adapter_task.global_base_prefix, None, ".weight"
+        )
+        qkv_base = next(name for name in base_names if name.endswith("in_proj_qkv.weight"))
+        module_prefix = qkv_base[: -len("in_proj_qkv.weight")]
+
+        exported: List[tuple[str, torch.Tensor]] = []
+        if all(c in rows for c in ("q", "k", "v")):
+            exported.append(("in_proj_qkv", torch.cat([rows["q"], rows["k"], rows["v"]], dim=0)))
+        else:
+            exported.extend((f"in_proj_{c}", rows[c]) for c in ("q", "k", "v") if c in rows)
+        exported.extend((f"in_proj_{c}", rows[c]) for c in ("z", "b", "a") if c in rows)
+
+        linear_in = linear_in_tensor.cpu() if cpu else linear_in_tensor
+        for hf_module, linear_out in exported:
+            yield emit_in(f"{module_prefix}{hf_module}.lora_A.weight", linear_in)
+            yield emit_out(f"{module_prefix}{hf_module}.lora_B.weight", linear_out.cpu() if cpu else linear_out)
 
     def _stream_shared_outer_adapter_weights(
         self,
