@@ -35,7 +35,7 @@ mamba parameter mappings from :class:`NemotronVLBridge` and adds:
 import copy
 import json
 import warnings
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import fields
 from pathlib import Path
 
@@ -50,13 +50,22 @@ from megatron.bridge.models.conversion.model_bridge import (
     MegatronModelBridge,
     WeightConversionTask,
 )
+from megatron.bridge.models.conversion.native_nvfp4 import (
+    classify_te_quantized_tensor,
+    copy_native_nvfp4_expert_weight,
+)
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ReplicatedMapping,
 )
+from megatron.bridge.models.conversion.quantization_utils import maybe_dequantize_modelopt_weight
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.hf_pretrained.state import SafeTensorsStateSource, StateDict
 from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import NemotronOmniModel
+from megatron.bridge.models.nemotron_omni.native_nvfp4_import import (
+    is_routed_expert_weight,
+    prepare_native_nvfp4_expert_weight,
+)
 from megatron.bridge.models.nemotron_omni.nemotron_omni_provider import (
     NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT,
     NEMOTRON_OMNI_LLAVA_CONTRACT,
@@ -375,6 +384,43 @@ from .configuration_radio import RADIOConfig as _RADIOConfig
             if not cpu and tensor.device.type == "cpu" and torch.cuda.is_available():
                 tensor = tensor.to(device=torch.cuda.current_device())
             yield from HFWeightTuple(name, tensor).iter_finalized(cpu=cpu, megatron_param_names=passthrough_sources)
+
+    def maybe_modify_loaded_hf_weight(
+        self,
+        hf_param: str | dict[str, str],
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        """Dequantize ModelOpt NVFP4 and FP8 weights; BF16 checkpoints pass through."""
+        if isinstance(hf_param, str):
+            return maybe_dequantize_modelopt_weight(hf_param, hf_state_dict)
+        return {key: maybe_dequantize_modelopt_weight(name, hf_state_dict) for key, name in hf_param.items()}
+
+    def maybe_load_native_hf_weight(
+        self,
+        task: WeightConversionTask,
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> bool:
+        """Load routed experts built as TE NVFP4 tensors straight from the NVFP4 payload.
+
+        Every other destination, including other quantized formats, takes the
+        dequantizing path above.
+        """
+        destination = task.param_weight
+        if destination is None or not is_routed_expert_weight(task.param_name):
+            return False
+        _, is_nvfp4 = classify_te_quantized_tensor(destination)
+        if not is_nvfp4:
+            return False
+
+        source = prepare_native_nvfp4_expert_weight(
+            megatron_param=task.param_name,
+            hf_param=task.mapping.hf_param,
+            hf_state_dict=hf_state_dict,
+            tp_size=task.mapping.tp_size,
+            tp_rank=task.mapping.tp_rank,
+        )
+        copy_native_nvfp4_expert_weight(destination, source)
+        return True
 
 
 @MegatronModelBridge.register_bridge(

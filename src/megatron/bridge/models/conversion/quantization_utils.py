@@ -24,6 +24,7 @@ FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 FP8_E4M3_MAX = 448.0
 FP4_E2M1_MAX = 6.0
 MXFP4_BLOCK_SIZE = 32
+NVFP4_BLOCK_SIZE = 16
 
 _FP4_E2M1_TABLE_VALUES = [
     0.0,
@@ -447,6 +448,89 @@ def maybe_dequantize_hf_quantized_weight(
         return weight.to(dtype)
 
     return dequantize_fp8_e4m3fn_with_scale(weight, hf_state_dict[scale_key], name=hf_param, dtype=dtype)
+
+
+def dequantize_nvfp4_e2m1_packed(
+    weight_packed: torch.Tensor,
+    *,
+    block_scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize NVFP4 as ``element * block_scale * global_scale``.
+
+    ``weight_packed`` holds two E2M1 elements per byte, the even element in the low
+    nibble. ``block_scale`` holds one E4M3 scale per 16 elements of a row, and
+    ``global_scale`` is the per-tensor level ModelOpt exports as ``weight_scale_2``.
+    """
+    if weight_packed.dtype is not torch.uint8 or weight_packed.ndim != 2:
+        raise ValueError(
+            f"NVFP4 payload must be a 2-D uint8 tensor, got {weight_packed.dtype} {tuple(weight_packed.shape)}"
+        )
+    if block_scale.dtype is not torch.float8_e4m3fn:
+        raise ValueError(f"NVFP4 block scales must be float8_e4m3fn, got {block_scale.dtype}")
+    rows, columns = weight_packed.shape[0], weight_packed.shape[1] * 2
+    expected_scale_shape = (rows, columns // NVFP4_BLOCK_SIZE)
+    if columns % NVFP4_BLOCK_SIZE != 0 or tuple(block_scale.shape) != expected_scale_shape:
+        raise ValueError(
+            f"NVFP4 block scales for a {rows}x{columns} weight must be {expected_scale_shape}, "
+            f"got {tuple(block_scale.shape)}"
+        )
+    if global_scale.numel() != 1:
+        raise ValueError(f"NVFP4 global scale must hold one value, got shape {tuple(global_scale.shape)}")
+
+    table = torch.tensor(_FP4_E2M1_TABLE_VALUES, dtype=torch.float32, device=weight_packed.device)
+    elements = torch.stack((table[(weight_packed & 0xF).long()], table[(weight_packed >> 4).long()]), dim=-1)
+    scale = block_scale.to(torch.float32) * global_scale.to(device=block_scale.device, dtype=torch.float32).reshape(())
+    values = elements.reshape(rows, -1, NVFP4_BLOCK_SIZE) * scale.to(elements.device).unsqueeze(-1)
+    return values.reshape(rows, columns).to(dtype)
+
+
+def dequantize_fp8_per_tensor(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize an FP8 E4M3 weight that carries a single scale for the whole tensor."""
+    if weight.dtype is not torch.float8_e4m3fn:
+        raise ValueError(f"Per-tensor FP8 payload must be float8_e4m3fn, got {weight.dtype}")
+    if scale.numel() != 1:
+        raise ValueError(f"Per-tensor FP8 scale must hold one value, got shape {tuple(scale.shape)}")
+    scale_f32 = scale.to(device=weight.device, dtype=torch.float32).reshape(())
+    return (weight.to(torch.float32) * scale_f32).to(dtype)
+
+
+def maybe_dequantize_modelopt_weight(
+    name: str,
+    hf_state_dict: Mapping[str, torch.Tensor],
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Load one tensor from a ModelOpt checkpoint, dequantizing NVFP4 and FP8 weights.
+
+    The stored dtype selects the format, so unquantized tensors pass through and a
+    quantized payload whose scales are missing raises instead of loading raw codes.
+    """
+    weight = hf_state_dict[name]
+    if weight.dtype is torch.uint8:
+        return dequantize_nvfp4_e2m1_packed(
+            weight,
+            block_scale=_modelopt_weight_scale(name, "_scale", hf_state_dict),
+            global_scale=_modelopt_weight_scale(name, "_scale_2", hf_state_dict),
+            dtype=dtype,
+        )
+    if weight.dtype is torch.float8_e4m3fn:
+        return dequantize_fp8_per_tensor(weight, _modelopt_weight_scale(name, "_scale", hf_state_dict), dtype=dtype)
+    return weight
+
+
+def _modelopt_weight_scale(name: str, suffix: str, hf_state_dict: Mapping[str, torch.Tensor]) -> torch.Tensor:
+    scale_name = f"{name}{suffix}"
+    try:
+        return hf_state_dict[scale_name]
+    except KeyError:
+        raise KeyError(f"Quantized ModelOpt weight {name!r} has no {scale_name!r} tensor") from None
 
 
 def requantize_hf_weight_scale_pairs(
