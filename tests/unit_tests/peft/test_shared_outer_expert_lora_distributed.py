@@ -175,6 +175,8 @@ def test_forward_routes_each_token_to_its_expert(ep_size: int, is_fc1: bool) -> 
 @pytest.mark.parametrize("is_fc1", [True, False], ids=_FC_IDS)
 def test_shared_side_starts_identical_on_every_rank(ep_size: int, is_fc1: bool) -> None:
     """Ranks are seeded differently, so identical values can only come from the init broadcast."""
+    if ep_size == 1:
+        pytest.skip("the ranks are expert-DP replicas, which share a seed instead of the EP broadcast")
     model_parallel_cuda_manual_seed(1000 + dist.get_rank(), force_reset_rng=True)
     adapter = _make_adapter(is_fc1=is_fc1, ep_size=ep_size)
     shared_name, per_expert_name = _shared_and_per_expert_names(is_fc1)
